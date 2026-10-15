@@ -1,5 +1,7 @@
 # Omacraft
 
+![Omacraft showing an instance's mods beside Modrinth search](docs/screenshot.png)
+
 A Minecraft launcher in Rust, modeled on [Prism Launcher](https://github.com/PrismLauncher/PrismLauncher)
 and drawn in [Omarchy](https://omarchy.org)'s design language.
 
