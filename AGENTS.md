@@ -21,8 +21,9 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | theme   
 - **Style:** don't run `cargo fmt`; the code uses longer lines than rustfmt's defaults. Match the
   surrounding style.
 - **Warnings:** keep the build warning-free.
-- **Binary size:** the release profile has LTO, strip and codegen-units=1, and `zip` is trimmed to
-  Deflate (flate2/zlib-rs), Deflate64 and `time`. Keep new dependencies' default features in check.
+- **Binary size:** the release profile strips symbols, and `zip` is trimmed to Deflate (flate2/zlib-rs),
+  Deflate64 and `time`. Keep new dependencies' default features in check. LTO is off on purpose: full LTO
+  with codegen-units=1 saved 7 MB (35 to 28) but tripled build times.
 
 ## Code map
 

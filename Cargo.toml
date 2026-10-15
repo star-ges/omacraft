@@ -35,6 +35,5 @@ uuid = { version = "1.28.0", features = ["v4", "serde"] }
 zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "time"] }
 
 [profile.release]
-lto = true
-codegen-units = 1
+# Full LTO with one codegen unit saved 7 MB (35 to 28) but tripled build times, so it's off.
 strip = true
