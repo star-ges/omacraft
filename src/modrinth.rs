@@ -1,0 +1,426 @@
+//! Modrinth: search and install mods, resource packs and shader packs into an
+//! instance (Prism's modplatform).
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use anyhow::Context;
+use serde::Deserialize;
+
+use crate::content_meta;
+use crate::instance::{ContentKind, Instance};
+use crate::net::{self, Download};
+
+const API: &str = "https://api.modrinth.com/v2";
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchResponse {
+    pub hits: Vec<Hit>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Hit {
+    pub project_id: String,
+    pub slug: String,
+    pub title: String,
+    pub description: String,
+    pub author: String,
+    pub downloads: u64,
+    #[serde(default)]
+    pub icon_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Version {
+    pub id: String,
+    pub project_id: String,
+    #[serde(default)]
+    pub version_number: String,
+    pub files: Vec<VersionFile>,
+    #[serde(default)]
+    pub loaders: Vec<String>,
+    #[serde(default)]
+    pub dependencies: Vec<Dependency>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VersionFile {
+    pub url: String,
+    pub filename: String,
+    pub primary: bool,
+    pub size: u64,
+    pub hashes: Hashes,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Hashes {
+    pub sha1: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Dependency {
+    pub project_id: Option<String>,
+    /// Set when the dependency is pinned to one version.
+    pub version_id: Option<String>,
+    pub dependency_type: String,
+}
+
+fn enc(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn project_type(kind: ContentKind) -> &'static str {
+    match kind {
+        ContentKind::Mods => "mod",
+        ContentKind::ResourcePacks => "resourcepack",
+        ContentKind::ShaderPacks => "shader",
+    }
+}
+
+pub async fn search(kind: ContentKind, query: &str, inst: &Instance) -> anyhow::Result<SearchResponse> {
+    let mut facets = vec![
+        format!(r#"["project_type:{}"]"#, project_type(kind)),
+        format!(r#"["versions:{}"]"#, inst.mc_version),
+    ];
+    if kind == ContentKind::Mods
+        && let Some(l) = inst.loader.modrinth()
+    {
+        facets.push(format!(r#"["categories:{l}"]"#));
+    }
+    let facets = format!("[{}]", facets.join(","));
+    let index = if query.trim().is_empty() { "downloads" } else { "relevance" };
+    let url = format!("{API}/search?query={}&facets={}&index={index}&limit=40", enc(query), enc(&facets));
+    net::get_json(&url).await
+}
+
+async fn compatible_version(kind: ContentKind, project: &str, inst: &Instance) -> anyhow::Result<Version> {
+    let mut url = format!("{API}/project/{}/version?game_versions={}", enc(project), enc(&format!(r#"["{}"]"#, inst.mc_version)));
+    let loader = match kind {
+        ContentKind::Mods => Some(inst.loader.modrinth().context("vanilla instances can't load mods")?),
+        ContentKind::ResourcePacks => Some("minecraft"),
+        // Shaders are tagged by the shader mod (iris, optifine, canvas…).
+        ContentKind::ShaderPacks => None,
+    };
+    if let Some(l) = loader {
+        url.push_str(&format!("&loaders={}", enc(&format!(r#"["{l}"]"#))));
+    }
+    let versions: Vec<Version> = net::get_json(&url).await?;
+    let pick = versions.iter().position(|v| loader.is_some() || v.loaders.iter().any(|l| l == "iris")).unwrap_or(0);
+    versions
+        .into_iter()
+        .nth(pick)
+        .with_context(|| format!("no build of {project} for {} {}", loader.unwrap_or(""), inst.mc_version))
+}
+
+/// What `install` did.
+#[derive(Debug, Default)]
+pub struct Installed {
+    /// Filenames written.
+    pub files: Vec<String>,
+    /// The Modrinth project of each of `files`, in the same order.
+    pub projects: Vec<String>,
+    /// Required dependencies that couldn't be installed, each with why.
+    pub missing: Vec<String>,
+}
+
+/// A required dependency: a project (its newest compatible build), a pinned
+/// version, or both (the pin wins).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Ref {
+    project: Option<String>,
+    version: Option<String>,
+}
+
+/// Where `plan` gets versions from: Modrinth, or a fixture in tests.
+trait Source {
+    async fn version(&self, id: &str) -> anyhow::Result<Version>;
+    async fn latest(&self, project: &str) -> anyhow::Result<Version>;
+    async fn title(&self, project: &str) -> Option<String>;
+}
+
+struct Api<'a> {
+    kind: ContentKind,
+    inst: &'a Instance,
+}
+
+impl Source for Api<'_> {
+    async fn version(&self, id: &str) -> anyhow::Result<Version> {
+        net::get_json(&format!("{API}/version/{}", enc(id))).await
+    }
+
+    async fn latest(&self, project: &str) -> anyhow::Result<Version> {
+        compatible_version(self.kind, project, self.inst).await
+    }
+
+    async fn title(&self, project: &str) -> Option<String> {
+        #[derive(Deserialize)]
+        struct P {
+            title: String,
+        }
+        net::get_json::<P>(&format!("{API}/project/{}", enc(project))).await.ok().map(|p| p.title)
+    }
+}
+
+/// Every version to install for `project`: its newest compatible build, then
+/// (for mods) its required dependencies, pinned ones at their pinned version.
+/// `installed` maps project id → version id of what the instance already has.
+/// Returns the versions plus the required dependencies that can't be met.
+/// An empty plan means the project is already installed.
+async fn plan(src: &impl Source, kind: ContentKind, project: &str, installed: &HashMap<String, String>) -> anyhow::Result<(Vec<Version>, Vec<String>)> {
+    let mut plan: Vec<Version> = Vec::new();
+    let mut pinned = HashSet::new();
+    let mut missing = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::from([Ref { project: Some(project.to_string()), version: None }]);
+    let mut root = true;
+    while let Some(r) = queue.pop_front() {
+        let is_root = std::mem::take(&mut root);
+        if !seen.insert(r.clone()) {
+            continue;
+        }
+        // An unpinned dependency that's already there or planned needs nothing more.
+        if !is_root
+            && r.version.is_none()
+            && let Some(p) = &r.project
+            && (installed.contains_key(p) || plan.iter().any(|v| &v.project_id == p))
+        {
+            continue;
+        }
+        let got = match (&r.version, &r.project) {
+            (Some(id), _) => src.version(id).await,
+            (None, Some(p)) => src.latest(p).await,
+            (None, None) => continue,
+        };
+        let v = match got {
+            Ok(v) => v,
+            Err(e) if is_root => return Err(e),
+            Err(e) => {
+                let name = match (&r.project, &r.version) {
+                    (Some(p), _) => src.title(p).await.unwrap_or_else(|| p.clone()),
+                    (None, v) => format!("version {}", v.as_deref().unwrap_or_default()),
+                };
+                missing.push(format!("{name}: {e:#}"));
+                continue;
+            }
+        };
+        let is_pin = r.version.is_some();
+        if let Some(have) = installed.get(&v.project_id) {
+            if is_root {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            if is_pin && *have != v.id {
+                let name = src.title(&v.project_id).await.unwrap_or_else(|| v.project_id.clone());
+                missing.push(format!("{name} {} is required, but another version is installed", v.version_number));
+            }
+            continue;
+        }
+        match plan.iter().position(|p| p.project_id == v.project_id) {
+            Some(i) if plan[i].id == v.id => continue,
+            // A pin replaces the newest build picked for an unpinned reference.
+            Some(i) if is_pin && !pinned.contains(&v.project_id) => {
+                plan.remove(i);
+            }
+            Some(i) => {
+                if is_pin {
+                    let name = src.title(&v.project_id).await.unwrap_or_else(|| v.project_id.clone());
+                    missing.push(format!("{name}: needs both {} and {}", plan[i].version_number, v.version_number));
+                }
+                continue;
+            }
+            None => {}
+        }
+        if is_pin {
+            pinned.insert(v.project_id.clone());
+        }
+        if kind == ContentKind::Mods {
+            for d in v.dependencies.iter().filter(|d| d.dependency_type == "required") {
+                queue.push_back(Ref { project: d.project_id.clone(), version: d.version_id.clone() });
+            }
+        }
+        plan.push(v);
+    }
+    Ok((plan, missing))
+}
+
+/// Project id → version id for the instance's files Modrinth knows. Empty if
+/// the lookup fails; `install` still skips files with the same name.
+async fn installed_versions(inst: &Instance, kind: ContentKind) -> HashMap<String, String> {
+    let files = inst.content(kind);
+    let hashes = tokio::task::spawn_blocking(move || files.iter().filter(|f| !f.is_dir).filter_map(|f| net::sha1_file(&f.path)).collect())
+        .await
+        .unwrap_or_default();
+    match content_meta::versions(hashes).await {
+        Ok(m) => m.into_values().collect(),
+        Err(e) => {
+            eprintln!("looking up installed {}: {e:#}", kind.dir());
+            HashMap::new()
+        }
+    }
+}
+
+/// Install the newest compatible version of a project (plus, for mods, its
+/// required dependencies). The whole set is worked out before anything is
+/// downloaded; a dependency that can't be met is reported, not fatal.
+pub async fn install(kind: ContentKind, project: &str, inst: &Instance) -> anyhow::Result<Installed> {
+    let dir = inst.game_dir().join(kind.dir());
+    tokio::fs::create_dir_all(&dir).await?;
+    let installed = installed_versions(inst, kind).await;
+    let (plan, missing) = plan(&Api { kind, inst }, kind, project, &installed).await?;
+    let existing: HashSet<String> = inst.content(kind).into_iter().map(|m| m.name.trim_end_matches(".disabled").to_string()).collect();
+    let (mut files, mut projects) = (Vec::new(), Vec::new());
+    for v in &plan {
+        let file = v.files.iter().find(|f| f.primary).or(v.files.first()).context("version has no files")?;
+        if !existing.contains(&file.filename) {
+            net::download(&Download {
+                url: file.url.clone(),
+                path: dir.join(&file.filename),
+                sha1: Some(file.hashes.sha1.clone()),
+                size: Some(file.size),
+            })
+            .await?;
+            files.push(file.filename.clone());
+            projects.push(v.project_id.clone());
+        }
+    }
+    Ok(Installed { files, projects, missing })
+}
+
+pub fn format_count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}k", n as f64 / 1e3),
+        _ => format!("{:.1}M", n as f64 / 1e6),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loaders::Loader;
+
+    /// Versions newest first; `latest` takes the first of a project.
+    struct Fixture(Vec<Version>);
+
+    impl Source for Fixture {
+        async fn version(&self, id: &str) -> anyhow::Result<Version> {
+            self.0.iter().find(|v| v.id == id).cloned().context("no such version")
+        }
+
+        async fn latest(&self, project: &str) -> anyhow::Result<Version> {
+            self.0.iter().find(|v| v.project_id == project).cloned().context("no compatible build")
+        }
+
+        async fn title(&self, _: &str) -> Option<String> {
+            None
+        }
+    }
+
+    /// `deps` are required (project, version) references.
+    fn v(id: &str, project: &str, deps: &[(Option<&str>, Option<&str>)]) -> Version {
+        Version {
+            id: id.into(),
+            project_id: project.into(),
+            version_number: id.into(),
+            files: Vec::new(),
+            loaders: Vec::new(),
+            dependencies: deps
+                .iter()
+                .map(|(p, v)| Dependency { project_id: p.map(Into::into), version_id: v.map(Into::into), dependency_type: "required".into() })
+                .collect(),
+        }
+    }
+
+    fn ids(plan: &[Version]) -> Vec<&str> {
+        plan.iter().map(|v| v.id.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn plans_pinned_dependencies() {
+        let src = Fixture(vec![
+            v("app", "app", &[(None, Some("lib-1")), (Some("api"), Some("api-1")), (Some("api"), None)]),
+            v("lib-2", "lib", &[]),
+            v("lib-1", "lib", &[]),
+            v("api-2", "api", &[]),
+            v("api-1", "api", &[]),
+        ]);
+        let (plan, missing) = plan(&src, ContentKind::Mods, "app", &HashMap::new()).await.unwrap();
+        // A version-only reference is followed, and a pin beats the newest build.
+        assert_eq!(ids(&plan), ["app", "lib-1", "api-1"]);
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    #[tokio::test]
+    async fn pin_replaces_an_earlier_unpinned_pick() {
+        let src = Fixture(vec![
+            v("app", "app", &[(Some("a"), None), (Some("b"), None)]),
+            v("a", "a", &[(Some("lib"), None)]),
+            v("b", "b", &[(Some("lib"), Some("lib-1"))]),
+            v("lib-2", "lib", &[]),
+            v("lib-1", "lib", &[]),
+        ]);
+        let (plan, _) = plan(&src, ContentKind::Mods, "app", &HashMap::new()).await.unwrap();
+        assert_eq!(ids(&plan), ["app", "a", "b", "lib-1"]);
+    }
+
+    #[tokio::test]
+    async fn reports_missing_dependencies() {
+        let src = Fixture(vec![
+            v("app", "app", &[(Some("gone"), None), (None, Some("gone-1")), (Some("x"), Some("x-1")), (Some("y"), Some("y-1"))]),
+            v("x-1", "x", &[(Some("z"), Some("z-1"))]),
+            v("y-1", "y", &[(Some("z"), Some("z-2"))]),
+            v("z-1", "z", &[]),
+            v("z-2", "z", &[]),
+        ]);
+        let (plan, missing) = plan(&src, ContentKind::Mods, "app", &HashMap::new()).await.unwrap();
+        assert_eq!(ids(&plan), ["app", "x-1", "y-1", "z-1"]);
+        assert_eq!(missing.len(), 3, "{missing:?}");
+        assert!(missing[0].starts_with("gone:"));
+        assert!(missing[1].starts_with("version gone-1:"));
+        assert!(missing[2].contains("needs both z-1 and z-2"));
+        // The project the user picked failing is an error, not a warning.
+        assert!(plan_err(&src, "nope").await);
+    }
+
+    async fn plan_err(src: &Fixture, project: &str) -> bool {
+        plan(src, ContentKind::Mods, project, &HashMap::new()).await.is_err()
+    }
+
+    #[tokio::test]
+    async fn skips_what_is_installed() {
+        let src = Fixture(vec![
+            v("app", "app", &[(Some("api"), None), (Some("lib"), Some("lib-2"))]),
+            v("api-2", "api", &[]),
+            v("lib-2", "lib", &[]),
+        ]);
+        // Installed under any filename, matched by project.
+        let installed = HashMap::from([("api".to_string(), "api-1".to_string()), ("lib".to_string(), "lib-1".to_string())]);
+        let (plan, missing) = plan(&src, ContentKind::Mods, "app", &installed).await.unwrap();
+        assert_eq!(ids(&plan), ["app"]);
+        assert_eq!(missing, ["lib lib-2 is required, but another version is installed"]);
+        let installed = HashMap::from([("app".to_string(), "old".to_string())]);
+        assert!(super::plan(&src, ContentKind::Mods, "app", &installed).await.unwrap().0.is_empty());
+    }
+
+    /// Hits the network; run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn installs_packs() {
+        let mut inst = Instance::new("t", "1.21.1", Loader::Fabric("0.16.5".into()));
+        inst.assign_id().unwrap();
+        inst.save().unwrap();
+        for (kind, slug) in [(ContentKind::ShaderPacks, "complementary-reimagined"), (ContentKind::ResourcePacks, "fresh-animations")] {
+            let hits = search(kind, "", &inst).await.unwrap().hits;
+            assert!(!hits.is_empty(), "{kind:?} search empty");
+            let done = install(kind, slug, &inst).await.unwrap();
+            println!("{kind:?}: {done:?}");
+            assert_eq!(inst.content(kind).len(), 1);
+        }
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+    }
+}

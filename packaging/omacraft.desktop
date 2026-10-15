@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Omacraft
+Comment=Minecraft launcher themed by Omarchy
+Exec=omacraft
+Icon=omacraft
+Terminal=false
+Categories=Game;
+StartupWMClass=omacraft

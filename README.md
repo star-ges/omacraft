@@ -1,0 +1,125 @@
+# Omacraft
+
+A Minecraft launcher in Rust, modeled on [Prism Launcher](https://github.com/PrismLauncher/PrismLauncher)
+and drawn in [Omarchy](https://omarchy.org)'s design language.
+
+It follows your Omarchy theme and changes with it, and on other systems it uses Tokyo Night.
+You can drive the whole thing with vim-style keys, or just use the mouse.
+
+## Install
+
+You need Rust 1.95 or newer ([rustup](https://rustup.rs)). Then:
+
+```sh
+git clone https://github.com/star-ges/omacraft
+cd omacraft
+cargo build --release
+install -Dm755 target/release/omacraft ~/.local/bin/omacraft
+install -Dm644 packaging/omacraft.desktop ~/.local/share/applications/omacraft.desktop
+install -Dm644 packaging/omacraft.svg ~/.local/share/icons/hicolor/scalable/apps/omacraft.svg
+```
+
+It runs on Linux (x86_64) under Wayland or X11. File pickers use the XDG desktop portal, and fonts
+are found with fontconfig. Java isn't needed: Omacraft downloads the runtime each Minecraft version
+expects.
+
+## Features
+
+- **Instances**: each one is a self-contained `.minecraft` with its own version, loader, memory,
+  JVM args, Java, window size, icon, group and notes. Libraries, assets and runtimes are shared
+  between instances.
+- **Loaders**: vanilla (every release and snapshot), Fabric, Quilt, Forge and NeoForge. Forge 1.13+
+  and NeoForge patch the game on the first launch of each build, so that launch takes a minute longer.
+- **Modrinth**: search and install mods, resource packs and shader packs, with dependencies resolved.
+  Installed items show their name, icon and version.
+- **Import**: Prism, PolyMC and MultiMC instances (found automatically, or from a `.zip` or folder)
+  and Modrinth packs (a `.mrpack` or a modrinth.com modpack link). Drop a file on the window to import
+  it. On btrfs, even huge instances import instantly.
+- **Export**: a Modrinth pack (`.mrpack`) or an instance zip that Prism, PolyMC and MultiMC open.
+  You choose which folders go in.
+- **Per-instance tabs**: version and loader, live game log, mods, resource packs, shader packs, notes,
+  worlds (open one directly on 1.20+, rename, duplicate, delete), servers (edit the list, join directly),
+  screenshots and past logs and crash reports.
+- **Groups**: collapsible groups in the instance list, each with an optional colour from the theme.
+  Drag instances between them, or press `g` to manage them.
+- **Accounts and skins**: Microsoft and offline accounts. A 3D preview of each skin and cape; upload a
+  skin, switch between classic and slim arms, or pick a cape you own.
+- **Keyboard first**: `h`/`l` move between panes and `j`/`k` within them, `enter` does the obvious
+  thing (play, join, install, open) and `p` plays from anywhere. The bottom bar shows the keys for the
+  focused pane, `?` lists them all, and every key can be rebound in **settings → keys** or in `config.toml`:
+  ```toml
+  [keys]
+  down = ["j", "down"]
+  play = ["p", "ctrl+enter"]
+  ```
+- **CLI**, for Hyprland binds or the Omarchy menu:
+  ```
+  omacraft list                 # grouped like the sidebar; tab-separated when piped
+  omacraft launch <instance>
+  omacraft create <name> <version> [fabric|quilt|forge|neoforge]
+  omacraft mod add <instance> <modrinth-slug>
+  omacraft import <zip|mrpack|folder|url>
+  omacraft export <instance> <file.zip|file.mrpack>
+  omacraft theme
+  ```
+
+Not supported: CurseForge packs and downloads, LiteLoader, and Forge before 1.6.
+
+## Omarchy integration
+
+| What | Source |
+|---|---|
+| Palette | `~/.local/state/omarchy/current/theme/colors.toml` |
+| Control and menu states | `[controls]` and `[menu]` in the generated `shell.toml`, as the Omarchy shell's menus use |
+| Modal and toast border | `[hyprland] active-border` (your window border colour) |
+| Font and size | fontconfig `monospace` (what `omarchy font set` writes) and `[font] base-size`; icons from a Nerd Font, with one bundled as a fallback |
+
+Outside Omarchy it uses Omarchy's stock Tokyo Night theme. The window has no client-side decorations,
+since Hyprland draws the frame, and its Wayland app-id is `omacraft`, for window rules.
+
+## Microsoft sign-in
+
+Omacraft ships its own Azure app ID, approved by Mojang for the Minecraft API, so sign-in works
+without any setup. The **settings → client id** field (or `OMACRAFT_MSA_CLIENT_ID`) is only for
+using a different Azure app; leave it empty otherwise. If you fork Omacraft, register your own
+Azure app and get it approved by Mojang rather than shipping this one. Prism's ID is licensed to
+Prism alone, so don't borrow it.
+
+## Where things live
+
+```
+~/.config/omacraft/config.toml
+~/.local/share/omacraft/
+  instances/<id>/instance.toml
+  instances/<id>/minecraft/        game dir (mods/, saves/, …)
+  groups.toml                      group order and colours
+  icons/                           your own instance icons
+  libraries/  assets/  versions/  runtimes/  meta/
+  accounts.json                    0600
+```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for building, testing and how the code maps onto Prism's.
+
+## Credits
+
+The instance icons in `assets/icons/` are unmodified copies of [Prism Launcher](https://github.com/PrismLauncher/PrismLauncher)'s
+(`launcher/resources/multimc/scalable/instances/`), apart from `omacraft.svg`. All but three are by Prism Launcher
+and its contributors (AutiOne, Boba, ely, Fulmine, gon sawa, Pankakes, tobimori, Zeke, Santiago Cézar),
+licensed [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). `fabricmc.svg`, `quiltmc.svg` and
+`neoforged.svg` are the Fabric, Quilt and NeoForged logos, used only to identify those loaders. Their
+artwork is openly licensed: Fabric's is Copyright 2016 FabricMC under Apache 2.0
+([fabric-loader](https://github.com/FabricMC/fabric-loader); see `assets/icons/fabricmc-LICENSE`), Quilt's is
+[CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/) ([QuiltMC/art](https://github.com/QuiltMC/art)),
+and NeoForged's is by the NeoForged Project under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+([neoforged/websites](https://github.com/neoforged/websites); redrawn as an SVG by Sefa Eyeoglu). None of those
+licenses cover trademarks: the names and logos belong to their projects, and Omacraft isn't affiliated with them.
+
+`assets/fonts/SymbolsNerdFontMono-Regular.ttf` is [Nerd Fonts](https://github.com/ryanoasis/nerd-fonts)'
+Symbols Only font v3.5.1 (MIT, see `SymbolsNerdFont-LICENSE`). It's bundled as a fallback so icons
+render without a Nerd Font installed; a system Nerd Font takes precedence.
+
+## License
+
+[MIT](LICENSE). The bundled icons, logos and font keep their own terms, listed under Credits.
