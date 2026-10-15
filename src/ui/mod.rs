@@ -556,8 +556,6 @@ impl App {
                             let text = if stage.is_empty() { task.0.label.clone() } else { stage };
                             ui.label(RichText::new(text).color(t.muted));
                             ui.ctx().request_repaint_after(Duration::from_millis(100));
-                        } else if let Some(theme) = Some(&t.name).filter(|n| !n.is_empty()) {
-                            ui.label(RichText::new(format!("󰏘 {theme}")).color(t.muted));
                         }
                         // Hints get whatever is left, clipped rather than overlapping.
                         ui.add_space(16.0);

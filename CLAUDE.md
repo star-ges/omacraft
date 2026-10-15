@@ -4,7 +4,7 @@ A Minecraft launcher in Rust (egui/eframe 0.36), modeled on Prism Launcher and d
 Omarchy's design language. It themes itself live from the active Omarchy theme. The README
 covers features and file layout for users; this file is for working on the code.
 
-Public repo: `star-ges/omacraft`, branch `master`. The name is **Omacraft**, with a capital O
+Repo: `star-ges/omacraft` (private for now; to go public once the README has screenshots), branch `master`. The name is **Omacraft**, with a capital O
 only, like Omacalc. Use lowercase `omacraft` for the binary, app-id and paths. Never write "OmaCraft".
 
 ## Build, run, test
@@ -154,7 +154,7 @@ and note any rule a fix sets under "Behaviour rules" above.
 
 - **S8:** size-only cache check is a deliberate speed trade-off (corruption risk, not a security hole). If it
   bites, record verified hashes by path/size/mtime (like `content_meta`) or add a "verify files" action.
-- **C5:** non-x86 architecture matching. Omarchy is x86_64 only; now the repo is public, an explicit
+- **C5:** non-x86 architecture matching. Omarchy is x86_64 only; once the repo is public, an explicit
   "unsupported architecture" error would be kinder than partial matching.
 
 ## Parked (README "Not yet")

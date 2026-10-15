@@ -23,6 +23,21 @@ It runs on Linux (x86_64) under Wayland or X11. File pickers use the XDG desktop
 are found with fontconfig. Java isn't needed: Omacraft downloads the runtime each Minecraft version
 expects.
 
+## Uninstall
+
+Remove the three installed files:
+
+```sh
+rm ~/.local/bin/omacraft ~/.local/share/applications/omacraft.desktop ~/.local/share/icons/hicolor/scalable/apps/omacraft.svg
+```
+
+That keeps your instances and settings. To delete those as well, including every world and your
+signed-in accounts:
+
+```sh
+rm -rf ~/.local/share/omacraft ~/.config/omacraft
+```
+
 ## Features
 
 - **Instances**: each one is a self-contained `.minecraft` with its own version, loader, memory,

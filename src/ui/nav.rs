@@ -152,9 +152,10 @@ pub fn hints(app: &App) -> Vec<(String, &'static str)> {
         return vec![("any key".into(), "bind it"), ("esc".into(), "cancel")];
     }
     if app.modal.is_some() {
-        return vec![("esc".into(), "close"), ("󰌑".into(), "confirm"), (p(Down, Up), "move"), (l(Help), "keys")];
+        return vec![(l(Help), "keys"), ("esc".into(), "close"), ("󰌑".into(), "confirm"), (p(Down, Up), "move")];
     }
-    let mut h: Vec<(String, &str)> = Vec::new();
+    // `?` leads, so the way to every other key is always in the same place.
+    let mut h: Vec<(String, &str)> = vec![(l(Help), "keys")];
     match app.tab {
         Tab::Accounts if app.acct.has_pending() => {
             h.extend([(l(Activate), "upload skin"), (l(Back), "cancel"), (l(Toggle), "classic/slim"), (p(TurnLeft, TurnRight), "turn")])
@@ -200,7 +201,7 @@ pub fn hints(app: &App) -> Vec<(String, &'static str)> {
             h.extend([(l(FocusLeft), "back"), (p(PrevTab, NextTab), "tabs")]);
         }
     }
-    h.extend([(l(Play), "play"), (l(Help), "keys")]);
+    h.push((l(Play), "play"));
     h
 }
 
