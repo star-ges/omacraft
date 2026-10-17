@@ -120,10 +120,21 @@ fn shared(app: &mut App, ui: &mut Ui) {
     let busy = app.sharing.is_some();
     let mut sets = app.share_sets.clone();
     sets.extend(app.instances.iter().map(|i| i.share_set.clone()).filter(|s| !s.is_empty()));
+    sets.extend(app.share_links.keys().cloned());
     sets.sort_by_key(|s| s.to_lowercase());
     sets.dedup();
     for set in &sets {
-        let members: Vec<&str> = app.instances.iter().filter(|i| &i.share_set == set).map(|i| i.name.as_str()).collect();
+        // Instances that left on paper but still link in (a leave that failed) count too.
+        let linked = app.share_links.get(set);
+        let members: Vec<String> = app
+            .instances
+            .iter()
+            .filter_map(|i| match (&i.share_set == set, linked.is_some_and(|l| l.contains(&i.id))) {
+                (true, _) => Some(i.name.clone()),
+                (false, true) => Some(format!("{} (leaving)", i.name)),
+                (false, false) => None,
+            })
+            .collect();
         ui.horizontal(|ui| {
             w::field_label(ui, &t, set);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

@@ -12,6 +12,7 @@
 //! Screenshots aren't shared on disk: the screenshots tab can show every instance's
 //! at once instead.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -64,10 +65,42 @@ pub fn sets_on_disk() -> Vec<String> {
     out
 }
 
-/// Delete a share set's folder and everything in it.
+/// Delete a share set's folder and everything in it. Refuses while any instance's
+/// folder still links into it (say, one whose leave failed halfway), whatever its
+/// `share_set` says: deleting would take that instance's only packs with it.
 pub fn delete_set(name: &str) -> anyhow::Result<()> {
     check_set_name(name)?;
+    if let Some(ids) = sets_in_use().remove(name) {
+        bail!("“{name}” is still linked from {} (Omacraft finishes leaving it at the next launch)", ids.join(", "));
+    }
     std::fs::remove_dir_all(set_dir(name)).with_context(|| format!("deleting share set {name}"))
+}
+
+/// Share set name → ids of the instances whose folders link into it now. This is
+/// what's on disk, which lags `share_set` until a change finishes. Reads a few links
+/// per instance.
+pub fn sets_in_use() -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for e in std::fs::read_dir(paths::instances_dir()).into_iter().flatten().flatten() {
+        let id = e.file_name().to_string_lossy().into_owned();
+        let game = e.path().join("minecraft");
+        let mut sets: Vec<String> = SET_FOLDERS.iter().filter_map(|f| linked_set(&game.join(f))).collect();
+        sets.dedup();
+        for set in sets {
+            out.entry(set).or_default().push(id.clone());
+        }
+    }
+    out
+}
+
+/// The share set `link` points into, if it's a link to one.
+fn linked_set(link: &Path) -> Option<String> {
+    let t = std::fs::read_link(link).ok()?;
+    let rest = t.strip_prefix(format!("{UP}/shared/sets")).or_else(|_| t.strip_prefix(sets_dir())).ok()?;
+    match rest.components().next()? {
+        std::path::Component::Normal(n) => Some(n.to_string_lossy().into_owned()).filter(|n| check_set_name(n).is_ok()),
+        _ => None,
+    }
 }
 
 /// Where `folder` in the game dir should link to, relative to the game dir.
@@ -319,6 +352,32 @@ mod tests {
             std::fs::remove_dir_all(i.dir()).unwrap();
         }
         delete_set(&set).unwrap();
+    }
+
+    #[test]
+    fn a_failed_leave_keeps_the_set_from_being_deleted() {
+        use std::os::unix::fs::PermissionsExt;
+        let set = set_name();
+        let mut a = instance("a", &set, &[("resourcepacks/p.zip", "p")]);
+        apply(&a).unwrap();
+        // The copy out of the set fails partway, as on a full disk.
+        let pack = set_dir(&set).join("resourcepacks/p.zip");
+        std::fs::set_permissions(&pack, std::fs::Permissions::from_mode(0o000)).unwrap();
+        a.share_set.clear();
+        a.save().unwrap();
+        assert!(apply(&a).is_err());
+        assert_eq!(sets_in_use().get(&set), Some(&vec![a.id.clone()]));
+        // No instance names the set any more, but deleting it would take a's packs.
+        assert!(delete_set(&set).is_err());
+        assert!(std::fs::symlink_metadata(&pack).is_ok());
+
+        // The next try finishes leaving; then the set can go.
+        std::fs::set_permissions(&pack, std::fs::Permissions::from_mode(0o644)).unwrap();
+        apply(&a).unwrap();
+        assert_eq!(std::fs::read_to_string(a.game_dir().join("resourcepacks/p.zip")).unwrap(), "p");
+        assert!(!sets_in_use().contains_key(&set));
+        delete_set(&set).unwrap();
+        std::fs::remove_dir_all(a.dir()).unwrap();
     }
 
     #[test]

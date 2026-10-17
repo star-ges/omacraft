@@ -161,6 +161,9 @@ pub struct App {
     pub sharing: Option<(Task, Promise<(Vec<String>, Vec<String>)>)>,
     /// Share sets with a folder on disk, re-read when sharing changes.
     pub share_sets: Vec<String>,
+    /// Share set → ids of instances whose folders link into it, re-read with `share_sets`.
+    /// Can name an instance that has left on paper but whose leave hasn't finished.
+    pub share_links: std::collections::BTreeMap<String, Vec<String>>,
     /// "new group" text in the instance context menu.
     pub group_buf: String,
     pub toasts: Vec<Toast>,
@@ -216,6 +219,7 @@ impl App {
             reclaim: None,
             sharing: None,
             share_sets: crate::shares::sets_on_disk(),
+            share_links: crate::shares::sets_in_use(),
             group_buf: String::new(),
             toasts: Vec::new(),
         };
@@ -379,6 +383,8 @@ impl App {
                 Phase::Game(p) => {
                     let Some(r) = p.take() else { continue };
                     s.phase = Phase::Ended;
+                    // The launch may have finished a share set change.
+                    self.share_links = crate::shares::sets_in_use();
                     match r {
                         Ok(res) => {
                             if let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) {
@@ -474,7 +480,7 @@ impl App {
                 }
                 Err(e) => self.toast(ToastKind::Error, format!("Shared folders: {e:#}")),
             }
-            self.share_sets = crate::shares::sets_on_disk();
+            self.refresh_shares();
             self.shots.invalidate();
             self.content.invalidate();
         }
@@ -511,6 +517,11 @@ impl App {
             let p = Promise::spawn(&self.rt, ctx, crate::store::reclaim(task.clone()));
             self.reclaim = Some((task, p));
         }
+    }
+
+    pub fn refresh_shares(&mut self) {
+        self.share_sets = crate::shares::sets_on_disk();
+        self.share_links = crate::shares::sets_in_use();
     }
 
     /// Bring these instances' shared folders in line with their settings. Running
@@ -909,12 +920,14 @@ impl App {
             ConfirmAction::ResetSkin(uuid) => accounts::skin_change(self, ctx, uuid, crate::skins::Change::Reset),
             ConfirmAction::DeleteShareSet(name) => {
                 // Checked again: an instance may have joined since the dialog opened.
-                if self.sharing.is_some() || self.instances.iter().any(|i| &i.share_set == name) {
+                // `delete_set` also refuses while any instance still links into the set.
+                self.refresh_shares();
+                if self.sharing.is_some() || self.instances.iter().any(|i| &i.share_set == name) || self.share_links.contains_key(name) {
                     self.toast(ToastKind::Error, format!("{name} is in use"));
                 } else if let Err(e) = crate::shares::delete_set(name) {
                     self.toast(ToastKind::Error, format!("{e:#}"));
                 }
-                self.share_sets = crate::shares::sets_on_disk();
+                self.refresh_shares();
             }
         }
     }

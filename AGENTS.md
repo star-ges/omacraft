@@ -117,8 +117,10 @@ test (and a rule here) with any fix that sets a new one.
   (identical files kept once, other clashes renamed `name (<instance id>).ext`, folders merged except unzipped packs).
   Unsharing a set folder replaces the link with a full copy; moving between sets only relinks. `shares::apply` is idempotent and
   runs at every launch, so new, imported or running-at-the-time instances catch up. Deleting an instance removes
-  only its links. Export follows top-level share links only; reclaim counts each shared file once. Tests:
-  `shares::tests`, `export::tests::shared_folders_export_like_normal_ones` (exports are self-contained: real files,
+  only its links. Export follows top-level share links only; reclaim counts each shared file once. A set counts as
+  in use while any instance's folder still links into it (`shares::sets_in_use`), not just by `share_set`, so a
+  leave that failed halfway keeps it from being deleted until the next `apply` finishes. Tests:
+  `shares::tests` (incl. `a_failed_leave_keeps_the_set_from_being_deleted`), `export::tests::shared_folders_export_like_normal_ones` (exports are self-contained: real files,
   mods included).
 - **Screenshots stay per instance:** never pool them on disk (a shared pool needed guessed ownership, which lost or
   misattributed files). The screenshots tab's "all instances" toggle (config `all_screenshots`) lists every
