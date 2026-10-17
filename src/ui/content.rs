@@ -410,7 +410,8 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
     if s.searched.as_ref().is_none_or(|(id, _)| *id != inst.id) {
         s.search(kind, inst, &rt, &ctx);
     }
-    meta.ensure(&s.files(inst, kind), kind, &rt, &ctx);
+    let files = s.files(inst, kind);
+    meta.ensure(&files, kind, &rt, &ctx);
     let mut out = Out::default();
     // Installing into a folder that's being moved into or out of a share set could land
     // the file in the old place or get it renamed on a clash.
@@ -424,7 +425,7 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
     let ups = match kind {
         ContentKind::Mods => Some(Updates {
             list: match &app.content.updates {
-                Some((id, Check::Found(l))) if *id == inst.id => l.clone(),
+                Some((id, Check::Found(l))) if *id == inst.id => current_updates(l, inst, &files),
                 _ => Vec::new(),
             },
             checking: app.content.updates.as_ref().is_some_and(|(id, c)| *id == inst.id && matches!(c, Check::Running(_))),
@@ -487,6 +488,22 @@ struct Updates {
     /// An update or rollback is running in this instance.
     running: bool,
     key: Option<Action>,
+}
+
+/// An update's file as if enabled, like [`base_path`].
+fn update_base(u: &Update) -> PathBuf {
+    u.path.with_file_name(u.path.file_name().unwrap_or_default().to_string_lossy().trim_end_matches(".disabled"))
+}
+
+/// The updates in `list` still good for `inst` as it is now: picked for its game, for a
+/// file it still has (enabled or not). `update` checks each file's contents again.
+fn current_updates(list: &[Update], inst: &Instance, files: &[ModFile]) -> Vec<Update> {
+    let game = modrinth::game_key(inst);
+    let names: HashSet<PathBuf> = files.iter().map(base_path).collect();
+    list.iter()
+        .filter(|u| u.game == game && names.contains(&update_base(u)))
+        .cloned()
+        .collect()
 }
 
 /// Update `list`'s mods in the background, unless the instance is busy.
@@ -705,7 +722,9 @@ fn installed(
     out: &mut Out,
 ) {
     let files = s.files(inst, kind);
-    let update_for = |m: &ModFile| ups.and_then(|u| u.list.iter().find(|x| x.path == m.path));
+    let update_for = |m: &ModFile| ups.and_then(|u| u.list.iter().find(|x| update_base(x) == base_path(m)));
+    // Mods aren't switched or removed under an update or rollback.
+    let busy = ups.is_some_and(|u| u.running);
     // Selection is by file stem, so it survives enable/disable renames.
     let stem = |m: &ModFile| m.name.trim_end_matches(".disabled").to_string();
     let pos = s.selected.as_ref().and_then(|n| files.iter().position(|m| stem(m) == *n));
@@ -718,7 +737,9 @@ fn installed(
     // Buttons, then the count: right-aligned if it fits, else on its own line.
     ui.horizontal_wrapped(|ui| {
         let sel = s.selected.as_ref().and_then(|n| files.iter().find(|m| stem(m) == *n)).cloned();
-        if let Some(m) = &sel {
+        if let Some(m) = &sel
+            && !busy
+        {
             if w::button(ui, if m.enabled { "disable" } else { "enable" }).clicked() || key(Nav::Toggle) || key(Nav::Activate) {
                 if let Err(e) = m.toggle() {
                     out.error = Some(format!("{e:#}"));
@@ -807,7 +828,7 @@ fn installed(
                 s.selected = Some(stem(m));
                 out.to_installed = true;
             }
-            if r.double_clicked() {
+            if r.double_clicked() && !busy {
                 if let Err(e) = m.toggle() {
                     out.error = Some(format!("{e:#}"));
                 }
@@ -1009,6 +1030,29 @@ mod tests {
         assert_eq!(world_prompts(&inst, early)[0].selected, None);
         std::fs::remove_dir_all(inst.dir()).unwrap();
         backups::forget_instance(&inst.id);
+    }
+
+    /// G17: a found update stays on offer only for the game it was checked for and a file
+    /// still there, enabled or not.
+    #[test]
+    fn found_updates_go_stale_with_the_game_or_the_file() {
+        let mut inst = Instance::new("stale", "1.21.1", crate::loaders::Loader::Fabric("0.16.5".into()));
+        inst.id = "stale".into();
+        let dir = std::path::Path::new("/i/mods");
+        let up = |name: &str| Update {
+            path: dir.join(name),
+            sha1: String::new(),
+            game: modrinth::game_key(&inst),
+            title: name.into(),
+            from: "1".into(),
+            to: modrinth::Version { id: "x".into(), project_id: "p".into(), version_number: "2".into(), files: vec![], loaders: vec![], dependencies: vec![], date_published: None },
+        };
+        let list = [up("a.jar"), up("b.jar")];
+        // a was disabled since the check, b removed.
+        let files = [file(dir, "a.jar.disabled", 1, 1)];
+        assert_eq!(current_updates(&list, &inst, &files).iter().map(|u| u.title.as_str()).collect::<Vec<_>>(), ["a.jar"]);
+        inst.mc_version = "1.21.4".into();
+        assert!(current_updates(&list, &inst, &files).is_empty(), "checked for another game");
     }
 
     /// G16: a second instance's update doesn't drop the first one's: both stay busy

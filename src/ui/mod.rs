@@ -316,7 +316,9 @@ impl App {
             return;
         }
         // A restore or mod swap would change files under the game as it loads them.
-        if let Some(why) = worlds::launch_blocked(&self.content, &self.worlds, &inst) {
+        // So is a share or world set change: the launch's own `apply` would undo a leave halfway.
+        let why = if self.sharing.is_some() { Some("shared folders are moving") } else { worlds::launch_blocked(&self.content, &self.worlds, &inst) };
+        if let Some(why) = why {
             self.toast(ToastKind::Error, format!("Can't start {} while {why}", inst.name));
             return;
         }
