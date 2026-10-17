@@ -19,7 +19,10 @@ use crate::task::{Promise, Task};
 #[derive(Default)]
 struct KindState {
     query: String,
-    searched: Option<String>,
+    /// (instance id, query) of the last search sent.
+    searched: Option<(String, String)>,
+    /// When the query last changed, so a search goes out once typing pauses.
+    typed: Option<Instant>,
     search_p: Option<Promise<SearchResponse>>,
     results: Option<Result<Vec<Hit>, String>>,
     /// (instance id, project id) → the install running for it.
@@ -224,6 +227,7 @@ impl ContentState {
                 && let Some(r) = p.take()
             {
                 s.results = Some(r.map(|s| s.hits).map_err(|e| format!("{e:#}")));
+                s.result = None;
                 s.search_p = None;
             }
             let done: Vec<(String, String)> = s.installing.iter().filter(|(_, j)| j.promise.ready()).map(|(k, _)| k.clone()).collect();
@@ -262,9 +266,13 @@ impl KindState {
 
     fn search(&mut self, kind: ContentKind, inst: &Instance, rt: &tokio::runtime::Handle, ctx: &egui::Context) {
         let (i, q) = (inst.clone(), self.query.clone());
-        self.searched = Some(inst.id.clone());
-        self.results = None;
-        self.result = None;
+        // Keep the old results up while the query changes; only another instance's are stale.
+        if self.searched.as_ref().is_none_or(|(id, _)| *id != inst.id) {
+            self.results = None;
+            self.result = None;
+        }
+        self.searched = Some((inst.id.clone(), q.clone()));
+        self.typed = None;
         self.search_p = Some(Promise::spawn(rt, ctx, async move { modrinth::search(kind, &q, &i).await }));
     }
 }
@@ -299,7 +307,7 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
     let focus = std::mem::take(&mut app.content.focus_search) || main_nav == Some(Nav::Search) || side_nav == Some(Nav::Search);
     let (meta, remote) = (app.content.meta.clone(), app.content.remote.clone());
     let s = app.content.kinds.entry(kind).or_default();
-    if s.searched.as_deref() != Some(&inst.id) {
+    if s.searched.as_ref().is_none_or(|(id, _)| *id != inst.id) {
         s.search(kind, inst, &rt, &ctx);
     }
     meta.ensure(&s.files(inst, kind), kind, &rt, &ctx);
@@ -430,6 +438,9 @@ fn installed(
     });
 }
 
+/// How long typing has to pause before the Modrinth search goes out.
+const SEARCH_DELAY: Duration = Duration::from_millis(250);
+
 #[allow(clippy::too_many_arguments)]
 fn browse(
     ui: &mut Ui,
@@ -447,9 +458,22 @@ fn browse(
     out: &mut Out,
 ) {
     let r = w::text_input(ui, &mut s.query, &format!("/  search modrinth {}s", kind.noun()), ui.available_width(), focus);
-    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+    if r.changed() {
+        s.typed = Some(Instant::now());
+        ctx.request_repaint_after(SEARCH_DELAY);
+    }
+    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    let unsent = s.searched.as_ref().is_none_or(|(_, q)| *q != s.query);
+    if unsent && (enter || s.typed.is_some_and(|at| at.elapsed() >= SEARCH_DELAY)) {
         s.search(kind, inst, rt, ctx);
+    }
+    if enter {
         out.to_results = true;
+    }
+    if s.search_p.is_some() && s.results.is_some() {
+        let side = r.rect.height() - 10.0;
+        let rect = egui::Rect::from_min_size(r.rect.right_top() + vec2(-side - 5.0, 5.0), vec2(side, side));
+        egui::Spinner::new().color(t.muted).paint_at(ui, rect);
     }
     let count = s.results.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |h| h.len());
     let mut scroll = false;
