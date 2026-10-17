@@ -203,6 +203,14 @@ pub fn write_records(inst: &Instance, worlds: &[PathBuf]) -> Vec<String> {
 /// by another game, is kept. Returns what went wrong or was kept, for the log.
 pub fn record_plays(loadout: &Loadout, plays: &[(PathBuf, DateTime<Utc>)]) -> Vec<String> {
     let mut notes = Vec::new();
+    // Games exiting together (any process) take turns, so the newer play's record wins.
+    let _lock = match fsutil::lock(&crate::paths::data_dir().join(".records.lock")) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            notes.push(format!("couldn't lock the play records: {e}"));
+            None
+        }
+    };
     for (w, played) in plays {
         if let Some(had) = read_record(w).filter(|r| r.played > *played) {
             let name = w.file_name().unwrap_or_default().to_string_lossy();
