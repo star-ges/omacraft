@@ -115,6 +115,8 @@ test (and a rule here) with any fix that sets a new one.
   file matches. Tests: `store::tests` (run with `TMPDIR` on btrfs to cover the reflink path, since `/tmp` is tmpfs).
 - **Shared folders:** sharing turns the instance's folder into a relative link into `shared/`, moving its files in
   (identical files kept once, other clashes renamed `name (<instance id>).ext`, folders merged except unzipped packs).
+  Links inside a folder being shared are first replaced by copies of what they point to (relative ones would point
+  elsewhere from `shared/`), like folder imports; a broken or looping one stops the join before anything moves.
   Unsharing a set folder replaces the link with a full copy; moving between sets only relinks. `shares::apply` is idempotent and
   runs at every launch, so new, imported or running-at-the-time instances catch up. Deleting an instance removes
   only its links. Export follows top-level share links only; reclaim counts each shared file once. A share link is
@@ -129,7 +131,7 @@ test (and a rule here) with any fix that sets a new one.
   and a share set change waits for exports and installs in the instance or any member of the old or new set
   (`App::set_busy`, members from `instances::set_members`). Tests:
   `shares::tests` (incl. `a_failed_leave_keeps_the_set_from_being_deleted`, `only_links_that_really_lead_into_a_set_count`,
-  `an_interrupted_leave_is_finished_by_the_next_apply`), `ui::instances::tests::set_members_count_instances_still_linked_in`, `export::tests::shared_folders_export_like_normal_ones` (exports are self-contained: real files,
+  `an_interrupted_leave_is_finished_by_the_next_apply`), `shares::tests::links_inside_a_shared_folder_become_copies`, `ui::instances::tests::set_members_count_instances_still_linked_in`, `export::tests::shared_folders_export_like_normal_ones` (exports are self-contained: real files,
   mods included).
 - **Screenshots stay per instance:** never pool them on disk (a shared pool needed guessed ownership, which lost or
   misattributed files). The screenshots tab's "all instances" toggle (config `all_screenshots`) lists every

@@ -168,6 +168,7 @@ pub fn apply(inst: &Instance) -> anyhow::Result<Vec<String>> {
                     Ok(m) if m.is_dir() => {
                         // Pack folders (unzipped packs) clash as a whole; other folders merge.
                         let merge = folder != "resourcepacks" && folder != "shaderpacks";
+                        copy_through_links(&link, &mut notes).with_context(|| format!("can't share {folder}"))?;
                         move_into(&link, &shared, merge, &inst.id, &mut notes).with_context(|| format!("moving {folder} into the shared folder"))?;
                     }
                     Ok(_) => {
@@ -300,12 +301,72 @@ fn move_into(src: &Path, dst: &Path, merge: bool, tag: &str, notes: &mut Vec<Str
     Ok(())
 }
 
+/// Replace every link under `dir` with a copy of what it points to, so the files read
+/// the same once moved (a relative link would point somewhere else from the shared
+/// folder), as folder imports do. Changes nothing, and fails naming them, if any link
+/// is broken or loops back up the tree.
+fn copy_through_links(dir: &Path, notes: &mut Vec<String>) -> anyhow::Result<()> {
+    let mut links = Vec::new();
+    find_links(dir, &mut links)?;
+    let bad: Vec<String> = links
+        .iter()
+        .filter(|l| match (l.canonicalize(), l.parent().map(Path::canonicalize)) {
+            (Ok(t), Some(Ok(parent))) => parent.starts_with(&t),
+            _ => true,
+        })
+        .map(|l| l.strip_prefix(dir).unwrap_or(l).display().to_string())
+        .collect();
+    if !bad.is_empty() {
+        bail!("these links are broken or loop back up the folder: {}; fix or remove them first", bad.join(", "));
+    }
+    for link in links {
+        let tmp = link.with_file_name(format!(".{}.{}.copy", link.file_name().unwrap_or_default().to_string_lossy(), uuid::Uuid::new_v4().simple()));
+        let real = link.canonicalize()?;
+        let copied = if real.is_dir() { fsutil::copy_tree(&real, &tmp, &|_| {}) } else { reflink_copy::reflink_or_copy(&real, &tmp).map(|_| Vec::new()) };
+        match copied {
+            Ok(skipped) => notes.extend(skipped),
+            Err(e) => {
+                let _ = if tmp.is_dir() { std::fs::remove_dir_all(&tmp) } else { std::fs::remove_file(&tmp) };
+                return Err(e.into());
+            }
+        }
+        match exchange(&tmp, &link) {
+            Ok(()) => std::fs::remove_file(&tmp)?,
+            Err(_) => {
+                std::fs::remove_file(&link)?;
+                std::fs::rename(&tmp, &link)?;
+            }
+        }
+        let rel = link.strip_prefix(dir.parent().unwrap_or(dir)).unwrap_or(&link);
+        notes.push(format!("{} was a link; it's now a copy of {}", rel.display(), real.display()));
+    }
+    Ok(())
+}
+
+/// Every symlink under `dir`, not following any.
+fn find_links(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let ft = e.file_type()?;
+        if ft.is_symlink() {
+            out.push(e.path());
+        } else if ft.is_dir() {
+            find_links(&e.path(), out)?;
+        }
+    }
+    Ok(())
+}
+
 /// Rename, or copy and delete across filesystems.
 fn move_entry(from: &Path, to: &Path) -> anyhow::Result<()> {
     match std::fs::rename(from, to) {
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
             if std::fs::symlink_metadata(from)?.is_dir() {
-                fsutil::copy_tree(from, to, &|_| {})?;
+                // Delete the source only once every file in it has arrived.
+                let skipped = fsutil::copy_tree(from, to, &|_| {})?;
+                if !skipped.is_empty() {
+                    bail!("{} couldn't be moved whole: {}", from.display(), skipped.join("; "));
+                }
                 std::fs::remove_dir_all(from)?;
             } else {
                 reflink_copy::reflink_or_copy(from, to)?;
@@ -563,6 +624,39 @@ mod tests {
         assert!(is_share_link(&link) && std::fs::symlink_metadata(&copied).is_err());
 
         for i in [&a, &other] {
+            std::fs::remove_dir_all(i.dir()).unwrap();
+        }
+        delete_set(&set).unwrap();
+    }
+
+    #[test]
+    fn links_inside_a_shared_folder_become_copies() {
+        let set = set_name();
+        let a = instance("a", &set, &[("original.zip", "o"), ("packs-elsewhere/p/pack.mcmeta", "m"), ("schematics/h.litematic", "h")]);
+        let game = a.game_dir();
+        std::fs::create_dir_all(game.join("resourcepacks/nested")).unwrap();
+        // Relative links, which would point somewhere else from shared/sets/<set>/.
+        std::os::unix::fs::symlink("../original.zip", game.join("resourcepacks/link.zip")).unwrap();
+        std::os::unix::fs::symlink("../../packs-elsewhere/p", game.join("resourcepacks/nested/p")).unwrap();
+        let notes = apply(&a).unwrap();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        let shared = set_dir(&set).join("resourcepacks");
+        assert!(!std::fs::symlink_metadata(shared.join("link.zip")).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(shared.join("link.zip")).unwrap(), "o");
+        assert_eq!(std::fs::read_to_string(shared.join("nested/p/pack.mcmeta")).unwrap(), "m");
+        // The originals stay where they were.
+        assert!(game.join("original.zip").is_file() && game.join("packs-elsewhere/p/pack.mcmeta").is_file());
+
+        // A broken link stops the join before anything moves.
+        let b = instance("b", &set, &[("shaderpacks/s.zip", "s")]);
+        std::os::unix::fs::symlink("../gone.zip", b.game_dir().join("shaderpacks/broken.zip")).unwrap();
+        let err = format!("{:#}", apply(&b).unwrap_err());
+        assert!(err.contains("broken.zip"), "{err}");
+        assert!(b.game_dir().join("shaderpacks/s.zip").is_file());
+        assert!(!std::fs::symlink_metadata(b.game_dir().join("shaderpacks")).unwrap().is_symlink());
+        assert!(!set_dir(&set).join("shaderpacks/s.zip").exists());
+
+        for i in [&a, &b] {
             std::fs::remove_dir_all(i.dir()).unwrap();
         }
         delete_set(&set).unwrap();
