@@ -1,37 +1,28 @@
-//! Shared folders. Minecraft has no setting for where screenshots or packs live,
-//! so sharing turns the instance's folder into a link to one under `shared/`:
-//!
-//! - `shared/screenshots`: every instance's screenshots, when the setting is on.
-//! - `shared/sets/<name>/{resourcepacks,shaderpacks,schematics}`: one pool per share
-//!   set, a named set of instances (packs are tied to versions, so one global pool
-//!   fills up with packs half the instances can't use).
+//! Shared folders. Minecraft has no setting for where packs live, so sharing turns
+//! the instance's folder into a link to one under `shared/`:
+//! `shared/sets/<name>/{resourcepacks,shaderpacks,schematics}`, one pool per share
+//! set, a named set of instances (packs are tied to versions, so one global pool
+//! fills up with packs half the instances can't use).
 //!
 //! `apply` makes an instance's folders match its settings. Sharing moves the
 //! instance's files into the shared folder (a name clash keeps both and renames the
 //! incoming one; identical files are kept once). Unsharing leaves the instance a full
 //! copy (reflinks, so free on btrfs). Links are relative, so the data dir can move.
 //!
-//! Screenshots are different: Omacraft records which instance each one came from
-//! (`shared/screenshots.owners.toml`), from the game's "Saved screenshot as" log line,
-//! so turning sharing off moves each instance's own screenshots back instead of
-//! copying the whole pool into every instance.
+//! Screenshots aren't shared on disk: the screenshots tab can show every instance's
+//! at once instead.
 
-use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
 
 use anyhow::{Context, bail};
-use serde::{Deserialize, Serialize};
 
 use crate::instance::Instance;
 use crate::{fsutil, paths};
 
 /// Folders a share set shares.
 pub const SET_FOLDERS: [&str; 3] = ["resourcepacks", "shaderpacks", "schematics"];
-pub const SCREENSHOTS: &str = "screenshots";
 
 /// From an instance's game dir (`instances/<id>/minecraft`) back to the data dir.
 const UP: &str = "../../..";
@@ -80,12 +71,8 @@ pub fn delete_set(name: &str) -> anyhow::Result<()> {
 }
 
 /// Where `folder` in the game dir should link to, relative to the game dir.
-fn target(inst: &Instance, screenshots: bool, folder: &str) -> Option<PathBuf> {
-    if folder == SCREENSHOTS {
-        screenshots.then(|| PathBuf::from(format!("{UP}/shared/{SCREENSHOTS}")))
-    } else {
-        (!inst.share_set.is_empty()).then(|| PathBuf::from(format!("{UP}/shared/sets/{}/{folder}", inst.share_set)))
-    }
+fn target(inst: &Instance, folder: &str) -> Option<PathBuf> {
+    (!inst.share_set.is_empty()).then(|| PathBuf::from(format!("{UP}/shared/sets/{}/{folder}", inst.share_set)))
 }
 
 /// A link Omacraft made: relative into `shared/`, or (made elsewhere) absolute into it.
@@ -101,7 +88,7 @@ pub fn is_share_link(path: &Path) -> bool {
 /// Make the instance's folders match its settings: linked to the shared folders
 /// it uses, real folders for the rest. Returns notes (renamed clashes, skipped
 /// links) for the user. Safe to run again after an interruption.
-pub fn apply(inst: &Instance, screenshots: bool) -> anyhow::Result<Vec<String>> {
+pub fn apply(inst: &Instance) -> anyhow::Result<Vec<String>> {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !inst.share_set.is_empty() {
         check_set_name(&inst.share_set)?;
@@ -109,9 +96,9 @@ pub fn apply(inst: &Instance, screenshots: bool) -> anyhow::Result<Vec<String>> 
     let game = inst.game_dir();
     std::fs::create_dir_all(&game)?;
     let mut notes = Vec::new();
-    for folder in std::iter::once(SCREENSHOTS).chain(SET_FOLDERS) {
+    for folder in SET_FOLDERS {
         let link = game.join(folder);
-        let want = target(inst, screenshots, folder);
+        let want = target(inst, folder);
         let current = std::fs::read_link(&link).ok();
         match (want, current) {
             (Some(w), Some(c)) if w == c => std::fs::create_dir_all(game.join(&w))?,
@@ -120,16 +107,12 @@ pub fn apply(inst: &Instance, screenshots: bool) -> anyhow::Result<Vec<String>> 
                 std::fs::create_dir_all(game.join(&w))?;
                 link_to(&link, &w)?;
             }
-            (None, Some(c)) if is_ours(&c) && folder == SCREENSHOTS => take_screenshots_back(&link, &inst.id, &mut notes).context("unsharing screenshots")?,
             (None, Some(c)) if is_ours(&c) => unshare(&link, &mut notes).with_context(|| format!("unsharing {folder}"))?,
             (Some(_), Some(_)) => notes.push(format!("{}: left {folder} alone, it's a link Omacraft didn't make", inst.name)),
             (Some(w), None) => {
                 let shared = game.join(&w);
                 std::fs::create_dir_all(&shared)?;
                 match std::fs::symlink_metadata(&link) {
-                    Ok(m) if m.is_dir() && folder == SCREENSHOTS => {
-                        move_screenshots_in(&link, &shared, &inst.id, &mut notes).context("moving screenshots into the shared folder")?;
-                    }
                     Ok(m) if m.is_dir() => {
                         // Pack folders (unzipped packs) clash as a whole; other folders merge.
                         let merge = folder != "resourcepacks" && folder != "shaderpacks";
@@ -143,190 +126,10 @@ pub fn apply(inst: &Instance, screenshots: bool) -> anyhow::Result<Vec<String>> 
                 }
                 link_to(&link, &w)?;
             }
-            // Finishes a take-back that was interrupted.
-            (None, None) if folder == SCREENSHOTS => take_screenshots_back(&link, &inst.id, &mut notes).context("unsharing screenshots")?,
             (None, _) => {}
         }
     }
     Ok(notes)
-}
-
-// -- screenshot owners ----------------------------------------------------------------
-
-fn shots_dir() -> PathBuf {
-    dir().join(SCREENSHOTS)
-}
-
-fn owners_file() -> PathBuf {
-    dir().join("screenshots.owners.toml")
-}
-
-/// Shared screenshot file name → id of the instance that took it.
-#[derive(Default, Serialize, Deserialize)]
-struct Owners {
-    #[serde(default)]
-    owners: BTreeMap<String, String>,
-}
-
-impl Owners {
-    fn load() -> Self {
-        std::fs::read_to_string(owners_file()).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()
-    }
-
-    /// Save, forgetting screenshots that were deleted.
-    fn save(&mut self) -> anyhow::Result<()> {
-        let shots = shots_dir();
-        self.owners.retain(|name, _| std::fs::symlink_metadata(shots.join(name)).is_ok());
-        let text = toml::to_string_pretty(self)?;
-        fsutil::write_atomic(&owners_file(), text.as_bytes(), 0o644)?;
-        Ok(())
-    }
-}
-
-/// Move an instance's screenshots into the shared folder, recording them as its own.
-fn move_screenshots_in(src: &Path, shared: &Path, id: &str, notes: &mut Vec<String>) -> anyhow::Result<()> {
-    let mut owners = Owners::load();
-    let r = (|| {
-        for e in std::fs::read_dir(src)? {
-            let e = e?;
-            let name = e.file_name().to_string_lossy().into_owned();
-            let from = e.path();
-            let mut to = shared.join(&name);
-            if let Ok(m) = std::fs::symlink_metadata(&to) {
-                if m.is_file() && e.file_type()?.is_file() && same_bytes(&from, &to)? {
-                    std::fs::remove_file(&from)?;
-                    owners.owners.entry(name).or_insert_with(|| id.to_string());
-                    continue;
-                }
-                to = free_name(shared, &name, id);
-                notes.push(format!("{name} was in both; this instance's copy is now {}", to.file_name().unwrap_or_default().to_string_lossy()));
-            }
-            move_entry(&from, &to)?;
-            owners.owners.insert(to.file_name().unwrap_or_default().to_string_lossy().into_owned(), id.to_string());
-        }
-        std::fs::remove_dir(src)?;
-        anyhow::Ok(())
-    })();
-    owners.save()?;
-    r
-}
-
-/// Turn `link` back into a real folder holding the screenshots this instance took.
-/// The rest stay shared. Moves, never copies, so no filesystem pays twice.
-fn take_screenshots_back(link: &Path, id: &str, notes: &mut Vec<String>) -> anyhow::Result<()> {
-    let mut owners = Owners::load();
-    let mine: Vec<String> = owners.owners.iter().filter(|(_, o)| *o == id).map(|(n, _)| n.clone()).collect();
-    let is_link = std::fs::read_link(link).is_ok();
-    if !is_link && mine.is_empty() {
-        return Ok(());
-    }
-    if is_link {
-        std::fs::remove_file(link)?;
-    }
-    std::fs::create_dir_all(link)?;
-    let shared = shots_dir();
-    let r = (|| {
-        for name in mine {
-            let from = shared.join(&name);
-            if std::fs::symlink_metadata(&from).is_err() {
-                continue;
-            }
-            let mut to = link.join(&name);
-            if std::fs::symlink_metadata(&to).is_ok() {
-                to = free_name(link, &name, "shared");
-                notes.push(format!("{name} was in both; the shared one is now {}", to.file_name().unwrap_or_default().to_string_lossy()));
-            }
-            move_entry(&from, &to)?;
-            owners.owners.remove(&name);
-        }
-        anyhow::Ok(())
-    })();
-    owners.save()?;
-    r
-}
-
-/// Screenshot names in the shared folder that `id` took.
-pub fn owned_screenshots(id: &str) -> HashSet<String> {
-    Owners::load().owners.into_iter().filter(|(_, o)| o == id).map(|(n, _)| n).collect()
-}
-
-/// Delete the shared screenshots a deleted instance took, as deleting it would have
-/// before they were shared.
-pub fn delete_screenshots_of(id: &str) -> anyhow::Result<()> {
-    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut owners = Owners::load();
-    for name in owners.owners.iter().filter(|(_, o)| *o == id).map(|(n, _)| n) {
-        let p = shots_dir().join(name);
-        let _ = if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
-    }
-    owners.save()
-}
-
-/// Shared screenshots no existing instance owns (dropped in by hand, or from a
-/// session that couldn't be told apart). They stay in the shared folder.
-pub fn untraced_screenshots() -> usize {
-    let owners = Owners::load().owners;
-    std::fs::read_dir(shots_dir())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-        .filter(|e| owners.get(&*e.file_name().to_string_lossy()).is_none_or(|id| !paths::instances_dir().join(id).is_dir()))
-        .count()
-}
-
-static SESSIONS: Mutex<Vec<(u64, bool)>> = Mutex::new(Vec::new());
-static NEXT: AtomicU64 = AtomicU64::new(0);
-
-/// A game session, for telling whose screenshots are whose. The log names each
-/// screenshot; when it doesn't, new files are claimed by time, but only if no other
-/// game ran alongside.
-pub struct Session {
-    token: u64,
-    since: SystemTime,
-}
-
-impl Session {
-    pub fn begin() -> Self {
-        let token = NEXT.fetch_add(1, Ordering::Relaxed);
-        let mut v = SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
-        let overlapped = !v.is_empty();
-        v.iter_mut().for_each(|s| s.1 = true);
-        v.push((token, overlapped));
-        Session { token, since: SystemTime::now() }
-    }
-
-    /// Record the screenshots this session took as `id`'s, if its screenshots are shared.
-    pub fn end(self, inst: &Instance, logged: &[String]) -> anyhow::Result<()> {
-        let alone = !SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|s| s.0 == self.token && s.1);
-        if !is_share_link(&inst.game_dir().join(SCREENSHOTS)) {
-            return Ok(());
-        }
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let mut owners = Owners::load();
-        let shots = shots_dir();
-        for name in logged {
-            if shots.join(name).is_file() {
-                owners.owners.entry(name.clone()).or_insert_with(|| inst.id.clone());
-            }
-        }
-        if alone {
-            for e in std::fs::read_dir(&shots).into_iter().flatten().flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let new = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t >= self.since);
-                if new && !name.starts_with('.') {
-                    owners.owners.entry(name).or_insert_with(|| inst.id.clone());
-                }
-            }
-        }
-        owners.save()
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        SESSIONS.lock().unwrap_or_else(|e| e.into_inner()).retain(|s| s.0 != self.token);
-    }
 }
 
 /// Point `link` at `target`, replacing whatever link is there in one step.
@@ -435,10 +238,6 @@ fn same_bytes(a: &Path, b: &Path) -> std::io::Result<bool> {
     }
 }
 
-/// The shared screenshots folder is global, so tests that use it take turns.
-#[cfg(test)]
-pub static TEST_SHOTS: Mutex<()> = Mutex::new(());
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,8 +271,8 @@ mod tests {
         let set = set_name();
         let a = instance("a", &set, &[("resourcepacks/a.zip", "a"), ("resourcepacks/same.zip", "x"), ("resourcepacks/clash.zip", "A"), ("schematics/house/a.litematic", "a")]);
         let b = instance("b", &set, &[("resourcepacks/b.zip", "b"), ("resourcepacks/same.zip", "x"), ("resourcepacks/clash.zip", "B"), ("schematics/house/b.litematic", "b")]);
-        assert!(apply(&a, false).unwrap().is_empty());
-        let notes = apply(&b, false).unwrap();
+        assert!(apply(&a).unwrap().is_empty());
+        let notes = apply(&b).unwrap();
         assert_eq!(notes.len(), 1, "{notes:?}");
 
         let shared = set_dir(&set).join("resourcepacks");
@@ -489,11 +288,9 @@ mod tests {
             assert_eq!(names(&i.game_dir().join("resourcepacks")), want);
             assert_eq!(names(&i.game_dir().join("schematics/house")), ["a.litematic", "b.litematic"]);
             assert!(i.game_dir().join("shaderpacks").is_dir());
-            // Screenshots aren't shared unless the setting is on.
-            assert!(std::fs::read_link(i.game_dir().join(SCREENSHOTS)).is_err());
         }
         // Running it again changes nothing.
-        assert!(apply(&b, false).unwrap().is_empty());
+        assert!(apply(&b).unwrap().is_empty());
         assert_eq!(names(&shared), want);
 
         // Deleting an instance removes its link, never the shared files.
@@ -508,10 +305,10 @@ mod tests {
         let set = set_name();
         let mut a = instance("a", &set, &[("shaderpacks/s.zip", "s")]);
         let b = instance("b", &set, &[]);
-        apply(&a, false).unwrap();
-        apply(&b, false).unwrap();
+        apply(&a).unwrap();
+        apply(&b).unwrap();
         a.share_set.clear();
-        apply(&a, false).unwrap();
+        apply(&a).unwrap();
         let own = a.game_dir().join("shaderpacks");
         assert!(!std::fs::symlink_metadata(&own).unwrap().is_symlink());
         assert_eq!(std::fs::read_to_string(own.join("s.zip")).unwrap(), "s");
@@ -528,9 +325,9 @@ mod tests {
     fn moving_to_another_set_relinks() {
         let (one, two) = (set_name(), set_name());
         let mut a = instance("a", &one, &[("resourcepacks/p.zip", "p")]);
-        apply(&a, false).unwrap();
+        apply(&a).unwrap();
         a.share_set = two.clone();
-        apply(&a, false).unwrap();
+        apply(&a).unwrap();
         assert_eq!(std::fs::read_link(a.game_dir().join("resourcepacks")).unwrap(), PathBuf::from(format!("{UP}/shared/sets/{two}/resourcepacks")));
         assert!(names(&a.game_dir().join("resourcepacks")).is_empty());
         assert_eq!(names(&set_dir(&one).join("resourcepacks")), ["p.zip"]);
@@ -539,78 +336,19 @@ mod tests {
         delete_set(&two).unwrap();
     }
 
-
     #[test]
-    fn unsharing_screenshots_gives_each_its_own_back() {
-        let _g = TEST_SHOTS.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = uuid::Uuid::new_v4().simple().to_string();
-        let shot = |n: &str| format!("screenshots/{tag}-{n}.png");
-        let a = instance("a", "", &[(&shot("a"), "a"), (&shot("both"), "A")]);
-        let b = instance("b", "", &[(&shot("b"), "b"), (&shot("both"), "B")]);
-        apply(&a, true).unwrap();
-        assert_eq!(apply(&b, true).unwrap().len(), 1);
-        // A game session: one screenshot named in the log, one found by time.
-        let session = Session::begin();
-        std::fs::write(a.screenshots_dir().join(format!("{tag}-logged.png")), "l").unwrap();
-        let timed = a.screenshots_dir().join(format!("{tag}-timed.png"));
-        std::fs::write(&timed, "t").unwrap();
-        // File times come from a coarse clock that can lag the session's start.
-        std::fs::File::options().write(true).open(&timed).unwrap().set_modified(SystemTime::now() + std::time::Duration::from_secs(1)).unwrap();
-        session.end(&a, &[format!("{tag}-logged.png")]).unwrap();
-        // Both see every screenshot while shared.
-        assert_eq!(names(&b.screenshots_dir()).iter().filter(|n| n.starts_with(&tag)).count(), 6);
-
-        apply(&a, false).unwrap();
-        let mine = |i: &Instance| names(&i.screenshots_dir()).into_iter().filter(|n| n.starts_with(&tag)).collect::<Vec<_>>();
-        assert!(!std::fs::symlink_metadata(a.screenshots_dir()).unwrap().is_symlink());
-        let want_a: Vec<String> = ["a", "both", "logged", "timed"].iter().map(|n| format!("{tag}-{n}.png")).collect();
-        assert_eq!(mine(&a), want_a);
-        // Moved, not copied: b keeps only its own.
-        let both_b = format!("{tag}-both ({}).png", b.id);
-        assert_eq!(mine(&b), [both_b.clone(), format!("{tag}-b.png")].into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>());
-        apply(&b, false).unwrap();
-        assert_eq!(std::fs::read_to_string(b.screenshots_dir().join(&both_b)).unwrap(), "B");
-        assert!(names(&shots_dir()).iter().all(|n| !n.starts_with(&tag)));
-        for i in [&a, &b] {
-            std::fs::remove_dir_all(i.dir()).unwrap();
-        }
-    }
-
-    #[test]
-    fn overlapping_sessions_claim_only_logged_screenshots() {
-        let _g = TEST_SHOTS.lock().unwrap_or_else(|e| e.into_inner());
-        let tag = uuid::Uuid::new_v4().simple().to_string();
-        let a = instance("a", "", &[]);
-        apply(&a, true).unwrap();
-        let (one, two) = (Session::begin(), Session::begin());
-        std::fs::write(shots_dir().join(format!("{tag}-x.png")), "x").unwrap();
-        one.end(&a, &[]).unwrap();
-        drop(two);
-        assert!(owned_screenshots(&a.id).is_empty(), "claimed a screenshot another game may have taken");
-        assert!(untraced_screenshots() >= 1);
-        std::fs::remove_file(shots_dir().join(format!("{tag}-x.png"))).unwrap();
-        delete_screenshots_of(&a.id).unwrap();
-        std::fs::remove_dir_all(a.dir()).unwrap();
-    }
-
-    #[test]
-    fn screenshots_share_globally_and_own_links_stay() {
-        let _g = TEST_SHOTS.lock().unwrap_or_else(|e| e.into_inner());
-        let a = instance("shots", "", &[("screenshots/2026-10-17_12.00.00.png", "png")]);
+    fn own_links_stay() {
+        let a = instance("links", "", &[]);
         let elsewhere = paths::test_root().join(format!("own-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, a.game_dir().join("resourcepacks")).unwrap();
         let mut a2 = a.clone();
         a2.share_set = set_name();
-        let notes = apply(&a2, true).unwrap();
+        let notes = apply(&a2).unwrap();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert_eq!(std::fs::read_link(a.game_dir().join("resourcepacks")).unwrap(), elsewhere);
-        assert!(dir().join(SCREENSHOTS).join("2026-10-17_12.00.00.png").is_file());
-        assert!(is_share_link(&a.game_dir().join(SCREENSHOTS)));
-        // Deleting the instance takes its screenshots with it, as before sharing.
+        assert!(is_share_link(&a.game_dir().join("schematics")));
         std::fs::remove_dir_all(a.dir()).unwrap();
-        delete_screenshots_of(&a.id).unwrap();
-        assert!(!dir().join(SCREENSHOTS).join("2026-10-17_12.00.00.png").exists());
         std::fs::remove_dir_all(elsewhere).unwrap();
         delete_set(&a2.share_set).unwrap();
     }

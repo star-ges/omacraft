@@ -84,11 +84,7 @@ pub fn entries(inst: &Instance) -> Vec<Entry> {
                 ft = std::fs::metadata(e.path()).ok()?.file_type();
             }
             let name = e.file_name().to_string_lossy().into_owned();
-            let size = if name == crate::shares::SCREENSHOTS && crate::shares::is_share_link(&e.path()) {
-                // Only this instance's screenshots go into the export.
-                let mine = crate::shares::owned_screenshots(&inst.id);
-                mine.iter().map(|n| std::fs::metadata(e.path().join(n)).map(|m| m.len()).unwrap_or(0)).sum()
-            } else if ft.is_dir() {
+            let size = if ft.is_dir() {
                 fsutil::tree_size(&e.path())
             } else {
                 e.metadata().map(|m| m.len()).unwrap_or(0)
@@ -140,10 +136,9 @@ pub async fn export(task: Task, req: Request) -> anyhow::Result<Exported> {
     let game = req.inst.game_dir();
     let include = req.include.clone();
     let t = task.clone();
-    let id = req.inst.id.clone();
     let files = tokio::task::spawn_blocking(move || {
         t.stage("Listing files", 0);
-        collect(&game, &include, &id)
+        collect(&game, &include)
     })
     .await??;
 
@@ -178,22 +173,17 @@ pub async fn export(task: Task, req: Request) -> anyhow::Result<Exported> {
 }
 
 /// Every regular file and empty folder under the included entries. Symlinks are
-/// skipped, except a top-level link to a shared folder, which is followed (for
-/// shared screenshots, only the ones instance `id` took).
-fn collect(game: &Path, include: &[String], id: &str) -> anyhow::Result<Vec<File>> {
+/// skipped, except a top-level link to a shared folder, which is followed.
+fn collect(game: &Path, include: &[String]) -> anyhow::Result<Vec<File>> {
     let mut out = Vec::new();
     let mut stack: Vec<(PathBuf, String)> = include.iter().map(|n| (game.join(n), n.clone())).collect();
     while let Some((path, rel)) = stack.pop() {
         let top = !rel.contains('/') && crate::shares::is_share_link(&path);
         let Ok(meta) = (if top { std::fs::metadata(&path) } else { std::fs::symlink_metadata(&path) }) else { continue };
-        let mine = (top && rel == crate::shares::SCREENSHOTS).then(|| crate::shares::owned_screenshots(id));
         if meta.is_dir() {
             let mut empty = true;
             for e in std::fs::read_dir(&path).with_context(|| format!("reading {}", path.display()))? {
                 let e = e?;
-                if mine.as_ref().is_some_and(|m| !m.contains(&*e.file_name().to_string_lossy())) {
-                    continue;
-                }
                 stack.push((e.path(), format!("{rel}/{}", e.file_name().to_string_lossy())));
                 empty = false;
             }
@@ -465,7 +455,7 @@ mod tests {
         std::fs::write(dir.join("mods/b.jar"), b"b").unwrap();
         std::fs::write(dir.join("options.txt"), b"x").unwrap();
         std::fs::create_dir_all(dir.join("config/empty")).unwrap();
-        let files = collect(&dir, &["mods".into(), "options.txt".into(), "config".into()], "x").unwrap();
+        let files = collect(&dir, &["mods".into(), "options.txt".into(), "config".into()]).unwrap();
         assert_eq!(files.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(), ["config/empty", "mods/a.jar", "mods/b.jar", "options.txt"]);
         assert!(files[0].dir);
         let a = Hosted { url: "https://cdn.modrinth.com/a.jar".into(), sha512: "ff".into(), size: 1 };
@@ -574,23 +564,22 @@ mod tests {
 
     #[tokio::test]
     async fn shared_folders_export_like_normal_ones() {
-        let _g = crate::shares::TEST_SHOTS.lock().unwrap_or_else(|e| e.into_inner());
         let d = crate::paths::test_root().join(format!("shared-export-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         let tag = uuid::Uuid::new_v4().simple().to_string();
         let set = format!("export {tag}");
         let mut src = tiny_instance(&d);
-        for (rel, bytes) in [("resourcepacks/pack.zip", &b"PK fake"[..]), ("schematics/house.litematic", b"h"), ("screenshots/mine.png", b"png")] {
-            let p = src.game_dir().join(rel.replace("mine", &format!("{tag}-mine")));
+        for (rel, bytes) in [("resourcepacks/pack.zip", &b"PK fake"[..]), ("schematics/house.litematic", b"h")] {
+            let p = src.game_dir().join(rel);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, bytes).unwrap();
         }
-        // Another instance in the set, with packs and a screenshot of its own.
+        // Another instance in the set, with packs of its own.
         let mut other = Instance::new("other", "1.21.1", Loader::Vanilla);
         other.share_set = set.clone();
         other.assign_id().unwrap();
         other.save().unwrap();
-        for rel in ["resourcepacks/theirs.zip".to_string(), format!("screenshots/{tag}-theirs.png")] {
+        for rel in ["resourcepacks/theirs.zip"] {
             std::fs::create_dir_all(other.game_dir().join(&rel).parent().unwrap()).unwrap();
             std::fs::write(other.game_dir().join(&rel), b"o").unwrap();
         }
@@ -599,17 +588,15 @@ mod tests {
         want.insert("resourcepacks/theirs.zip".into(), Some(b"o".to_vec()));
         want.insert("shaderpacks".into(), None);
         src.share_set = set.clone();
-        crate::shares::apply(&src, true).unwrap();
-        crate::shares::apply(&other, true).unwrap();
-        for f in ["resourcepacks", "schematics", "screenshots"] {
+        crate::shares::apply(&src).unwrap();
+        crate::shares::apply(&other).unwrap();
+        for f in ["resourcepacks", "schematics"] {
             assert!(crate::shares::is_share_link(&src.game_dir().join(f)), "{f}");
         }
 
-        // The export holds real files: mods and config as always, the set's packs, and
-        // only the screenshots this instance took.
+        // The export holds real files: mods and config as always, and the set's packs.
         let dest = d.join("out.zip");
-        let mut include = default_include(&src);
-        include.push("screenshots".into());
+        let include = default_include(&src);
         let req = Request { inst: src.clone(), format: Format::Zip, dest, include, version: String::new() };
         let out = export(Task::new("export"), req).await.unwrap();
         let req = crate::import::Request { source: out.path.display().to_string(), name: None, group: String::new() };
@@ -623,7 +610,6 @@ mod tests {
 
         for i in [&src, &other, &back] {
             std::fs::remove_dir_all(i.dir()).unwrap();
-            crate::shares::delete_screenshots_of(&i.id).unwrap();
         }
         crate::shares::delete_set(&set).unwrap();
         std::fs::remove_dir_all(d).unwrap();

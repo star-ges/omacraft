@@ -59,7 +59,7 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
   You choose which folders go in.
 - **Per-instance tabs**: version and loader, live game log, mods, resource packs, shader packs, notes,
   worlds (open one directly on 1.20+, rename, duplicate, delete), servers (edit the list, join directly),
-  screenshots and past logs and crash reports.
+  screenshots (just this instance's, or every instance's at once) and past logs and crash reports.
 - **Groups**: collapsible groups in the instance list, each with an optional colour from the theme.
   Drag instances between them, or press `g` to manage them.
 - **Accounts and skins**: Microsoft and offline accounts. A 3D preview of each skin and cape; upload a

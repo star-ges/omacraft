@@ -55,8 +55,6 @@ pub struct GameLog {
     /// The session's access token, blanked out of every line (the game or a
     /// mod may print its own arguments).
     secret: Option<String>,
-    /// Screenshot file names the game reported saving ("Saved screenshot as …").
-    pub screenshots: Vec<String>,
 }
 
 impl GameLog {
@@ -69,11 +67,6 @@ impl GameLog {
             && text.contains(s.as_str())
         {
             text = text.replace(s.as_str(), "<token>");
-        }
-        if let Some(name) = text.split("Saved screenshot as ").nth(1).and_then(|r| r.split_whitespace().next())
-            && let Some(name) = Path::new(name).file_name()
-        {
-            self.screenshots.push(name.to_string_lossy().into_owned());
         }
         self.lines.push_back(LogLine { level, text });
         self.pushed += 1;
@@ -578,8 +571,8 @@ async fn start(
     std::fs::create_dir_all(inst.game_dir())?;
     // Catches instances created or imported since sharing was set up, and settings
     // changed while this one was running. A failure here shouldn't stop the game.
-    let (i, shots) = (inst.clone(), cfg.share_screenshots);
-    let shared = tokio::task::spawn_blocking(move || crate::shares::apply(&i, shots)).await?;
+    let i = inst.clone();
+    let shared = tokio::task::spawn_blocking(move || crate::shares::apply(&i)).await?;
     let args = build_command(&prepared, inst, cfg, account, token, features, quick)?;
 
     {
@@ -630,7 +623,6 @@ pub async fn launch(
         quick_play_multiplayer: matches!(quick, Some(QuickPlay::Server(_))),
     };
     log.lock().unwrap().set_secret(&token);
-    let session = crate::shares::Session::begin();
     let mut child = match start(&task, &inst, &cfg, &account, &token, &log, quick.as_ref(), &features).await {
         Ok(c) => c,
         Err(e) => {
@@ -676,13 +668,6 @@ pub async fn launch(
         l.push(if exit == Ok(0) { LogLevel::Launcher } else { LogLevel::Error }, msg);
         l.exited = Some(exit.clone());
     }
-    let logged = log.lock().unwrap().screenshots.clone();
-    let i = inst.clone();
-    match tokio::task::spawn_blocking(move || session.end(&i, &logged)).await {
-        Ok(Err(e)) => log.lock().unwrap().push(LogLevel::Warn, format!("recording whose screenshots are whose: {e:#}")),
-        Err(e) => log.lock().unwrap().push(LogLevel::Warn, format!("recording whose screenshots are whose: {e}")),
-        Ok(Ok(())) => {}
-    }
     Ok(LaunchResult { played: started.elapsed(), exit })
 }
 
@@ -709,15 +694,6 @@ mod tests {
             extra_jvm: vec![],
         };
         build_command(&p, &inst, &Config::default(), &Account::offline("Steve"), "0", &features, quick.as_ref()).unwrap()
-    }
-
-    #[test]
-    fn log_names_saved_screenshots() {
-        let mut l = GameLog::default();
-        l.push(LogLevel::Info, "[18:52:53] [Render thread/INFO]: [System] [CHAT] Saved screenshot as 2026-09-01_18.52.51.png");
-        l.push(LogLevel::Info, "Saved screenshot as screenshots/2013-05-01_10.00.00.png");
-        l.push(LogLevel::Info, "<Steve> nice screenshot");
-        assert_eq!(l.screenshots, ["2026-09-01_18.52.51.png", "2013-05-01_10.00.00.png"]);
     }
 
     fn has_pair(args: &[String], flag: &str, value: &str) -> bool {

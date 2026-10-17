@@ -192,7 +192,7 @@ pub fn hints(app: &App) -> Vec<(String, &'static str)> {
                 (InstTab::Notes, _) => vec![(l(Activate), "write"), ("esc".into(), "stop writing")],
                 (InstTab::Worlds, _) => vec![(p(Down, Up), "worlds"), (l(Activate), "play world"), (l(Rename), "rename"), (l(Duplicate), "duplicate"), (l(Delete), "delete"), (l(Folder), "folder")],
                 (InstTab::Servers, _) => vec![(p(Down, Up), "servers"), (l(Activate), "join"), (l(Add), "add"), (l(Edit), "edit"), (p(MoveDown, MoveUp), "reorder"), (l(Delete), "remove")],
-                (InstTab::Screenshots, _) => vec![(p(Down, Up), "screenshots"), (l(Activate), "open"), (l(Copy), "copy"), (l(Delete), "delete"), (l(Folder), "folder")],
+                (InstTab::Screenshots, _) => vec![(p(Down, Up), "screenshots"), (l(Activate), "open"), (l(Copy), "copy"), (l(Delete), "delete"), (l(Folder), "folder"), (l(Toggle), "all instances")],
                 (InstTab::LogHistory, false) => vec![(p(Down, Up), "files"), (l(FocusRight), "read"), (l(Activate), "open"), (l(Folder), "folder")],
                 (InstTab::LogHistory, true) => vec![(p(Down, Up), "scroll"), (l(Search), "filter"), (l(Copy), "copy")],
                 (_, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(FocusRight), "modrinth"), (l(Search), "search")],

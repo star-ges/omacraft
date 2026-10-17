@@ -112,28 +112,16 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     });
 }
 
-/// Shared screenshots, and the share sets with their members.
+/// The share sets with their members.
 fn shared(app: &mut App, ui: &mut Ui) {
     let t = app.t.clone();
     let indent = egui::Margin { left: (t.body_size() * 9.0 + 8.0) as i8, ..Default::default() };
     w::section(ui, &t, "shared folders");
     let busy = app.sharing.is_some();
-    let mut on = app.cfg.share_screenshots;
-    let r = ui.add_enabled(!busy, egui::Checkbox::new(&mut on, "share screenshots between all instances"));
-    let r = r.on_hover_text("Omacraft remembers which instance took each one; turning this off moves them back");
-    if r.changed() {
-        app.cfg.share_screenshots = on;
-        if let Err(e) = app.cfg.save() {
-            app.toast(ToastKind::Error, format!("Couldn't save settings: {e}"));
-        }
-        let all = app.instances.clone();
-        app.start_sharing(ui.ctx(), all);
-    }
     let mut sets = app.share_sets.clone();
     sets.extend(app.instances.iter().map(|i| i.share_set.clone()).filter(|s| !s.is_empty()));
     sets.sort_by_key(|s| s.to_lowercase());
     sets.dedup();
-    ui.add_space(4.0);
     for set in &sets {
         let members: Vec<&str> = app.instances.iter().filter(|i| &i.share_set == set).map(|i| i.name.as_str()).collect();
         ui.horizontal(|ui| {

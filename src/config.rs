@@ -20,8 +20,8 @@ pub struct Config {
     /// Extra JVM flags applied to every instance.
     pub global_jvm_args: String,
     pub show_snapshots: bool,
-    /// Every instance's `screenshots` links to one shared folder.
-    pub share_screenshots: bool,
+    /// The screenshots tab shows every instance's screenshots, not just the current one's.
+    pub all_screenshots: bool,
     /// Instance groups folded shut in the list.
     pub collapsed_groups: Vec<String>,
     /// Rebound keys: action id → chords (see keymap.rs).
@@ -36,7 +36,7 @@ impl Default for Config {
             java_override: String::new(),
             global_jvm_args: String::new(),
             show_snapshots: false,
-            share_screenshots: false,
+            all_screenshots: false,
             collapsed_groups: Vec::new(),
             keys: BTreeMap::new(),
         }

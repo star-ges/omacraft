@@ -115,7 +115,7 @@ actions!(
     (Back, "back", "back towards the instance list", "moving around", Nav, ["esc"]),
     (Search, "search", "search or filter the focused pane", "moving around", Nav, ["/"]),
     (Activate, "activate", "play, play world, join, install, open…", "acting on the selection", Nav, ["enter"]),
-    (Toggle, "toggle", "enable / disable, add to group", "acting on the selection", Nav, ["space"]),
+    (Toggle, "toggle", "enable / disable, add to group, all instances' screenshots", "acting on the selection", Nav, ["space"]),
     (Delete, "delete", "delete or remove", "acting on the selection", Nav, ["x", "delete"]),
     (Rename, "rename", "rename", "acting on the selection", Nav, ["r"]),
     (Duplicate, "duplicate", "duplicate", "acting on the selection", Nav, ["d"]),

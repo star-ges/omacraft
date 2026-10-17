@@ -523,20 +523,16 @@ impl App {
         let insts: Vec<Instance> = insts.into_iter().filter(|i| !self.is_running(&i.id)).collect();
         let task = Task::new("shared folders");
         task.stage("Updating shared folders", insts.len() as u64);
-        let (t, shots) = (task.clone(), self.cfg.share_screenshots);
+        let t = task.clone();
         let p = Promise::spawn(&self.rt, ctx, async move {
             Ok(tokio::task::spawn_blocking(move || {
                 let (mut notes, mut errors) = (Vec::new(), Vec::new());
                 for i in &insts {
-                    match crate::shares::apply(i, shots) {
+                    match crate::shares::apply(i) {
                         Ok(n) => notes.extend(n),
                         Err(e) => errors.push(format!("{}: {e:#}", i.name)),
                     }
                     t.inc(1);
-                }
-                let left = if shots { 0 } else { crate::shares::untraced_screenshots() };
-                if left > 0 {
-                    notes.insert(0, format!("{left} shared screenshot{} couldn't be traced to an instance; they stay in {}", if left == 1 { "" } else { "s" }, crate::shares::dir().join(crate::shares::SCREENSHOTS).display()));
                 }
                 (notes, errors)
             })
@@ -895,9 +891,6 @@ impl App {
                 if let Err(e) = std::fs::remove_dir_all(inst.dir()) {
                     self.toast(ToastKind::Error, format!("Delete failed: {e}"));
                     return;
-                }
-                if let Err(e) = crate::shares::delete_screenshots_of(id) {
-                    self.toast(ToastKind::Error, format!("Couldn't delete its shared screenshots: {e:#}"));
                 }
                 self.toast(ToastKind::Info, format!("Deleted {name}"));
                 self.instances.retain(|i| &i.id != id);
