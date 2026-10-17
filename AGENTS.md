@@ -150,6 +150,10 @@ test (and a rule here) with any fix that sets a new one.
   misattributed files). The screenshots tab's "all instances" toggle (config `all_screenshots`) lists every
   instance's folder in the background, each tile captioned with its instance. Test:
   `ui::screenshots::tests::merged_view_lists_every_instance_with_its_owner`.
+- **Game settings are copied, never shared:** "settings" in the new-instance dialog copies another instance's
+  `options.txt` (plus OptiFine's `optionsof.txt`/`optionsshaders.txt`, `instance::SETTINGS_FILES`) once, at creation.
+  Sharing it live would lose keys: older versions drop keys they don't know when they save, and mod keybinds differ
+  between instances. Test: `instance::tests::copy_settings_takes_only_settings_files`.
 - **Saving:** write config/state files with `fsutil::write_atomic` (unique temp + rename; accounts at 0600).
 
 ## Testing the GUI safely

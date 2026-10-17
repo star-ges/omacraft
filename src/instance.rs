@@ -94,6 +94,27 @@ impl Instance {
         self.dir().join("natives")
     }
 
+    /// Whether this instance has game settings to copy into a new one.
+    pub fn has_settings(&self) -> bool {
+        self.game_dir().join("options.txt").is_file()
+    }
+
+    /// Copy another instance's game settings (keybinds, video, sound…) into this one,
+    /// once. Never shared live: older versions drop keys they don't know when they save,
+    /// and mod keybinds differ between instances. Returns how many files came across.
+    pub fn copy_settings_from(&self, from: &Instance) -> std::io::Result<usize> {
+        std::fs::create_dir_all(self.game_dir())?;
+        let mut n = 0;
+        for f in SETTINGS_FILES {
+            let src = from.game_dir().join(f);
+            if src.is_file() {
+                std::fs::copy(&src, self.game_dir().join(f))?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     pub fn save(&self) -> anyhow::Result<()> {
         let text = toml::to_string_pretty(self)?;
         std::fs::create_dir_all(self.game_dir())?;
@@ -234,6 +255,9 @@ fn default_icon() -> String {
     "omacraft".into()
 }
 
+/// Game settings files: Minecraft's own and OptiFine's.
+pub const SETTINGS_FILES: &[&str] = &["options.txt", "optionsof.txt", "optionsshaders.txt"];
+
 pub fn load_all() -> Vec<Instance> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(paths::instances_dir()) {
@@ -299,5 +323,30 @@ mod tests {
         list.iter().find(|m| m.name == "b.jar").unwrap().toggle().unwrap();
         assert!(mods.join("b.jar.disabled").is_file());
         std::fs::remove_dir_all(inst.dir()).unwrap();
+    }
+
+    #[test]
+    fn copy_settings_takes_only_settings_files() {
+        let mut from = Instance::new("settings from", "1.21.1", Loader::Vanilla);
+        from.assign_id().unwrap();
+        let mut to = Instance::new("settings to", "1.21.1", Loader::Vanilla);
+        to.assign_id().unwrap();
+        assert!(!from.has_settings());
+        std::fs::create_dir_all(from.game_dir().join("config")).unwrap();
+        std::fs::write(from.game_dir().join("options.txt"), "fov:0.5\n").unwrap();
+        std::fs::write(from.game_dir().join("optionsof.txt"), "ofFogType:3\n").unwrap();
+        std::fs::write(from.game_dir().join("servers.dat"), "x").unwrap();
+        std::fs::write(from.game_dir().join("config/mod.json"), "{}").unwrap();
+        assert!(from.has_settings());
+        assert_eq!(to.copy_settings_from(&from).unwrap(), 2);
+        assert_eq!(std::fs::read_to_string(to.game_dir().join("options.txt")).unwrap(), "fov:0.5\n");
+        assert!(to.game_dir().join("optionsof.txt").is_file());
+        assert!(!to.game_dir().join("optionsshaders.txt").exists());
+        assert!(!to.game_dir().join("servers.dat").exists() && !to.game_dir().join("config").exists());
+        // A copy, not a link: changing one leaves the other alone.
+        std::fs::write(to.game_dir().join("options.txt"), "fov:1.0\n").unwrap();
+        assert_eq!(std::fs::read_to_string(from.game_dir().join("options.txt")).unwrap(), "fov:0.5\n");
+        std::fs::remove_dir_all(from.dir()).unwrap();
+        std::fs::remove_dir_all(to.dir()).unwrap();
     }
 }

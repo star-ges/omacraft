@@ -23,6 +23,9 @@ pub struct NewInstance {
     name_touched: bool,
     group: String,
     picker: VersionPicker,
+    /// Instance to copy game settings from (id), and the ones that have any (id, name, version).
+    settings_from: Option<String>,
+    settings_sources: Option<Vec<(String, String, String)>>,
     // import
     pub source: String,
     found: Option<Vec<Found>>,
@@ -47,6 +50,8 @@ impl NewInstance {
             name_touched: false,
             group: String::new(),
             picker,
+            settings_from: None,
+            settings_sources: None,
             source: String::new(),
             found: None,
             browse_p: None,
@@ -127,6 +132,49 @@ pub fn group_field(ui: &mut Ui, t: &crate::theme::Theme, value: &mut String, gro
     });
 }
 
+/// Picks an instance whose game settings (options.txt) the new one starts with.
+fn settings_field(app: &App, s: &mut NewInstance, ui: &mut Ui) {
+    let t = &app.t;
+    let sources = s.settings_sources.get_or_insert_with(|| app.instances.iter().filter(|i| i.has_settings()).map(|i| (i.id.clone(), i.name.clone(), i.mc_version.clone())).collect());
+    w::section(ui, t, "settings");
+    let chosen = s.settings_from.as_ref().and_then(|id| sources.iter().find(|(i, _, _)| i == id));
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_enabled_ui(!sources.is_empty(), |ui| {
+                ui.menu_button("\u{f44b}", |ui| {
+                    for (id, name, mc) in sources.iter() {
+                        if ui.button(format!("{name}  ·  {mc}")).clicked() {
+                            s.settings_from = Some(id.clone());
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button(RichText::new("game defaults").color(t.muted)).clicked() {
+                        s.settings_from = None;
+                        ui.close();
+                    }
+                });
+            });
+            let text = match chosen {
+                Some((_, name, _)) => RichText::new(format!("copy from {name}")),
+                None if sources.is_empty() => RichText::new("game defaults (no instance has settings yet)").color(t.muted),
+                None => RichText::new("game defaults").color(t.muted),
+            };
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| ui.add(egui::Label::new(text).truncate()));
+        });
+    });
+    // Keybinds from 1.13 on use key names, which older versions can't read (they fall back to defaults).
+    let target = s.picker.version.as_deref().unwrap_or_default();
+    let old = |v: &str| crate::world_sets::compare_versions(v, "1.13") == std::cmp::Ordering::Less;
+    if let Some((_, _, mc)) = chosen
+        && !target.is_empty()
+        && old(target)
+        && !old(mc)
+    {
+        ui.label(RichText::new("keybinds won't carry over to versions before 1.13").color(t.yellow));
+    }
+}
+
 fn create(app: &mut App, s: &mut NewInstance, ui: &mut Ui) -> Option<Outcome> {
     let t = app.t.clone();
     s.picker.poll(app, ui.ctx());
@@ -141,6 +189,8 @@ fn create(app: &mut App, s: &mut NewInstance, ui: &mut Ui) -> Option<Outcome> {
             s.name = s.default_name();
         }
         name_and_group(app, s, ui, "instance name");
+        ui.add_space(6.0);
+        settings_field(app, s, ui);
         ui.add_space(6.0);
         let list_h = ui.available_height() - 110.0;
         s.picker.loader_ui(app, ui, list_h, lnav, false);
@@ -158,7 +208,15 @@ fn create(app: &mut App, s: &mut NewInstance, ui: &mut Ui) -> Option<Outcome> {
                     let mut inst = Instance::new(s.name.trim(), &mc, loader);
                     inst.group = s.group.trim().to_string();
                     match inst.assign_id().map_err(anyhow::Error::from).and_then(|()| inst.save()) {
-                        Ok(()) => out = Some(Outcome::Created(inst)),
+                        Ok(()) => {
+                            let from = s.settings_from.as_ref().and_then(|id| app.instances.iter().find(|i| &i.id == id));
+                            if let Some(from) = from
+                                && let Err(e) = inst.copy_settings_from(from)
+                            {
+                                app.toast(ToastKind::Error, format!("Created {}, but couldn't copy settings from {}: {e}", inst.name, from.name));
+                            }
+                            out = Some(Outcome::Created(inst));
+                        }
                         Err(e) => app.toast(ToastKind::Error, format!("Couldn't create instance: {e}")),
                     }
                 }
