@@ -39,6 +39,22 @@ impl Listing {
     }
 }
 
+/// A duplicate, backup or restore running in the background.
+pub struct WorldJob {
+    pub task: Task,
+    pub promise: Promise<JobDone>,
+    pub inst_id: String,
+    /// The folder its worlds really live in ([`saves_key`]), shared by a world set's members.
+    pub saves: PathBuf,
+}
+
+/// The folder `inst`'s worlds really live in: its `saves`, followed through a world
+/// set's link. Two instances whose keys match touch the same worlds.
+pub fn saves_key(inst: &Instance) -> PathBuf {
+    let saves = inst.saves_dir();
+    saves.canonicalize().unwrap_or(saves)
+}
+
 /// What a background world job leaves behind: a folder to select, and a note.
 pub struct JobDone {
     pub select: Option<String>,
@@ -53,8 +69,8 @@ pub struct WorldsState {
     fetched: Option<Instant>,
     /// Background read of an instance's `saves/` and backups.
     loading: Option<(String, Promise<Listing>)>,
-    /// Duplicates, backups and restores: (task, result, instance id).
-    pub jobs: Vec<(Task, Promise<JobDone>, String)>,
+    /// Duplicates, backups and restores, each with the instance and saves folder it's in.
+    pub jobs: Vec<WorldJob>,
     selected: Option<String>,
     /// The selected backup, by folder.
     backup: Option<PathBuf>,
@@ -103,11 +119,16 @@ impl WorldsState {
     }
 
     pub fn tasks(&self) -> impl Iterator<Item = &Task> {
-        self.jobs.iter().map(|(t, ..)| t)
+        self.jobs.iter().map(|j| &j.task)
     }
 
     pub fn busy_with(&self, inst_id: &str) -> bool {
-        self.jobs.iter().any(|(.., id)| id == inst_id)
+        self.jobs.iter().any(|j| j.inst_id == inst_id)
+    }
+
+    /// Whether a job is copying worlds in this saves folder, through any instance.
+    pub fn busy_on(&self, saves: &std::path::Path) -> bool {
+        self.jobs.iter().any(|j| j.saves == saves)
     }
 
     /// A finished job selects its world if its instance is still on screen.
@@ -120,23 +141,53 @@ impl WorldsState {
         self.invalidate();
     }
 
-    fn start(&mut self, rt: &tokio::runtime::Handle, ctx: &egui::Context, inst_id: &str, label: &str, stage: String, job: impl FnOnce() -> anyhow::Result<JobDone> + Send + 'static) {
+    fn start(&mut self, rt: &tokio::runtime::Handle, ctx: &egui::Context, inst: &Instance, label: &str, stage: String, job: impl FnOnce() -> anyhow::Result<JobDone> + Send + 'static) {
         let task = Task::new(label);
         task.stage(stage, 0);
-        let p = Promise::spawn(rt, ctx, async move { tokio::task::spawn_blocking(job).await? });
-        self.jobs.push((task, p, inst_id.to_string()));
+        let promise = Promise::spawn(rt, ctx, async move { tokio::task::spawn_blocking(job).await? });
+        self.jobs.push(WorldJob { task, promise, inst_id: inst.id.clone(), saves: saves_key(inst) });
     }
 }
 
-/// Why `inst`'s worlds can't be backed up or restored right now, if they can't.
-fn worlds_busy(app: &App, inst: &Instance) -> Option<String> {
-    if app.worlds.busy_with(&inst.id) {
-        return Some("another world job is running".into());
+/// Why the worlds in saves folder `saves` can't be copied right now: a world job or a
+/// mod update's backups already run there, through whichever instance.
+pub fn jobs_on(content: &super::content::ContentState, worlds: &WorldsState, saves: &std::path::Path) -> Option<&'static str> {
+    if worlds.busy_on(saves) {
+        Some("another world job is running")
+    } else if content.updating_saves(saves) {
+        Some("a mod update is backing up its worlds")
+    } else {
+        None
+    }
+}
+
+/// Why `inst` can't start right now, if it can't: its mods are being swapped, or its
+/// worlds copied or swapped, through it or any instance sharing its saves.
+pub fn launch_blocked(content: &super::content::ContentState, worlds: &WorldsState, inst: &Instance) -> Option<&'static str> {
+    if content.updating(&inst.id) {
+        return Some("its mods are being updated or rolled back");
+    }
+    let saves = saves_key(inst);
+    if worlds.busy_with(&inst.id) || worlds.busy_on(&saves) {
+        Some("one of its worlds is being copied or restored")
+    } else if content.updating_saves(&saves) {
+        Some("a mod update is backing up its worlds")
+    } else {
+        None
+    }
+}
+
+/// Why `inst`'s worlds can't be backed up or restored right now, if they can't. Its
+/// world set's members count by where their saves really lead, not just by setting.
+pub fn worlds_busy(app: &App, inst: &Instance) -> Option<String> {
+    let saves = saves_key(inst);
+    if let Some(why) = jobs_on(&app.content, &app.worlds, &saves) {
+        return Some(why.into());
     }
     if app.sharing.is_some() {
         return Some("shared folders are moving".into());
     }
-    let running = std::iter::once(inst).chain(crate::world_sets::others(&inst.world_set, &inst.id, &app.instances)).find(|i| app.is_running(&i.id));
+    let running = app.instances.iter().filter(|i| app.is_running(&i.id)).find(|i| i.id == inst.id || (!inst.world_set.is_empty() && i.world_set == inst.world_set) || saves_key(i) == saves);
     running.map(|i| if i.id == inst.id { "it's running".to_string() } else { format!("{} is running in the same world set", i.name) })
 }
 
@@ -148,9 +199,9 @@ pub fn start_restore(app: &mut App, ctx: &egui::Context, id: &str, snap: Snapsho
         return;
     }
     let folder = snap.dir.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let rt = app.rt.clone();
-    app.worlds.start(&rt, ctx, id, "restore", format!("Restoring {folder}"), move || {
-        backups::restore_world(&snap, &inst.saves_dir())?;
+    let (rt, i) = (app.rt.clone(), inst.clone());
+    app.worlds.start(&rt, ctx, &inst, "restore", format!("Restoring {folder}"), move || {
+        backups::restore_world(&snap, &i.saves_dir())?;
         Ok(JobDone { select: Some(folder.clone()), note: Some(format!("Restored {folder} from {}", snap.when())) })
     });
 }
@@ -240,10 +291,10 @@ fn world_list(
             }
             // One at a time per instance, so two copies can't pick the same folder name.
             // Not while shared folders move: the copy could land in a folder on its way out.
-            if (w::button(ui, "duplicate").clicked() || key(Nav::Duplicate)) && !app.worlds.busy_with(&inst.id) && !moving {
+            if (w::button(ui, "duplicate").clicked() || key(Nav::Duplicate)) && !moving && jobs_on(&app.content, &app.worlds, &saves_key(inst)).is_none() {
                 let world = wd.clone();
                 let rt = app.rt.clone();
-                app.worlds.start(&rt, ui.ctx(), &inst.id, "duplicate", format!("Duplicating {}", wd.name), move || {
+                app.worlds.start(&rt, ui.ctx(), inst, "duplicate", format!("Duplicating {}", wd.name), move || {
                     Ok(JobDone { select: Some(saves::duplicate_world(&world)?), note: None })
                 });
             }
@@ -416,7 +467,7 @@ fn backup_list(
             None => {
                 let (dir, i, name) = (wd.dir.clone(), inst.clone(), wd.name.clone());
                 let rt = app.rt.clone();
-                app.worlds.start(&rt, ui.ctx(), &inst.id, "back up", format!("Backing up {name}"), move || {
+                app.worlds.start(&rt, ui.ctx(), inst, "back up", format!("Backing up {name}"), move || {
                     backups::snapshot_world(&dir, Owner::of(&i), "backed up by hand", false)?;
                     Ok(JobDone { select: None, note: Some(format!("Backed up {name}")) })
                 });
@@ -465,6 +516,58 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(5), "worlds never loaded");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// G12, G14: world jobs and mod jobs hold off launches and each other through any
+    /// instance whose saves lead to the same folder, not just the one that started them.
+    #[test]
+    fn jobs_on_shared_worlds_block_every_member() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ctx = egui::Context::default();
+        let mut a = Instance::new("jobs a", "1.21.1", Loader::Vanilla);
+        a.assign_id().unwrap();
+        let mut b = Instance::new("jobs b", "1.21.1", Loader::Vanilla);
+        b.assign_id().unwrap();
+        let mut c = Instance::new("jobs c", "1.21.1", Loader::Vanilla);
+        c.assign_id().unwrap();
+        // a and b share worlds through a link (whatever their settings say); c has its own.
+        let shared = crate::paths::test_root().join(format!("shared-saves-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&shared).unwrap();
+        for i in [&a, &b] {
+            std::fs::create_dir_all(i.game_dir()).unwrap();
+            std::os::unix::fs::symlink(&shared, i.saves_dir()).unwrap();
+        }
+        std::fs::create_dir_all(c.saves_dir()).unwrap();
+        assert_eq!(saves_key(&a), saves_key(&b));
+
+        let mut worlds = WorldsState::default();
+        let mut content = super::super::content::ContentState::default();
+        for i in [&a, &b, &c] {
+            assert!(launch_blocked(&content, &worlds, i).is_none());
+        }
+        // A restore started through b holds off a and b, not c.
+        worlds.start(rt.handle(), &ctx, &b, "restore", "Restoring".into(), || {
+            std::thread::sleep(Duration::from_secs(60));
+            Ok(JobDone { select: None, note: None })
+        });
+        assert!(launch_blocked(&content, &worlds, &a).is_some(), "a plays the worlds b is restoring");
+        assert!(launch_blocked(&content, &worlds, &b).is_some());
+        assert!(launch_blocked(&content, &worlds, &c).is_none());
+        assert!(jobs_on(&content, &worlds, &saves_key(&a)).is_some(), "a second world job through a waits");
+        worlds.jobs.clear();
+
+        // A mod update in c holds off c only; one in a (backing up its worlds) holds off b too.
+        content.start_mod_job(rt.handle(), &ctx, &c.id, Some(saves_key(&c)), Task::new("c"), std::future::pending());
+        assert!(launch_blocked(&content, &worlds, &c).is_some());
+        assert!(launch_blocked(&content, &worlds, &a).is_none());
+        content.start_mod_job(rt.handle(), &ctx, &a.id, Some(saves_key(&a)), Task::new("a"), std::future::pending());
+        assert!(launch_blocked(&content, &worlds, &b).is_some());
+        assert!(jobs_on(&content, &worlds, &saves_key(&b)).is_some(), "b's world backups wait for a's update");
+        assert!(content.busy_with(&c.id), "c's job still counts after a's started");
+        for i in [&a, &b, &c] {
+            std::fs::remove_dir_all(i.dir()).unwrap();
+        }
+        std::fs::remove_dir_all(shared).unwrap();
     }
 
     #[test]

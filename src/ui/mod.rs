@@ -315,6 +315,11 @@ impl App {
             self.toast(ToastKind::Info, format!("{} is already running", inst.name));
             return;
         }
+        // A restore or mod swap would change files under the game as it loads them.
+        if let Some(why) = worlds::launch_blocked(&self.content, &self.worlds, &inst) {
+            self.toast(ToastKind::Error, format!("Can't start {} while {why}", inst.name));
+            return;
+        }
         let Some(account) = self.accounts.active().cloned() else {
             self.toast(ToastKind::Error, "Add an account before playing");
             self.tab = Tab::Accounts;
@@ -509,10 +514,10 @@ impl App {
             self.worlds.invalidate();
         }
 
-        let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.worlds.jobs).into_iter().partition(|(_, p, _)| p.ready());
+        let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.worlds.jobs).into_iter().partition(|j| j.promise.ready());
         self.worlds.jobs = running;
-        for (task, p, id) in done {
-            let r = p.take().unwrap();
+        for worlds::WorldJob { task, promise, inst_id: id, .. } in done {
+            let r = promise.take().unwrap();
             task.finish(&r.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
             match r {
                 Ok(done) => {
@@ -996,7 +1001,10 @@ impl App {
             }
             ConfirmAction::RestoreWorld(id, snap) => worlds::start_restore(self, ctx, id, snap.clone()),
             ConfirmAction::DeleteBackup(snap) => {
-                if let Err(e) = crate::backups::delete(snap) {
+                // A world job or an update's backups may be writing next to it.
+                if !self.worlds.jobs.is_empty() || self.content.backing_up_worlds() {
+                    self.toast(ToastKind::Error, "Can't delete a backup while worlds are being backed up or restored");
+                } else if let Err(e) = crate::backups::delete(snap) {
                     self.toast(ToastKind::Error, format!("Couldn't delete the backup: {e:#}"));
                 }
                 self.worlds.invalidate();

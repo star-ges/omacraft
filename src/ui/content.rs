@@ -52,10 +52,20 @@ pub struct ContentState {
     pub key: Option<Action>,
     /// The last mod update check: (instance id, the check).
     updates: Option<(String, Check)>,
-    /// Mods being updated or rolled back: (task, what to say when done, instance id).
-    pub mod_job: Option<(Task, Promise<ModJobDone>, String)>,
+    /// Mods being updated or rolled back, any number of instances at once.
+    mod_jobs: Vec<ModJob>,
     /// Worlds a rollback left played with newer mods, each to ask about in turn.
     pub world_prompts: std::collections::VecDeque<WorldPrompt>,
+}
+
+/// A mods update or rollback running in the background. Kept until its result is
+/// taken, so its instance counts as busy for as long as it writes.
+struct ModJob {
+    task: Task,
+    promise: Promise<ModJobDone>,
+    inst_id: String,
+    /// The saves folder an update backs worlds up from (`worlds::saves_key`); a rollback has none.
+    saves: Option<PathBuf>,
 }
 
 /// How a mods update or rollback went.
@@ -233,7 +243,7 @@ fn kind_glyph(kind: ContentKind) -> &'static str {
 
 impl ContentState {
     pub fn tasks(&self) -> impl Iterator<Item = &Task> {
-        self.kinds.values().flat_map(|k| k.installing.values().map(|j| &j.task)).chain(self.mod_job.iter().map(|(t, ..)| t))
+        self.kinds.values().flat_map(|k| k.installing.values().map(|j| &j.task)).chain(self.mod_jobs.iter().map(|j| &j.task))
     }
 
     /// Whether anything is still being installed into this instance, or its mods updated.
@@ -241,19 +251,39 @@ impl ContentState {
         self.kinds.values().any(|k| k.installing.keys().any(|(id, _)| id == inst_id)) || self.updating(inst_id)
     }
 
-    fn updating(&self, inst_id: &str) -> bool {
-        self.mod_job.as_ref().is_some_and(|(.., id)| id == inst_id)
+    /// Whether this instance's mods are being updated or rolled back.
+    pub fn updating(&self, inst_id: &str) -> bool {
+        self.mod_jobs.iter().any(|j| j.inst_id == inst_id)
+    }
+
+    /// Whether a mod update is backing up worlds in this saves folder.
+    pub fn updating_saves(&self, saves: &std::path::Path) -> bool {
+        self.mod_jobs.iter().any(|j| j.saves.as_deref() == Some(saves))
+    }
+
+    /// Whether any mod update is backing up worlds.
+    pub fn backing_up_worlds(&self) -> bool {
+        self.mod_jobs.iter().any(|j| j.saves.is_some())
     }
 
     /// Run a mods update or rollback in the background; it toasts its own outcome.
-    pub fn start_mod_job(&mut self, rt: &tokio::runtime::Handle, ctx: &egui::Context, inst_id: &str, task: Task, fut: impl Future<Output = ModJobDone> + Send + 'static) {
+    /// `saves` is the saves folder it backs worlds up from, if it does.
+    pub fn start_mod_job(
+        &mut self,
+        rt: &tokio::runtime::Handle,
+        ctx: &egui::Context,
+        inst_id: &str,
+        saves: Option<PathBuf>,
+        task: Task,
+        fut: impl Future<Output = ModJobDone> + Send + 'static,
+    ) {
         let tk = task.clone();
-        let p = Promise::spawn(rt, ctx, async move {
+        let promise = Promise::spawn(rt, ctx, async move {
             let r = fut.await;
             tk.finish(&if r.kind == ToastKind::Error { Err(anyhow::anyhow!("{}", r.text)) } else { Ok(()) });
             Ok(r)
         });
-        self.mod_job = Some((task, p, inst_id.to_string()));
+        self.mod_jobs.push(ModJob { task, promise, inst_id: inst_id.to_string(), saves });
     }
 
     pub fn invalidate(&mut self) {
@@ -279,12 +309,16 @@ impl ContentState {
                 }
             }
         }
-        if let Some((_, p, _)) = self.mod_job.take_if(|(_, p, _)| p.ready()) {
-            let done = p.take().unwrap().unwrap_or_else(|e| ModJobDone::new(ToastKind::Error, format!("{e:#}")));
+        let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.mod_jobs).into_iter().partition(|j| j.promise.ready());
+        self.mod_jobs = running;
+        for j in done {
+            let done = j.promise.take().unwrap().unwrap_or_else(|e| ModJobDone::new(ToastKind::Error, format!("{e:#}")));
             toasts.push(Toast { kind: done.kind, text: done.text, born: Instant::now() });
             self.world_prompts.extend(done.worlds);
-            // What was found is out of date now.
-            self.updates = None;
+            // What was found for that instance is out of date now.
+            if self.updates.as_ref().is_some_and(|(id, _)| *id == j.inst_id) {
+                self.updates = None;
+            }
             self.invalidate();
         }
         for s in self.kinds.values_mut() {
@@ -457,14 +491,15 @@ struct Updates {
 
 /// Update `list`'s mods in the background, unless the instance is busy.
 fn start_update(app: &mut App, ctx: &egui::Context, inst: &Instance, list: Vec<Update>) {
-    if let Some(why) = app.instance_busy(&inst.id) {
+    // It backs up worlds first, which another member of a world set may be copying.
+    if let Some(why) = app.instance_busy(&inst.id).map(str::to_string).or_else(|| super::worlds::worlds_busy(app, inst)) {
         app.toast(ToastKind::Error, format!("Can't update mods while {why}"));
         return;
     }
     let task = Task::new(format!("updating {}", inst.name));
     let (i, keep, tk) = (inst.clone(), app.cfg.backups_keep, task.clone());
     let rt = app.rt.clone();
-    app.content.start_mod_job(&rt, ctx, &inst.id, task, async move {
+    app.content.start_mod_job(&rt, ctx, &inst.id, Some(super::worlds::saves_key(inst)), task, async move {
         let (kind, text) = match modrinth::update(&i, list, keep, &tk).await {
             Ok(done) => {
                 let mut text = match done.done.as_slice() {
@@ -564,7 +599,7 @@ pub fn start_roll_back(app: &mut App, ctx: &egui::Context, id: &str, snap: crate
     task.stage("Rolling back mods", 0);
     let keep = app.cfg.backups_keep;
     let rt = app.rt.clone();
-    app.content.start_mod_job(&rt, ctx, id, task, async move {
+    app.content.start_mod_job(&rt, ctx, id, None, task, async move {
         let when = snap.when();
         let r = tokio::task::spawn_blocking(move || {
             crate::backups::roll_back(&inst, &snap, keep)?;
@@ -965,6 +1000,44 @@ mod tests {
         assert_eq!(p.snaps[p.selected].info.reason, "before the update");
         std::fs::remove_dir_all(inst.dir()).unwrap();
         backups::forget_instance(&inst.id);
+    }
+
+    /// G16: a second instance's update doesn't drop the first one's: both stay busy
+    /// until each is done, and each reports.
+    #[test]
+    fn every_mod_job_stays_tracked_until_it_ends() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ctx = egui::Context::default();
+        let mut s = ContentState::default();
+        let (go_a, wait_a) = tokio::sync::oneshot::channel::<()>();
+        let (go_b, wait_b) = tokio::sync::oneshot::channel::<()>();
+        s.start_mod_job(rt.handle(), &ctx, "a", None, Task::new("a"), async move {
+            let _ = wait_a.await;
+            ModJobDone::new(ToastKind::Info, "a done".into())
+        });
+        s.start_mod_job(rt.handle(), &ctx, "b", None, Task::new("b"), async move {
+            let _ = wait_b.await;
+            ModJobDone::new(ToastKind::Info, "b done".into())
+        });
+        assert!(s.busy_with("a") && s.busy_with("b"));
+        assert_eq!(s.tasks().count(), 2);
+
+        let mut toasts = Vec::new();
+        let settle = |s: &mut ContentState, toasts: &mut Vec<Toast>, want: usize| {
+            let start = Instant::now();
+            while toasts.len() < want {
+                assert!(start.elapsed() < Duration::from_secs(5), "job never finished");
+                std::thread::sleep(Duration::from_millis(5));
+                s.poll(toasts);
+            }
+        };
+        go_b.send(()).unwrap();
+        settle(&mut s, &mut toasts, 1);
+        assert!(s.busy_with("a") && !s.busy_with("b"));
+        go_a.send(()).unwrap();
+        settle(&mut s, &mut toasts, 2);
+        assert!(!s.busy_with("a"));
+        assert_eq!(toasts.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(), ["b done", "a done"]);
     }
 
     fn file(dir: &std::path::Path, name: &str, size: u64, secs: u64) -> ModFile {
