@@ -45,37 +45,165 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()>
     r
 }
 
-/// Swap two paths in one step (`renameat2` with `RENAME_EXCHANGE`).
-pub fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+/// An exclusive `flock` on a lock file, held until dropped. It excludes other
+/// processes as well as other threads here (each lock opens the file anew).
+pub struct FileLock(#[allow(dead_code)] std::fs::File);
+
+fn lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)
+}
+
+/// Take the lock at `path`, waiting for whoever holds it. Never delete a lock file
+/// someone may hold: the next one would lock a new file.
+pub fn lock(path: &Path) -> std::io::Result<FileLock> {
+    let f = lock_file(path)?;
+    f.lock()?;
+    Ok(FileLock(f))
+}
+
+/// Take the lock at `path` if nobody holds it.
+pub fn try_lock(path: &Path) -> std::io::Result<Option<FileLock>> {
+    let f = lock_file(path)?;
+    match f.try_lock() {
+        Ok(()) => Ok(Some(FileLock(f))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+fn renameat2(a: &Path, b: &Path, flags: libc::c_uint) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(std::io::Error::other);
     let (a, b) = (c(a)?, c(b)?);
-    if unsafe { libc::renameat2(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_EXCHANGE) } == 0 {
+    if unsafe { libc::renameat2(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), flags) } == 0 {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
     }
 }
 
-/// Put the folder `staged` where `target` is, replacing whatever is there: swapped in
-/// one step where the filesystem can, then the old one (now at `staged`) deleted.
-pub fn swap_in(staged: &Path, target: &Path) -> std::io::Result<()> {
-    let remove = |p: &Path| match std::fs::symlink_metadata(p) {
+/// The filesystem can't do this kind of rename.
+fn unsupported(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP))
+}
+
+/// Swap two paths in one step (`renameat2` with `RENAME_EXCHANGE`).
+pub fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::NO_EXCHANGE.with(|n| n.get()) {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    renameat2(a, b, libc::RENAME_EXCHANGE)
+}
+
+/// Rename `from` to `to` unless something is already at `to` (then `AlreadyExists`,
+/// and nothing moves). Falls back to check-then-rename where the filesystem lacks
+/// `RENAME_NOREPLACE`.
+pub fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    match renameat2(from, to, libc::RENAME_NOREPLACE) {
+        Err(e) if unsupported(&e) => {
+            if std::fs::symlink_metadata(to).is_ok() {
+                return Err(std::io::ErrorKind::AlreadyExists.into());
+            }
+            std::fs::rename(from, to)
+        }
+        r => r,
+    }
+}
+
+fn remove_any(p: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(p) {
         Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
         Ok(_) => std::fs::remove_file(p),
         Err(_) => Ok(()),
-    };
-    if std::fs::symlink_metadata(target).is_err() {
-        return std::fs::rename(staged, target);
     }
-    match exchange(staged, target) {
-        Ok(()) => remove(staged),
-        Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)) => {
-            remove(target)?;
-            std::fs::rename(staged, target)
+}
+
+/// What [`swap_in`] is doing, saved beside the staged folder before anything moves,
+/// so [`finish_swap`] can tell after a crash whether the copy is in place yet: it
+/// knows the copy by its inode, which a rename keeps.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Swap {
+    target: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+/// `staged` + `suffix`, beside it.
+fn beside(staged: &Path, suffix: &str) -> PathBuf {
+    let mut s = staged.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// The journal [`swap_in`] keeps for the folder staged at `staged`.
+pub fn swap_journal(staged: &Path) -> PathBuf {
+    beside(staged, ".swap")
+}
+
+fn identity(p: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Put the whole folder `staged` where `target` is, replacing whatever is there.
+/// Swapped in one step where the filesystem can; elsewhere the old one is renamed
+/// aside first. A journal (`<staged>.swap`) records the move, so a crash at any step
+/// is finished by [`finish_swap`] and never leaves `target` missing for good.
+pub fn swap_in(staged: &Path, target: &Path) -> std::io::Result<()> {
+    let (dev, ino) = identity(staged).ok_or(std::io::ErrorKind::NotFound)?;
+    let swap = Swap { target: target.to_path_buf(), dev, ino };
+    let journal = swap_journal(staged);
+    write_atomic(&journal, toml::to_string(&swap).map_err(std::io::Error::other)?.as_bytes(), 0o644)?;
+    finish(staged, &journal, &swap)
+}
+
+/// Finish (or clean up after) a [`swap_in`] of `staged` cut short. Returns false if
+/// there was no journal: a folder at `staged` is then a copy that never finished.
+pub fn finish_swap(staged: &Path) -> std::io::Result<bool> {
+    let journal = swap_journal(staged);
+    let Ok(text) = std::fs::read_to_string(&journal) else { return Ok(false) };
+    let swap: Swap = toml::from_str(&text).map_err(std::io::Error::other)?;
+    finish(staged, &journal, &swap)?;
+    Ok(true)
+}
+
+fn finish(staged: &Path, journal: &Path, swap: &Swap) -> std::io::Result<()> {
+    let ours = Some((swap.dev, swap.ino));
+    let old = beside(staged, ".old");
+    let target = &swap.target;
+    if identity(target) != ours {
+        if identity(staged) != ours {
+            // Neither holds the copy: it's gone. Put back what was renamed aside, if anything.
+            if std::fs::symlink_metadata(target).is_err() && std::fs::symlink_metadata(&old).is_ok() {
+                std::fs::rename(&old, target)?;
+            }
+            return std::fs::remove_file(journal);
         }
-        Err(e) => Err(e),
+        if std::fs::symlink_metadata(target).is_err() {
+            std::fs::rename(staged, target)?;
+        } else {
+            match exchange(staged, target) {
+                Ok(()) => {}
+                Err(e) if unsupported(&e) => {
+                    // Aside first, never deleted before the copy is in place.
+                    remove_any(&old)?;
+                    std::fs::rename(target, &old)?;
+                    std::fs::rename(staged, target)?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
+    // In place. What's left at `staged` (after an exchange) or `.old` is the old folder.
+    if identity(staged) != ours {
+        remove_any(staged)?;
+    }
+    remove_any(&old)?;
+    std::fs::remove_file(journal)
 }
 
 /// The most we decompress for one metadata entry (instance.cfg, modrinth.index.json,
@@ -148,7 +276,7 @@ fn copy_dir(root: &Path, src: &Path, dst: &Path, stack: &mut Vec<PathBuf>, progr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -200,6 +328,147 @@ mod tests {
             assert!(std::fs::symlink_metadata(dst.join(p)).is_err(), "{p} was copied");
         }
         assert_eq!(skipped.len(), 3, "{skipped:?}");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    thread_local! {
+        /// Makes [`exchange`] fail as on filesystems without `RENAME_EXCHANGE`.
+        pub static NO_EXCHANGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The journal [`swap_in`] writes before moving anything, for tests that stop
+    /// a swap partway.
+    pub fn write_journal(staged: &Path, target: &Path) {
+        let (dev, ino) = identity(staged).unwrap();
+        write_atomic(&swap_journal(staged), toml::to_string(&Swap { target: target.to_path_buf(), dev, ino }).unwrap().as_bytes(), 0o644).unwrap();
+    }
+
+    fn folder(dir: &Path, text: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("f"), text).unwrap();
+    }
+
+    #[test]
+    fn swap_in_finishes_after_a_crash_at_any_step() {
+        for no_exchange in [false, true] {
+            NO_EXCHANGE.with(|n| n.set(no_exchange));
+            let d = scratch();
+            let (staged, target) = (d.join(".stage"), d.join("target"));
+            let old = beside(&staged, ".old");
+            let reset = || {
+                for p in [&staged, &target, &old] {
+                    let _ = remove_any(p);
+                }
+                folder(&target, "old");
+                folder(&staged, "new");
+            };
+            let check = |what: &str| {
+                assert_eq!(std::fs::read_to_string(target.join("f")).unwrap(), "new", "{what}");
+                for p in [&staged, &old, &swap_journal(&staged)] {
+                    assert!(std::fs::symlink_metadata(p).is_err(), "{what}: {} left", p.display());
+                }
+            };
+            // A straight run.
+            reset();
+            swap_in(&staged, &target).unwrap();
+            check("whole");
+            // Each state a crash can leave, journal written:
+            let journal = |staged: &Path| write_journal(staged, &target);
+            // nothing moved yet;
+            reset();
+            journal(&staged);
+            assert!(finish_swap(&staged).unwrap());
+            check("before moving");
+            // the old one renamed aside, the copy not yet in (no exchange): the target is missing;
+            reset();
+            journal(&staged);
+            std::fs::rename(&target, &old).unwrap();
+            assert!(finish_swap(&staged).unwrap());
+            check("target aside");
+            // the copy in, the old one still aside, or (after an exchange) at the stage's name.
+            reset();
+            journal(&staged);
+            std::fs::rename(&target, &old).unwrap();
+            std::fs::rename(&staged, &target).unwrap();
+            assert!(finish_swap(&staged).unwrap());
+            check("old aside");
+            reset();
+            journal(&staged);
+            renameat2(&staged, &target, libc::RENAME_EXCHANGE).unwrap();
+            assert_eq!(std::fs::read_to_string(staged.join("f")).unwrap(), "old");
+            assert!(finish_swap(&staged).unwrap());
+            check("exchanged");
+            // No journal: nothing to finish.
+            reset();
+            assert!(!finish_swap(&staged).unwrap());
+            assert_eq!(std::fs::read_to_string(target.join("f")).unwrap(), "old");
+            std::fs::remove_dir_all(d).unwrap();
+        }
+        NO_EXCHANGE.with(|n| n.set(false));
+    }
+
+    #[test]
+    fn rename_noreplace_never_replaces() {
+        let d = scratch();
+        std::fs::write(d.join("a"), "a").unwrap();
+        std::fs::write(d.join("b"), "b").unwrap();
+        assert_eq!(rename_noreplace(&d.join("a"), &d.join("b")).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(d.join("b")).unwrap(), "b");
+        rename_noreplace(&d.join("a"), &d.join("c")).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("c")).unwrap(), "a");
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// A child process (this test binary again, running [`hold_flock_helper`]) holding
+    /// the lock at a path until dropped.
+    pub struct FlockHolder(std::process::Child);
+
+    impl FlockHolder {
+        pub fn lock(path: &Path) -> Self {
+            use std::io::BufRead;
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "fsutil::tests::hold_flock_helper", "--ignored", "--nocapture", "--test-threads=1"])
+                .env("OMACRAFT_TEST_FLOCK", path)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let out = std::io::BufReader::new(child.stdout.take().unwrap());
+            assert!(out.lines().map_while(Result::ok).any(|l| l.ends_with("omacraft-test-flocked")), "helper couldn't lock");
+            FlockHolder(child)
+        }
+    }
+
+    impl Drop for FlockHolder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    #[ignore = "helper, run by FlockHolder in a child process"]
+    fn hold_flock_helper() {
+        use std::io::Write;
+        let Some(path) = std::env::var_os("OMACRAFT_TEST_FLOCK") else { return };
+        let _l = lock(Path::new(&path)).unwrap();
+        println!("omacraft-test-flocked");
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn locks_exclude_other_processes() {
+        let d = scratch();
+        let path = d.join(".lock");
+        let holder = FlockHolder::lock(&path);
+        assert!(try_lock(&path).unwrap().is_none());
+        drop(holder);
+        let held = try_lock(&path).unwrap();
+        assert!(held.is_some());
+        // And other threads here.
+        let p = path.clone();
+        assert!(std::thread::spawn(move || try_lock(&p).unwrap().is_none()).join().unwrap());
+        drop(held);
         std::fs::remove_dir_all(d).unwrap();
     }
 

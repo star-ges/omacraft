@@ -573,6 +573,10 @@ async fn start(
     // changed while this one was running. A failure here shouldn't stop the game.
     let i = inst.clone();
     let shared = tokio::task::spawn_blocking(move || crate::shares::apply(&i)).await?;
+    // A restore or mod rollback a crash cut short is finished first, so no world or
+    // mods folder is missing when the game starts.
+    let i = inst.clone();
+    let recovered = tokio::task::spawn_blocking(move || crate::backups::recover(&i)).await?;
     // Worlds may have been played with mods this one lacks: in another instance of its
     // world set, or here before a mod rollback.
     task.stage("Checking worlds", 0);
@@ -590,7 +594,7 @@ async fn start(
             Ok(notes) => notes.iter().for_each(|n| l.push(LogLevel::Warn, n.clone())),
             Err(e) => l.push(LogLevel::Warn, format!("shared folders: {e:#}")),
         }
-        worlds.into_iter().for_each(|n| l.push(LogLevel::Warn, n));
+        recovered.into_iter().chain(worlds).for_each(|n| l.push(LogLevel::Warn, n));
         match quick {
             Some(QuickPlay::World(w)) if supports_quick_play(&prepared.version) => l.push(LogLevel::Launcher, format!("opening world {w}")),
             Some(QuickPlay::World(_)) => l.push(LogLevel::Warn, "this version can't open a world on launch; pick it from the menu"),

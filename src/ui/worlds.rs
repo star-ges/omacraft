@@ -25,6 +25,7 @@ pub struct Listing {
 
 impl Listing {
     fn read(saves: PathBuf, owner: Owner) -> Self {
+        backups::recover_worlds(owner).into_iter().for_each(|e| eprintln!("{e}"));
         let mut worlds = saves::list_worlds(&saves);
         for w in &mut worlds {
             w.played_in = crate::world_sets::read_record(&w.dir).map(|r| (r.instance, r.instance_name));
@@ -149,7 +150,7 @@ pub fn start_restore(app: &mut App, ctx: &egui::Context, id: &str, snap: Snapsho
     let folder = snap.dir.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let rt = app.rt.clone();
     app.worlds.start(&rt, ctx, id, "restore", format!("Restoring {folder}"), move || {
-        backups::restore_world(&snap, &inst.saves_dir(), Owner::of(&inst))?;
+        backups::restore_world(&snap, &inst.saves_dir())?;
         Ok(JobDone { select: Some(folder.clone()), note: Some(format!("Restored {folder} from {}", snap.when())) })
     });
 }

@@ -17,7 +17,6 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
 
 use anyhow::{Context, bail};
 
@@ -79,11 +78,14 @@ impl Kind {
 /// From an instance's game dir (`instances/<id>/minecraft`) back to the data dir.
 const UP: &str = "../../..";
 
-/// One `apply` at a time, so two never move the same files.
-static LOCK: Mutex<()> = Mutex::new(());
-
 pub fn dir() -> PathBuf {
     paths::data_dir().join("shared")
+}
+
+/// One `apply` or set deletion at a time, in any process (an `flock` on
+/// `shared/.lock`), so two never move the same files.
+fn lock() -> anyhow::Result<fsutil::FileLock> {
+    fsutil::lock(&dir().join(".lock")).context("locking the shared folders")
 }
 
 pub fn sets_dir(kind: Kind) -> PathBuf {
@@ -121,6 +123,18 @@ pub fn sets_on_disk(kind: Kind) -> Vec<String> {
 /// say: deleting would take that instance's only packs or worlds with it.
 pub fn delete_set(kind: Kind, name: &str) -> anyhow::Result<()> {
     check_set_name(name)?;
+    // Waited for only briefly: this runs on the UI thread.
+    let mut tries = 0;
+    let _l = loop {
+        if let Some(l) = fsutil::try_lock(&dir().join(".lock")).context("locking the shared folders")? {
+            break l;
+        }
+        tries += 1;
+        if tries == 100 {
+            bail!("shared folders are being changed (maybe by another Omacraft); try again in a moment");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
     if let Some(ids) = sets_in_use(kind).remove(name) {
         bail!("“{name}” is still linked from {} (Omacraft finishes leaving it at the next launch)", ids.join(", "));
     }
@@ -192,7 +206,7 @@ pub fn is_share_link(path: &Path) -> bool {
 /// it uses, real folders for the rest. Returns notes (renamed clashes, skipped
 /// links) for the user. Safe to run again after an interruption.
 pub fn apply(inst: &Instance) -> anyhow::Result<Vec<String>> {
-    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = lock()?;
     for kind in Kind::ALL {
         let set = kind.set_of(inst);
         if !set.is_empty() {
@@ -325,7 +339,8 @@ fn recover(link: &Path, folder: &str, want_shared: bool, notes: &mut Vec<String>
 
 /// Move everything in `src` into `dst`, then remove `src`. On a clash, identical
 /// files are kept once, folders merge if `merge` is set, and anything else comes
-/// in renamed with `tag`.
+/// in renamed with `tag`. Nothing is ever moved over a file: if one appears at the
+/// name between looking and moving, it's looked at again.
 fn move_into(src: &Path, dst: &Path, merge: bool, tag: &str, notes: &mut Vec<String>) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst)?;
     for e in std::fs::read_dir(src)? {
@@ -333,15 +348,26 @@ fn move_into(src: &Path, dst: &Path, merge: bool, tag: &str, notes: &mut Vec<Str
         let name = e.file_name().to_string_lossy().into_owned();
         let (from, to) = (e.path(), dst.join(&name));
         let ft = e.file_type()?;
-        match std::fs::symlink_metadata(&to) {
-            Err(_) => move_entry(&from, &to)?,
-            Ok(m) if merge && ft.is_dir() && m.is_dir() => move_into(&from, &to, merge, tag, notes)?,
-            Ok(m) if ft.is_file() && m.is_file() && same_bytes(&from, &to)? => std::fs::remove_file(&from)?,
-            Ok(_) => {
-                let to = free_name(dst, &name, tag);
-                notes.push(format!("{name} was in both; this instance's copy is now {}", to.file_name().unwrap_or_default().to_string_lossy()));
-                move_entry(&from, &to)?;
+        loop {
+            match std::fs::symlink_metadata(&to) {
+                Err(_) => match move_entry(&from, &to) {
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    r => r?,
+                },
+                Ok(m) if merge && ft.is_dir() && m.is_dir() => move_into(&from, &to, merge, tag, notes)?,
+                Ok(m) if ft.is_file() && m.is_file() && same_bytes(&from, &to)? => std::fs::remove_file(&from)?,
+                Ok(_) => {
+                    let to = loop {
+                        let to = free_name(dst, &name, tag);
+                        match move_entry(&from, &to) {
+                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                            r => break r.map(|_| to)?,
+                        }
+                    };
+                    notes.push(format!("{name} was in both; this instance's copy is now {}", to.file_name().unwrap_or_default().to_string_lossy()));
+                }
             }
+            break;
         }
     }
     std::fs::remove_dir(src)?;
@@ -404,24 +430,29 @@ fn find_links(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Rename, or copy and delete across filesystems.
-fn move_entry(from: &Path, to: &Path) -> anyhow::Result<()> {
-    match std::fs::rename(from, to) {
+/// Rename, or copy and delete across filesystems, never replacing anything at `to`
+/// (`AlreadyExists` then, and `from` stays).
+fn move_entry(from: &Path, to: &Path) -> std::io::Result<()> {
+    match fsutil::rename_noreplace(from, to) {
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            if std::fs::symlink_metadata(from)?.is_dir() {
-                // Delete the source only once every file in it has arrived.
-                let skipped = fsutil::copy_tree(from, to, &|_| {})?;
-                if !skipped.is_empty() {
-                    bail!("{} couldn't be moved whole: {}", from.display(), skipped.join("; "));
-                }
-                std::fs::remove_dir_all(from)?;
+            // Copied under a temporary name and moved in whole, then the source deleted.
+            let tmp = to.with_file_name(format!(".{}.{}.moving", to.file_name().unwrap_or_default().to_string_lossy(), uuid::Uuid::new_v4().simple()));
+            let copied = if std::fs::symlink_metadata(from)?.is_dir() {
+                fsutil::copy_tree(from, &tmp, &|_| {}).and_then(|skipped| match skipped.is_empty() {
+                    true => Ok(()),
+                    false => Err(std::io::Error::other(format!("{} couldn't be moved whole: {}", from.display(), skipped.join("; ")))),
+                })
             } else {
-                reflink_copy::reflink_or_copy(from, to)?;
-                std::fs::remove_file(from)?;
+                reflink_copy::reflink_or_copy(from, &tmp).map(|_| ())
+            };
+            let r = copied.and_then(|_| fsutil::rename_noreplace(&tmp, to));
+            if r.is_err() {
+                let _ = if tmp.is_dir() { std::fs::remove_dir_all(&tmp) } else { std::fs::remove_file(&tmp) };
             }
-            Ok(())
+            r?;
+            if std::fs::symlink_metadata(from)?.is_dir() { std::fs::remove_dir_all(from) } else { std::fs::remove_file(from) }
         }
-        r => Ok(r?),
+        r => r,
     }
 }
 
@@ -782,6 +813,37 @@ mod tests {
         std::fs::remove_dir_all(a.dir()).unwrap();
         std::fs::remove_dir_all(elsewhere).unwrap();
         delete_set(Kind::Packs, &a2.share_set).unwrap();
+    }
+
+    #[test]
+    fn moving_in_locks_out_other_processes_and_never_replaces() {
+        let set = set_name();
+        let a = instance("a", &set, &[("schematics/house.litematic", "a")]);
+        // Another Omacraft is moving files: joining waits for it.
+        let holder = crate::fsutil::tests::FlockHolder::lock(&dir().join(".lock"));
+        let a2 = a.clone();
+        let join = std::thread::spawn(move || apply(&a2));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!join.is_finished(), "apply didn't wait for the other process");
+        // Meanwhile it published a file of the same name.
+        let shared = set_dir(Kind::Packs, &set).join("schematics");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("house.litematic"), "other").unwrap();
+        drop(holder);
+        assert_eq!(join.join().unwrap().unwrap().len(), 1);
+        assert_eq!(std::fs::read_to_string(shared.join("house.litematic")).unwrap(), "other");
+        assert_eq!(std::fs::read_to_string(shared.join(format!("house ({}).litematic", a.id))).unwrap(), "a");
+
+        // A move onto a name that's taken fails and leaves both alone.
+        let d = paths::test_root().join(format!("noreplace-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(d.join("from")).unwrap();
+        std::fs::create_dir_all(d.join("to")).unwrap();
+        std::fs::write(d.join("from/f"), "1").unwrap();
+        assert_eq!(move_entry(&d.join("from"), &d.join("to")).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(d.join("from/f").is_file() && !d.join("to/f").exists());
+        std::fs::remove_dir_all(d).unwrap();
+        std::fs::remove_dir_all(a.dir()).unwrap();
+        delete_set(Kind::Packs, &set).unwrap();
     }
 
     #[test]
