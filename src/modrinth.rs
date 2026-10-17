@@ -2,6 +2,7 @@
 //! instance (Prism's modplatform).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 
 use anyhow::Context;
 use serde::Deserialize;
@@ -10,6 +11,7 @@ use crate::content_meta;
 use crate::instance::{ContentKind, Instance};
 use crate::net::{self, Download};
 use crate::store;
+use crate::task::Task;
 
 const API: &str = "https://api.modrinth.com/v2";
 
@@ -41,6 +43,8 @@ pub struct Version {
     pub loaders: Vec<String>,
     #[serde(default)]
     pub dependencies: Vec<Dependency>,
+    #[serde(default)]
+    pub date_published: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -292,6 +296,170 @@ pub async fn install(kind: ContentKind, project: &str, inst: &Instance) -> anyho
     Ok(Installed { files, projects, missing })
 }
 
+/// A newer build of an installed mod.
+#[derive(Debug, Clone)]
+pub struct Update {
+    /// The installed file, and whether it's enabled (an update keeps that).
+    pub path: PathBuf,
+    pub enabled: bool,
+    pub title: String,
+    /// The installed version's number, and the one to update to.
+    pub from: String,
+    pub to: Version,
+}
+
+/// An installed file: path, enabled, sha1.
+type Held = (PathBuf, bool, String);
+
+/// The files in `held` with a newer build: `current` and `latest` map each sha1 to
+/// Modrinth's version of that file and its newest compatible version. Newer by date,
+/// so a beta installed by hand isn't "updated" to an older release.
+fn pick_updates(held: &[Held], current: &HashMap<String, Version>, latest: &HashMap<String, Version>, titles: &HashMap<String, String>) -> Vec<Update> {
+    let mut out: Vec<Update> = held
+        .iter()
+        .filter_map(|(path, enabled, sha1)| {
+            let (cur, new) = (current.get(sha1)?, latest.get(sha1)?);
+            let newer = match (cur.date_published, new.date_published) {
+                (Some(a), Some(b)) => b > a,
+                _ => true,
+            };
+            let same = new.id == cur.id || new.files.iter().any(|f| f.hashes.sha1.eq_ignore_ascii_case(sha1));
+            (newer && !same && new.project_id == cur.project_id).then(|| Update {
+                path: path.clone(),
+                enabled: *enabled,
+                title: titles.get(&cur.project_id).cloned().unwrap_or_else(|| cur.version_number.clone()),
+                from: cur.version_number.clone(),
+                to: new.clone(),
+            })
+        })
+        .collect();
+    out.sort_by_key(|u| u.title.to_lowercase());
+    out
+}
+
+/// Modrinth's versions for these sha1s (`/version_files`), or with `filter`, the newest
+/// version each file could update to (`/version_files/update`).
+async fn versions_by_hash(hashes: &[String], filter: Option<serde_json::Value>) -> anyhow::Result<HashMap<String, Version>> {
+    let mut out = HashMap::new();
+    for chunk in hashes.chunks(500) {
+        let mut body = serde_json::json!({ "hashes": chunk, "algorithm": "sha1" });
+        let url = match &filter {
+            Some(f) => {
+                body.as_object_mut().unwrap().extend(f.as_object().cloned().unwrap_or_default());
+                format!("{API}/version_files/update")
+            }
+            None => format!("{API}/version_files"),
+        };
+        let got: HashMap<String, Version> = net::client().post(url).json(&body).send().await?.error_for_status()?.json().await?;
+        out.extend(got);
+    }
+    Ok(out)
+}
+
+/// Project id → title.
+async fn titles(ids: Vec<String>) -> HashMap<String, String> {
+    #[derive(Deserialize)]
+    struct P {
+        id: String,
+        title: String,
+    }
+    let mut out = HashMap::new();
+    for chunk in ids.chunks(100) {
+        let Ok(list) = serde_json::to_string(chunk) else { continue };
+        if let Ok(ps) = net::get_json::<Vec<P>>(&format!("{API}/projects?ids={}", enc(&list))).await {
+            out.extend(ps.into_iter().map(|p| (p.id, p.title)));
+        }
+    }
+    out
+}
+
+/// The instance's mods with a newer compatible build on Modrinth.
+pub async fn check_updates(inst: &Instance) -> anyhow::Result<Vec<Update>> {
+    let loader = inst.loader.modrinth().context("vanilla instances don't load mods")?;
+    let files = inst.mods();
+    let held: Vec<Held> = tokio::task::spawn_blocking(move || files.into_iter().filter(|f| !f.is_dir).filter_map(|f| Some((f.path.clone(), f.enabled, net::sha1_file(&f.path)?))).collect()).await?;
+    let hashes: Vec<String> = held.iter().map(|(.., h)| h.clone()).collect();
+    let current = versions_by_hash(&hashes, None).await?;
+    let latest = versions_by_hash(&hashes, Some(serde_json::json!({ "loaders": [loader], "game_versions": [inst.mc_version] }))).await?;
+    let mut ids: Vec<String> = current.values().map(|v| v.project_id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    Ok(pick_updates(&held, &current, &latest, &titles(ids).await))
+}
+
+/// What `update` did.
+#[derive(Debug, Default)]
+pub struct Updated {
+    /// "title from → to", one per mod updated.
+    pub done: Vec<String>,
+    /// Dependencies the new versions brought in.
+    pub added: Vec<String>,
+    /// Required dependencies that couldn't be installed, each with why.
+    pub missing: Vec<String>,
+}
+
+/// Update mods to the versions `check_updates` found. Their mods and config are
+/// snapshotted first (stopping here if that fails), so it can all be rolled back.
+/// New required dependencies are installed too.
+pub async fn update(inst: &Instance, updates: Vec<Update>, keep: u32, task: &Task) -> anyhow::Result<Updated> {
+    task.stage("Backing up mods, config and worlds", 0);
+    let names: Vec<String> = updates.iter().map(|u| u.title.clone()).collect();
+    let reason = match names.as_slice() {
+        [one] => format!("before updating {one}"),
+        many => format!("before updating {} mods: {}", many.len(), many.join(", ")),
+    };
+    let i = inst.clone();
+    let worlds = tokio::task::spawn_blocking(move || {
+        crate::backups::snapshot_instance(&i, &reason, keep)?;
+        // Worlds played with the new mods can't go back on their own: keep a copy from before.
+        Ok::<_, anyhow::Error>(crate::backups::cover_worlds(&i, &reason))
+    })
+    .await?
+    .context("backing up first")?;
+    for n in worlds {
+        eprintln!("{n}");
+    }
+
+    let dir = inst.game_dir().join(ContentKind::Mods.dir());
+    let mut out = Updated::default();
+    for u in &updates {
+        task.stage(format!("Updating {}", u.title), 0);
+        let file = u.to.files.iter().find(|f| f.primary).or(u.to.files.first()).with_context(|| format!("{}: the new version has no files", u.title))?;
+        if file.filename.contains(['/', '\\']) || file.filename.starts_with('.') {
+            anyhow::bail!("{}: odd file name {:?}", u.title, file.filename);
+        }
+        let dest = dir.join(if u.enabled { file.filename.clone() } else { format!("{}.disabled", file.filename) });
+        store::fetch(&Download { url: file.url.clone(), path: dest.clone(), sha1: Some(file.hashes.sha1.clone()), size: Some(file.size) })
+            .await
+            .with_context(|| format!("updating {} (roll back to undo the updates so far)", u.title))?;
+        if dest != u.path {
+            tokio::fs::remove_file(&u.path).await.with_context(|| format!("removing the old {}", u.title))?;
+        }
+        out.done.push(format!("{} {} → {}", u.title, u.from, u.to.version_number));
+    }
+
+    // The new versions may need mods the old ones didn't.
+    let needed: Vec<String> = updates.iter().flat_map(|u| &u.to.dependencies).filter(|d| d.dependency_type == "required").filter_map(|d| d.project_id.clone()).collect();
+    if !needed.is_empty() {
+        task.stage("Checking dependencies", 0);
+        let have = installed_versions(inst, ContentKind::Mods).await;
+        let mut seen = HashSet::new();
+        for p in needed.into_iter().filter(|p| !have.contains_key(p)) {
+            if !seen.insert(p.clone()) {
+                continue;
+            }
+            match install(ContentKind::Mods, &p, inst).await {
+                Ok(done) => {
+                    out.added.extend(done.files);
+                    out.missing.extend(done.missing);
+                }
+                Err(e) => out.missing.push(format!("{p}: {e:#}")),
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn format_count(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
@@ -330,6 +498,7 @@ mod tests {
             version_number: id.into(),
             files: Vec::new(),
             loaders: Vec::new(),
+            date_published: None,
             dependencies: deps
                 .iter()
                 .map(|(p, v)| Dependency { project_id: p.map(Into::into), version_id: v.map(Into::into), dependency_type: "required".into() })
@@ -406,6 +575,69 @@ mod tests {
         assert_eq!(missing, ["lib lib-2 is required, but another version is installed"]);
         let installed = HashMap::from([("app".to_string(), "old".to_string())]);
         assert!(super::plan(&src, ContentKind::Mods, "app", &installed).await.unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn updates_only_go_forward() {
+        let at = |d: u32| Some(chrono::DateTime::parse_from_rfc3339(&format!("2026-01-{d:02}T00:00:00Z")).unwrap().to_utc());
+        let ver = |id: &str, project: &str, day: u32, sha1: &str| Version {
+            date_published: at(day),
+            files: vec![VersionFile { url: String::new(), filename: format!("{id}.jar"), primary: true, size: 1, hashes: Hashes { sha1: sha1.into() } }],
+            ..v(id, project, &[])
+        };
+        let held: Vec<Held> = ["a", "b", "c", "d"].iter().map(|h| (PathBuf::from(format!("{h}.jar")), *h != "b", h.to_string())).collect();
+        let current = HashMap::from([
+            ("a".to_string(), ver("a-1", "pa", 1, "a")),
+            ("b".to_string(), ver("b-1", "pb", 1, "b")),
+            ("c".to_string(), ver("c-2", "pc", 5, "c")),
+            ("d".to_string(), ver("d-1", "pd", 1, "d")),
+        ]);
+        let latest = HashMap::from([
+            // Newer: an update, kept disabled if it was.
+            ("a".to_string(), ver("a-2", "pa", 3, "a2")),
+            ("b".to_string(), ver("b-2", "pb", 3, "b2")),
+            // The newest compatible build is older than what's installed (a beta, say): no.
+            ("c".to_string(), ver("c-1", "pc", 2, "c1")),
+            // Already the newest.
+            ("d".to_string(), ver("d-1", "pd", 1, "d")),
+        ]);
+        let titles = HashMap::from([("pa".to_string(), "Alpha".to_string())]);
+        let ups = pick_updates(&held, &current, &latest, &titles);
+        assert_eq!(ups.iter().map(|u| (u.title.as_str(), u.to.id.as_str(), u.enabled)).collect::<Vec<_>>(), [("Alpha", "a-2", true), ("b-1", "b-2", false)]);
+        assert_eq!(ups[0].from, "a-1");
+    }
+
+    /// Hits the network; run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn finds_and_applies_updates() {
+        let mut inst = Instance::new("updates", "1.21.1", Loader::Fabric("0.16.5".into()));
+        inst.assign_id().unwrap();
+        // The oldest Fabric build of Sodium for 1.21.1, disabled to check that sticks.
+        let url = format!("{API}/project/sodium/version?game_versions={}&loaders={}", enc(r#"["1.21.1"]"#), enc(r#"["fabric"]"#));
+        let versions: Vec<Version> = net::get_json(&url).await.unwrap();
+        let old = versions.last().unwrap();
+        let f = old.files.iter().find(|f| f.primary).unwrap();
+        let path = inst.game_dir().join("mods").join(format!("{}.disabled", f.filename));
+        store::fetch(&Download { url: f.url.clone(), path: path.clone(), sha1: Some(f.hashes.sha1.clone()), size: Some(f.size) }).await.unwrap();
+
+        let ups = check_updates(&inst).await.unwrap();
+        assert_eq!(ups.len(), 1, "{ups:?}");
+        assert_eq!(ups[0].title, "Sodium");
+        assert!(!ups[0].enabled);
+        let to = ups[0].to.files.iter().find(|f| f.primary).unwrap().filename.clone();
+        let done = update(&inst, ups, 5, &Task::new("t")).await.unwrap();
+        assert_eq!(done.done.len(), 1);
+        assert!(!path.exists());
+        assert!(inst.game_dir().join("mods").join(format!("{to}.disabled")).exists());
+        assert!(check_updates(&inst).await.unwrap().is_empty(), "up to date now");
+
+        // And back.
+        let snap = crate::backups::instance_snapshots(&inst.id).remove(0);
+        crate::backups::roll_back(&inst, &snap, 5).unwrap();
+        assert!(path.exists());
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+        crate::backups::forget_instance(&inst.id);
     }
 
     /// Hits the network; run with `cargo test -- --ignored`.

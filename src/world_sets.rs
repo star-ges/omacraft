@@ -5,8 +5,8 @@
 //! - When the game exits, each world it played gets an `omacraft.toml` ([`Record`]):
 //!   the instance, Minecraft version, loader and mods (id → version, read from the jars;
 //!   Fabric and Quilt worlds don't list their mods anywhere else).
-//! - Before launch, every world in the set is checked against the instance's mods
-//!   ([`check`]). A world last played with a mod this instance lacks, or a newer
+//! - Before launch, every world is checked against the instance's mods ([`check`]):
+//!   a world set's, or the instance's own (after a mod rollback, say). A world last played with a mod this instance lacks, or a newer
 //!   version of one, gets a warning and a snapshot first. Extra mods are fine, and
 //!   nothing blocks the launch: content mods can't be told from client-side ones.
 
@@ -176,7 +176,7 @@ impl Drift {
         self.missing.is_empty() && self.older.is_empty() && self.minecraft.is_none()
     }
 
-    fn describe(&self) -> String {
+    pub fn describe(&self) -> String {
         let mut parts = Vec::new();
         if let Some((was, now)) = &self.minecraft {
             parts.push(format!("Minecraft {was} (this instance has {now})"));
@@ -207,17 +207,31 @@ pub fn drift(rec: &Record, inst_mc: &str, inst_mods: &BTreeMap<String, String>) 
     d
 }
 
+/// The worlds in `inst`'s saves last played with something it would lose (see [`Drift`]),
+/// e.g. after its mods were rolled back.
+pub fn behind(inst: &Instance) -> Vec<(saves::World, Drift)> {
+    let mut here = None;
+    saves::list_worlds(&inst.saves_dir())
+        .into_iter()
+        .filter_map(|w| {
+            let d = drift(&read_record(&w.dir)?, &inst.mc_version, here.get_or_insert_with(|| mods(inst)));
+            (!d.is_empty()).then_some((w, d))
+        })
+        .collect()
+}
+
 /// Check every world in `inst`'s saves before it launches. Each one last played with
 /// something this instance would lose is snapshotted first, unless it's open in
 /// another game or a snapshot already covers its last play. Returns warnings for
 /// the log. Never fails: the game launches either way.
 pub fn check(inst: &Instance) -> Vec<String> {
-    let owner = if inst.world_set.is_empty() { Owner::Instance(&inst.id) } else { Owner::Set(&inst.world_set) };
-    let here = mods(inst);
+    let owner = Owner::of(inst);
+    // Reading every jar is the slow part; worlds never played through Omacraft don't need it.
+    let mut here = None;
     let mut notes = Vec::new();
     for w in saves::list_worlds(&inst.saves_dir()) {
         let Some(rec) = read_record(&w.dir) else { continue };
-        let d = drift(&rec, &inst.mc_version, &here);
+        let d = drift(&rec, &inst.mc_version, here.get_or_insert_with(|| mods(inst)));
         if d.is_empty() {
             continue;
         }
@@ -229,7 +243,7 @@ pub fn check(inst: &Instance) -> Vec<String> {
         } else if lock_holder(&w.dir).is_some() {
             notes.push(format!("{what}. It's open in another game, so no snapshot was taken"));
         } else {
-            match backups::snapshot_world(&w.dir, owner, &format!("before {} played it: {}", inst.name, d.describe())) {
+            match backups::snapshot_world(&w.dir, owner, &format!("before {} played it: {}", inst.name, d.describe()), false) {
                 Ok(dir) => notes.push(format!("{what}. Snapshot taken first: {}", dir.display())),
                 Err(e) => notes.push(format!("{what}. The snapshot failed: {e:#}")),
             }

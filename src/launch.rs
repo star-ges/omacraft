@@ -573,14 +573,11 @@ async fn start(
     // changed while this one was running. A failure here shouldn't stop the game.
     let i = inst.clone();
     let shared = tokio::task::spawn_blocking(move || crate::shares::apply(&i)).await?;
-    // Worlds shared with other instances may have been played with mods this one lacks.
-    let worlds = if inst.world_set.is_empty() {
-        Vec::new()
-    } else {
-        task.stage("Checking worlds", 0);
-        let i = inst.clone();
-        tokio::task::spawn_blocking(move || crate::world_sets::check(&i)).await?
-    };
+    // Worlds may have been played with mods this one lacks: in another instance of its
+    // world set, or here before a mod rollback.
+    task.stage("Checking worlds", 0);
+    let i = inst.clone();
+    let worlds = tokio::task::spawn_blocking(move || crate::world_sets::check(&i)).await?;
     let args = build_command(&prepared, inst, cfg, account, token, features, quick)?;
 
     {
@@ -672,10 +669,13 @@ pub async fn launch(
         }
     };
     let _ = tokio::join!(a, b);
-    let i = inst.clone();
+    let (i, keep) = (inst.clone(), cfg.backups_keep);
     let (played, failed) = tokio::task::spawn_blocking(move || {
         let played = watch.played();
-        let failed = crate::world_sets::write_records(&i, &played);
+        let mut failed = crate::world_sets::write_records(&i, &played);
+        for w in &played {
+            failed.extend(crate::backups::after_play(w, crate::backups::Owner::of(&i), &i.name, keep));
+        }
         (played, failed)
     })
     .await
@@ -697,6 +697,9 @@ pub async fn launch(
         if !played.is_empty() {
             let names: Vec<String> = played.iter().filter_map(|w| w.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
             l.push(LogLevel::Launcher, format!("recorded the mods {} was played with", names.join(", ")));
+            if cfg.backups_keep > 0 {
+                l.push(LogLevel::Launcher, format!("backed up {}", names.join(", ")));
+            }
         }
         failed.into_iter().for_each(|f| l.push(LogLevel::Warn, f));
         l.exited = Some(exit.clone());

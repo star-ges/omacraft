@@ -45,6 +45,39 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()>
     r
 }
 
+/// Swap two paths in one step (`renameat2` with `RENAME_EXCHANGE`).
+pub fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(std::io::Error::other);
+    let (a, b) = (c(a)?, c(b)?);
+    if unsafe { libc::renameat2(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_EXCHANGE) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Put the folder `staged` where `target` is, replacing whatever is there: swapped in
+/// one step where the filesystem can, then the old one (now at `staged`) deleted.
+pub fn swap_in(staged: &Path, target: &Path) -> std::io::Result<()> {
+    let remove = |p: &Path| match std::fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
+        Ok(_) => std::fs::remove_file(p),
+        Err(_) => Ok(()),
+    };
+    if std::fs::symlink_metadata(target).is_err() {
+        return std::fs::rename(staged, target);
+    }
+    match exchange(staged, target) {
+        Ok(()) => remove(staged),
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)) => {
+            remove(target)?;
+            std::fs::rename(staged, target)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The most we decompress for one metadata entry (instance.cfg, modrinth.index.json,
 /// mod metadata and icons, level.dat), so a crafted archive can't exhaust memory.
 pub const METADATA_LIMIT: u64 = 16 << 20;

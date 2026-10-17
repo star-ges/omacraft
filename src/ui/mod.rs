@@ -59,6 +59,10 @@ pub enum Modal {
     Confirm(Confirm),
     /// A world set member's version change.
     SetVersion(Box<version::SetVersion>),
+    /// Pick a backup of an instance's mods to roll back to.
+    RollBack(Box<content::RollBack>),
+    /// After a rollback: roll a world played with the newer mods back too?
+    WorldRollBack(Box<content::WorldPrompt>),
 }
 
 /// A yes/no question before something destructive.
@@ -77,6 +81,11 @@ pub enum ConfirmAction {
     ResetSkin(String),
     /// A share or world set no instance uses, with its files.
     DeleteSet(Kind, String),
+    /// Put a world back from a backup: (instance id, the backup).
+    RestoreWorld(String, crate::backups::Snapshot),
+    DeleteBackup(crate::backups::Snapshot),
+    /// Put an instance's mods and config back: (instance id, the backup).
+    RollBack(String, crate::backups::Snapshot),
 }
 
 enum Phase {
@@ -499,14 +508,22 @@ impl App {
             self.worlds.invalidate();
         }
 
-        let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.worlds.dups).into_iter().partition(|(_, p, _)| p.ready());
-        self.worlds.dups = running;
+        let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.worlds.jobs).into_iter().partition(|(_, p, _)| p.ready());
+        self.worlds.jobs = running;
         for (task, p, id) in done {
             let r = p.take().unwrap();
             task.finish(&r.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
             match r {
-                Ok(folder) => self.worlds.duplicated(&id, folder),
-                Err(e) => self.toast(ToastKind::Error, format!("Couldn't duplicate: {e:#}")),
+                Ok(done) => {
+                    if let Some(n) = done.note {
+                        self.toast(ToastKind::Info, n);
+                    }
+                    self.worlds.finished(&id, done.select);
+                }
+                Err(e) => {
+                    self.toast(ToastKind::Error, format!("{e:#}"));
+                    self.worlds.invalidate();
+                }
             }
         }
     }
@@ -768,7 +785,7 @@ impl App {
         let mut cands = vec![Help, TabInstances, TabAccounts, TabSettings, Play, New, Import, Export, Groups];
         match self.tab {
             Tab::Instances => {
-                cands.extend([FocusLeft, FocusRight, PrevTab, NextTab, Back, ModsTab, LoaderType]);
+                cands.extend([FocusLeft, FocusRight, PrevTab, NextTab, Back, ModsTab, LoaderType, Update, UpdateOne, RollBack]);
                 cands.extend(nav::PANE_ACTIONS);
             }
             Tab::Accounts => cands.extend([Microsoft, Down, Up, Top, Bottom, Activate, Delete, Add, TurnLeft, TurnRight, UploadSkin, Toggle, Cycle, Back]),
@@ -813,6 +830,11 @@ impl App {
             Action::LoaderType => {
                 if self.inst_tab == InstTab::Version {
                     self.version.cycle_loader();
+                }
+            }
+            Action::Update | Action::UpdateOne | Action::RollBack => {
+                if self.inst_tab == InstTab::Mods {
+                    self.content.key = Some(a);
                 }
             }
             Action::FocusLeft => {
@@ -914,7 +936,8 @@ impl App {
 
     /// The pending navigation key, if `zone` has focus.
     pub fn nav_for(&mut self, zone: Zone) -> Option<Nav> {
-        if self.tab == Tab::Instances && self.focus != zone {
+        // An open dialog's keys are its own, though the panes under it still draw first.
+        if self.modal.is_some() || (self.tab == Tab::Instances && self.focus != zone) {
             return None;
         }
         self.nav.take()
@@ -955,6 +978,7 @@ impl App {
                     self.toast(ToastKind::Error, format!("Delete failed: {e}"));
                     return;
                 }
+                crate::backups::forget_instance(id);
                 self.toast(ToastKind::Info, format!("Deleted {name}"));
                 self.instances.retain(|i| &i.id != id);
                 self.sessions.remove(id);
@@ -969,6 +993,14 @@ impl App {
                 self.shots.invalidate();
                 self.content.invalidate();
             }
+            ConfirmAction::RestoreWorld(id, snap) => worlds::start_restore(self, ctx, id, snap.clone()),
+            ConfirmAction::DeleteBackup(snap) => {
+                if let Err(e) = crate::backups::delete(snap) {
+                    self.toast(ToastKind::Error, format!("Couldn't delete the backup: {e:#}"));
+                }
+                self.worlds.invalidate();
+            }
+            ConfirmAction::RollBack(id, snap) => content::start_roll_back(self, ctx, id, snap.clone()),
             ConfirmAction::ResetSkin(uuid) => accounts::skin_change(self, ctx, uuid, crate::skins::Change::Reset),
             ConfirmAction::DeleteSet(kind, name) => {
                 // Checked again: an instance may have joined since the dialog opened.
@@ -1058,6 +1090,11 @@ impl eframe::App for App {
                 Tab::Settings => settings::show(self, ui),
             });
 
+        if self.modal.is_none()
+            && let Some(p) = self.content.world_prompts.pop_front()
+        {
+            self.modal = Some(Modal::WorldRollBack(Box::new(p)));
+        }
         self.show_modal(&ctx);
         self.toasts(&ctx);
         self.nav = None;
@@ -1146,6 +1183,20 @@ impl App {
                     .backdrop_color(widgets::scrim(&t))
                     .show(ctx, |ui| version::set_version_dialog(self, &s, ui));
                 if r.inner || r.should_close() { None } else { Some(Modal::SetVersion(s)) }
+            }
+            Modal::RollBack(mut s) => {
+                let r = egui::Modal::new(egui::Id::new("roll-back"))
+                    .frame(widgets::modal_frame(&t))
+                    .backdrop_color(widgets::scrim(&t))
+                    .show(ctx, |ui| content::roll_back_dialog(self, &mut s, ui));
+                if r.inner || r.should_close() { None } else { Some(Modal::RollBack(s)) }
+            }
+            Modal::WorldRollBack(mut s) => {
+                let r = egui::Modal::new(egui::Id::new("world-roll-back"))
+                    .frame(widgets::modal_frame(&t))
+                    .backdrop_color(widgets::scrim(&t))
+                    .show(ctx, |ui| content::world_prompt_dialog(self, &mut s, ui));
+                if r.inner || r.should_close() { None } else { Some(Modal::WorldRollBack(s)) }
             }
             Modal::Confirm(c) => {
                 let mut yes = false;

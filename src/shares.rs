@@ -285,7 +285,7 @@ fn unshare(link: &Path, set: &str, notes: &mut Vec<String>) -> anyhow::Result<()
 /// Put the finished copy where `link` is: swapped in one step where the filesystem
 /// can, then the old link (now under the staging name) removed.
 fn publish(link: &Path, copied: &Path) -> anyhow::Result<()> {
-    match exchange(copied, link) {
+    match fsutil::exchange(copied, link) {
         Ok(()) => std::fs::remove_file(copied)?,
         // No atomic swap here; `recover` covers the moment with neither in place.
         Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)) => {
@@ -295,18 +295,6 @@ fn publish(link: &Path, copied: &Path) -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     }
     Ok(())
-}
-
-/// Swap two paths in one step (`renameat2` with `RENAME_EXCHANGE`).
-fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(std::io::Error::other);
-    let (a, b) = (c(a)?, c(b)?);
-    if unsafe { libc::renameat2(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_EXCHANGE) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }
 
 /// Clean up after a leave that was cut short at `link`: drop a half-made copy, drop
@@ -389,7 +377,7 @@ fn copy_through_links(dir: &Path, notes: &mut Vec<String>) -> anyhow::Result<()>
                 return Err(e.into());
             }
         }
-        match exchange(&tmp, &link) {
+        match fsutil::exchange(&tmp, &link) {
             Ok(()) => std::fs::remove_file(&tmp)?,
             Err(_) => {
                 std::fs::remove_file(&link)?;

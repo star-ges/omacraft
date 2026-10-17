@@ -87,7 +87,7 @@ impl Nav {
 
 /// Which zones the current instance tab has.
 pub fn has_side(app: &App) -> bool {
-    app.inst_tab.content_kind().is_some() || app.inst_tab == InstTab::LogHistory || (app.inst_tab == InstTab::Version && app.version.picker_open())
+    app.inst_tab.content_kind().is_some() || matches!(app.inst_tab, InstTab::LogHistory | InstTab::Worlds) || (app.inst_tab == InstTab::Version && app.version.picker_open())
 }
 
 /// Actions that drive panes and dialogs.
@@ -190,11 +190,13 @@ pub fn hints(app: &App) -> Vec<(String, &'static str)> {
                 (InstTab::Version, _) => vec![(l(Activate), "change version")],
                 (InstTab::Log, _) => vec![(p(Down, Up), "scroll"), (l(Bottom), "follow"), (l(Search), "filter"), (l(Copy), "copy")],
                 (InstTab::Notes, _) => vec![(l(Activate), "write"), ("esc".into(), "stop writing")],
-                (InstTab::Worlds, _) => vec![(p(Down, Up), "worlds"), (l(Activate), "play world"), (l(Rename), "rename"), (l(Duplicate), "duplicate"), (l(Delete), "delete"), (l(Folder), "folder")],
+                (InstTab::Worlds, false) => vec![(p(Down, Up), "worlds"), (l(Activate), "play world"), (l(Rename), "rename"), (l(Duplicate), "duplicate"), (l(Add), "back up"), (l(Delete), "delete"), (l(FocusRight), "backups")],
+                (InstTab::Worlds, true) => vec![(p(Down, Up), "backups"), (l(Activate), "restore"), (l(Add), "back up now"), (l(Delete), "delete"), (l(Folder), "folder")],
                 (InstTab::Servers, _) => vec![(p(Down, Up), "servers"), (l(Activate), "join"), (l(Add), "add"), (l(Edit), "edit"), (p(MoveDown, MoveUp), "reorder"), (l(Delete), "remove")],
                 (InstTab::Screenshots, _) => vec![(p(Down, Up), "screenshots"), (l(Activate), "open"), (l(Copy), "copy"), (l(Delete), "delete"), (l(Folder), "folder"), (l(Toggle), "all instances")],
                 (InstTab::LogHistory, false) => vec![(p(Down, Up), "files"), (l(FocusRight), "read"), (l(Activate), "open"), (l(Folder), "folder")],
                 (InstTab::LogHistory, true) => vec![(p(Down, Up), "scroll"), (l(Search), "filter"), (l(Copy), "copy")],
+                (InstTab::Mods, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(Update), "updates"), (l(RollBack), "roll back"), (l(FocusRight), "modrinth"), (l(Search), "search")],
                 (_, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(FocusRight), "modrinth"), (l(Search), "search")],
                 (_, true) => vec![(p(Down, Up), "results"), (l(Activate), "install"), (l(Search), "search")],
             });

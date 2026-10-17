@@ -13,7 +13,8 @@ use super::nav::{Nav, Zone};
 use super::{App, Confirm, ConfirmAction, Modal, Toast, ToastKind};
 use crate::instance::{ContentKind, Instance, ModFile};
 use crate::content_meta::{self, FileMeta};
-use crate::modrinth::{self, Hit, SearchResponse};
+use crate::keymap::Action;
+use crate::modrinth::{self, Hit, SearchResponse, Update};
 use crate::task::{Promise, Task};
 
 #[derive(Default)]
@@ -47,6 +48,32 @@ pub struct ContentState {
     meta: MetaStore,
     remote: RemoteIcons,
     pub focus_search: bool,
+    /// An update or rollback key for the mods tab, taken while it draws.
+    pub key: Option<Action>,
+    /// The last mod update check: (instance id, the check).
+    updates: Option<(String, Check)>,
+    /// Mods being updated or rolled back: (task, what to say when done, instance id).
+    pub mod_job: Option<(Task, Promise<ModJobDone>, String)>,
+    /// Worlds a rollback left played with newer mods, each to ask about in turn.
+    pub world_prompts: std::collections::VecDeque<WorldPrompt>,
+}
+
+/// How a mods update or rollback went.
+pub struct ModJobDone {
+    kind: ToastKind,
+    text: String,
+    worlds: Vec<WorldPrompt>,
+}
+
+impl ModJobDone {
+    fn new(kind: ToastKind, text: String) -> Self {
+        ModJobDone { kind, text, worlds: Vec::new() }
+    }
+}
+
+enum Check {
+    Running(Promise<Vec<Update>>),
+    Found(Vec<Update>),
 }
 
 /// Name, version and icon of installed files, filled in the background.
@@ -206,12 +233,27 @@ fn kind_glyph(kind: ContentKind) -> &'static str {
 
 impl ContentState {
     pub fn tasks(&self) -> impl Iterator<Item = &Task> {
-        self.kinds.values().flat_map(|k| k.installing.values().map(|j| &j.task))
+        self.kinds.values().flat_map(|k| k.installing.values().map(|j| &j.task)).chain(self.mod_job.iter().map(|(t, ..)| t))
     }
 
-    /// Whether anything is still being installed into this instance.
+    /// Whether anything is still being installed into this instance, or its mods updated.
     pub fn busy_with(&self, inst_id: &str) -> bool {
-        self.kinds.values().any(|k| k.installing.keys().any(|(id, _)| id == inst_id))
+        self.kinds.values().any(|k| k.installing.keys().any(|(id, _)| id == inst_id)) || self.updating(inst_id)
+    }
+
+    fn updating(&self, inst_id: &str) -> bool {
+        self.mod_job.as_ref().is_some_and(|(.., id)| id == inst_id)
+    }
+
+    /// Run a mods update or rollback in the background; it toasts its own outcome.
+    pub fn start_mod_job(&mut self, rt: &tokio::runtime::Handle, ctx: &egui::Context, inst_id: &str, task: Task, fut: impl Future<Output = ModJobDone> + Send + 'static) {
+        let tk = task.clone();
+        let p = Promise::spawn(rt, ctx, async move {
+            let r = fut.await;
+            tk.finish(&if r.kind == ToastKind::Error { Err(anyhow::anyhow!("{}", r.text)) } else { Ok(()) });
+            Ok(r)
+        });
+        self.mod_job = Some((task, p, inst_id.to_string()));
     }
 
     pub fn invalidate(&mut self) {
@@ -221,6 +263,30 @@ impl ContentState {
     }
 
     pub fn poll(&mut self, toasts: &mut Vec<Toast>) {
+        if let Some((_, Check::Running(p))) = &self.updates
+            && let Some(r) = p.take()
+        {
+            match r {
+                Ok(list) => {
+                    if list.is_empty() {
+                        toasts.push(Toast::info("Every mod is up to date"));
+                    }
+                    self.updates.as_mut().unwrap().1 = Check::Found(list);
+                }
+                Err(e) => {
+                    toasts.push(Toast::error(format!("Couldn't check for updates: {e:#}")));
+                    self.updates = None;
+                }
+            }
+        }
+        if let Some((_, p, _)) = self.mod_job.take_if(|(_, p, _)| p.ready()) {
+            let done = p.take().unwrap().unwrap_or_else(|e| ModJobDone::new(ToastKind::Error, format!("{e:#}")));
+            toasts.push(Toast { kind: done.kind, text: done.text, born: Instant::now() });
+            self.world_prompts.extend(done.worlds);
+            // What was found is out of date now.
+            self.updates = None;
+            self.invalidate();
+        }
         for s in self.kinds.values_mut() {
             let meta = &self.meta;
             if let Some(p) = &s.search_p
@@ -314,11 +380,40 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
     let mut out = Out::default();
     // Installing into a folder that's being moved into or out of a share set could land
     // the file in the old place or get it renamed on a clash.
-    let moving = app.sharing.is_some() && crate::shares::SET_FOLDERS.contains(&kind.dir());
+    let blocked = if app.sharing.is_some() && crate::shares::SET_FOLDERS.contains(&kind.dir()) {
+        Some("Shared folders are moving; install again in a moment")
+    } else if kind == ContentKind::Mods && app.content.updating(&inst.id) {
+        Some("Mods are updating; install again in a moment")
+    } else {
+        None
+    };
+    let ups = match kind {
+        ContentKind::Mods => Some(Updates {
+            list: match &app.content.updates {
+                Some((id, Check::Found(l))) if *id == inst.id => l.clone(),
+                _ => Vec::new(),
+            },
+            checking: app.content.updates.as_ref().is_some_and(|(id, c)| *id == inst.id && matches!(c, Check::Running(_))),
+            running: app.content.updating(&inst.id),
+            key: app.content.key.take(),
+        }),
+        _ => None,
+    };
+    let s = app.content.kinds.entry(kind).or_default();
     ui.columns(2, |cols| {
-        installed(&mut cols[0], &t, s, &meta, inst, kind, main_nav, zone == Zone::Main, &mut out);
-        browse(&mut cols[1], &t, s, &meta, &remote, inst, kind, &rt, &ctx, focus, side_nav, zone == Zone::Side, moving, &mut out);
+        installed(&mut cols[0], &t, s, &meta, inst, kind, main_nav, zone == Zone::Main, ups.as_ref(), &mut out);
+        browse(&mut cols[1], &t, s, &meta, &remote, inst, kind, &rt, &ctx, focus, side_nav, zone == Zone::Side, blocked, &mut out);
     });
+    if out.check {
+        let i = inst.clone();
+        app.content.updates = Some((inst.id.clone(), Check::Running(Promise::spawn(&rt, &ctx, async move { modrinth::check_updates(&i).await }))));
+    }
+    if let Some(list) = out.update {
+        start_update(app, &ctx, inst, list);
+    }
+    if out.roll_back {
+        open_roll_back(app, inst);
+    }
     if focus || out.to_results {
         app.focus = Zone::Side;
     }
@@ -345,6 +440,215 @@ struct Out {
     error: Option<String>,
     to_results: bool,
     to_installed: bool,
+    /// Check for mod updates, update these, or open the rollback dialog.
+    check: bool,
+    update: Option<Vec<Update>>,
+    roll_back: bool,
+}
+
+/// The mods tab's update state, for the installed pane.
+struct Updates {
+    list: Vec<Update>,
+    checking: bool,
+    /// An update or rollback is running in this instance.
+    running: bool,
+    key: Option<Action>,
+}
+
+/// Update `list`'s mods in the background, unless the instance is busy.
+fn start_update(app: &mut App, ctx: &egui::Context, inst: &Instance, list: Vec<Update>) {
+    if let Some(why) = app.instance_busy(&inst.id) {
+        app.toast(ToastKind::Error, format!("Can't update mods while {why}"));
+        return;
+    }
+    let task = Task::new(format!("updating {}", inst.name));
+    let (i, keep, tk) = (inst.clone(), app.cfg.backups_keep, task.clone());
+    let rt = app.rt.clone();
+    app.content.start_mod_job(&rt, ctx, &inst.id, task, async move {
+        let (kind, text) = match modrinth::update(&i, list, keep, &tk).await {
+            Ok(done) => {
+                let mut text = match done.done.as_slice() {
+                    [one] => format!("Updated {one}"),
+                    many => format!("Updated {} mods:\n{}", many.len(), many.join("\n")),
+                };
+                if !done.added.is_empty() {
+                    text.push_str(&format!("\nAdded {}", done.added.join(", ")));
+                }
+                if done.missing.is_empty() {
+                    (ToastKind::Info, text)
+                } else {
+                    (ToastKind::Error, format!("{text}\nbut not these required dependencies:\n{}", done.missing.join("\n")))
+                }
+            }
+            Err(e) => (ToastKind::Error, format!("{e:#}")),
+        };
+        ModJobDone::new(kind, text)
+    });
+}
+
+/// The rollback dialog, listing the instance's backups of its mods and config.
+fn open_roll_back(app: &mut App, inst: &Instance) {
+    let list = crate::backups::instance_snapshots(&inst.id);
+    app.modal = Some(Modal::RollBack(Box::new(RollBack { id: inst.id.clone(), name: inst.name.clone(), list, selected: 0 })));
+}
+
+pub struct RollBack {
+    id: String,
+    name: String,
+    list: Vec<crate::backups::Snapshot>,
+    selected: usize,
+}
+
+/// The rollback dialog. Returns true once it's done.
+pub fn roll_back_dialog(app: &mut App, s: &mut RollBack, ui: &mut Ui) -> bool {
+    let t = app.t.clone();
+    let kb = app.modal_nav();
+    ui.set_width(520.0);
+    w::heading(ui, &t, "roll back mods");
+    ui.add_space(8.0);
+    if s.list.is_empty() {
+        w::para(ui, RichText::new(format!("No backups of {}'s mods yet. One is taken before every update.", s.name)).color(t.muted));
+        ui.add_space(14.0);
+        return w::button(ui, "close").clicked() || kb == Some(Nav::Activate);
+    }
+    w::para(ui, RichText::new(format!("Put {}'s mods and config back as they were. What's there now is backed up first.", s.name)).color(t.muted));
+    ui.add_space(8.0);
+    if let Some(p) = kb.filter(|n| n.is_move()).and_then(|n| n.step(s.list.len(), Some(s.selected))) {
+        s.selected = p;
+    }
+    let mut pick = kb == Some(Nav::Activate);
+    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        for (n, snap) in s.list.iter().enumerate() {
+            let on = n == s.selected;
+            let r = w::rich_row(ui, &t, on, w::Lead::Glyph("\u{f006f}"), &snap.when(), &snap.info.reason, "");
+            if on {
+                w::focus_mark(ui, &t, r.rect);
+            }
+            if r.clicked() {
+                s.selected = n;
+            }
+            if r.double_clicked() {
+                pick = true;
+            }
+        }
+    });
+    ui.add_space(14.0);
+    let mut done = false;
+    ui.horizontal(|ui| {
+        if w::primary_button(ui, &t, "roll back…").clicked() {
+            pick = true;
+        }
+        done = w::button(ui, "cancel").clicked();
+    });
+    if pick && let Some(snap) = s.list.get(s.selected) {
+        app.modal = Some(Modal::Confirm(Confirm {
+            title: "roll back mods".into(),
+            body: format!("Put {}'s mods and config back as they were on {}? What's there now is backed up first.", s.name, snap.when()),
+            button: "roll back".into(),
+            action: ConfirmAction::RollBack(s.id.clone(), snap.clone()),
+        }));
+        return true;
+    }
+    done
+}
+
+/// Roll `id`'s mods back to `snap` in the background (confirmed already).
+pub fn start_roll_back(app: &mut App, ctx: &egui::Context, id: &str, snap: crate::backups::Snapshot) {
+    let Some(inst) = app.instances.iter().find(|i| i.id == id).cloned() else { return };
+    if let Some(why) = app.instance_busy(id) {
+        app.toast(ToastKind::Error, format!("Can't roll back while {why}"));
+        return;
+    }
+    let task = Task::new(format!("rolling back {}", inst.name));
+    task.stage("Rolling back mods", 0);
+    let keep = app.cfg.backups_keep;
+    let rt = app.rt.clone();
+    app.content.start_mod_job(&rt, ctx, id, task, async move {
+        let when = snap.when();
+        let r = tokio::task::spawn_blocking(move || {
+            crate::backups::roll_back(&inst, &snap, keep)?;
+            Ok::<_, anyhow::Error>(world_prompts(&inst, snap.info.taken))
+        })
+        .await;
+        match r {
+            Ok(Ok(worlds)) => ModJobDone { kind: ToastKind::Info, text: format!("Rolled mods back to {when}"), worlds },
+            Ok(Err(e)) => ModJobDone::new(ToastKind::Error, format!("Couldn't roll back: {e:#}")),
+            Err(e) => ModJobDone::new(ToastKind::Error, format!("Couldn't roll back: {e}")),
+        }
+    });
+}
+
+/// A world last played with mods a rollback just took away or made older: offer to
+/// roll it back too.
+pub struct WorldPrompt {
+    inst_id: String,
+    name: String,
+    what: String,
+    snaps: Vec<crate::backups::Snapshot>,
+    selected: usize,
+}
+
+/// The worlds `inst` (just rolled back to mods from `before`) last played with newer
+/// mods, each with its backups. The newest backup from before `before` is picked: the
+/// world as it was before those mods were installed.
+fn world_prompts(inst: &Instance, before: chrono::DateTime<chrono::Utc>) -> Vec<WorldPrompt> {
+    let owner = crate::backups::Owner::of(inst);
+    crate::world_sets::behind(inst)
+        .into_iter()
+        .map(|(w, d)| {
+            let snaps = crate::backups::snapshots(owner, &w.folder);
+            let selected = snaps.iter().position(|s| s.info.taken <= before).unwrap_or(0);
+            WorldPrompt { inst_id: inst.id.clone(), name: w.name, what: d.describe(), snaps, selected }
+        })
+        .collect()
+}
+
+/// Asks whether to roll a world back too. Returns true once it's answered.
+pub fn world_prompt_dialog(app: &mut App, p: &mut WorldPrompt, ui: &mut Ui) -> bool {
+    let t = app.t.clone();
+    let kb = app.modal_nav();
+    ui.set_width(520.0);
+    w::heading(ui, &t, "roll back the world too?");
+    ui.add_space(8.0);
+    w::para(ui, format!("“{}” was last played with {}, which the rollback took away. Restore the world from a backup as well?", p.name, p.what));
+    ui.add_space(8.0);
+    if p.snaps.is_empty() {
+        w::para(ui, RichText::new("It has no backups to restore from.").color(t.muted));
+        ui.add_space(14.0);
+        return w::button(ui, "ok").clicked() || kb == Some(Nav::Activate);
+    }
+    if let Some(n) = kb.filter(|n| n.is_move()).and_then(|n| n.step(p.snaps.len(), Some(p.selected))) {
+        p.selected = n;
+    }
+    let mut restore = kb == Some(Nav::Activate);
+    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        for (n, snap) in p.snaps.iter().enumerate() {
+            let on = n == p.selected;
+            let r = w::rich_row(ui, &t, on, w::Lead::Glyph("\u{f006f}"), &snap.when(), &snap.info.reason, if snap.info.auto { "auto" } else { "" });
+            if on {
+                w::focus_mark(ui, &t, r.rect);
+            }
+            if r.clicked() {
+                p.selected = n;
+            }
+            if r.double_clicked() {
+                restore = true;
+            }
+        }
+    });
+    ui.add_space(14.0);
+    let mut no = false;
+    ui.horizontal(|ui| {
+        restore |= w::primary_button(ui, &t, "restore").clicked();
+        no = w::button(ui, "no").clicked();
+    });
+    if restore && let Some(snap) = p.snaps.get(p.selected).cloned() {
+        super::worlds::start_restore(app, ui.ctx(), &p.inst_id.clone(), snap);
+        return true;
+    }
+    no
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -357,9 +661,11 @@ fn installed(
     kind: ContentKind,
     kb: Option<Nav>,
     focused: bool,
+    ups: Option<&Updates>,
     out: &mut Out,
 ) {
     let files = s.files(inst, kind);
+    let update_for = |m: &ModFile| ups.and_then(|u| u.list.iter().find(|x| x.path == m.path));
     // Selection is by file stem, so it survives enable/disable renames.
     let stem = |m: &ModFile| m.name.trim_end_matches(".disabled").to_string();
     let pos = s.selected.as_ref().and_then(|n| files.iter().position(|m| stem(m) == *n));
@@ -382,9 +688,32 @@ fn installed(
             if w::danger_button(ui, t, "remove").clicked() || key(Nav::Delete) {
                 out.remove = Some(m.clone());
             }
+            if let Some(u) = update_for(m)
+                && !ups.is_some_and(|u| u.running)
+                && (w::button(ui, "update").on_hover_text(format!("{} → {}", u.from, u.to.version_number)).clicked() || ups.is_some_and(|u| u.key == Some(Action::UpdateOne)))
+            {
+                out.update = Some(vec![u.clone()]);
+            }
         }
         if w::button(ui, "folder").clicked() || key(Nav::Folder) {
             super::open_path(&inst.game_dir().join(kind.dir()));
+        }
+        if let Some(u) = ups {
+            let key = u.key == Some(Action::Update);
+            if u.running {
+                ui.label(RichText::new("updating…").color(t.muted));
+            } else if u.checking {
+                ui.label(RichText::new("checking…").color(t.muted));
+            } else if !u.list.is_empty() {
+                if w::button(ui, &format!("update all ({})", u.list.len())).clicked() || key {
+                    out.update = Some(u.list.clone());
+                }
+            } else if w::button(ui, "check updates").clicked() || key {
+                out.check = true;
+            }
+            if (w::button(ui, "roll back…").clicked() || u.key == Some(Action::RollBack)) && !u.running {
+                out.roll_back = true;
+            }
         }
         let on = files.iter().filter(|f| f.enabled).count();
         let text = RichText::new(format!("{on}/{} enabled", files.len())).color(t.muted);
@@ -420,7 +749,14 @@ fn installed(
             if title != m.display_name() {
                 sub.push(m.display_name().to_string());
             }
-            let r = w::rich_row_dim(ui, t, sel, lead, &title, &sub.join("  ·  "), if m.enabled { "" } else { "disabled" }, !m.enabled);
+            let mut right: Vec<String> = Vec::new();
+            if update_for(m).is_some() {
+                right.push("\u{f06b0} update".into());
+            }
+            if !m.enabled {
+                right.push("disabled".into());
+            }
+            let r = w::rich_row_dim(ui, t, sel, lead, &title, &sub.join("  ·  "), &right.join("  ·  "), !m.enabled);
             if sel && focused {
                 w::focus_mark(ui, t, r.rect);
             }
@@ -458,7 +794,7 @@ fn browse(
     focus: bool,
     kb: Option<Nav>,
     focused: bool,
-    moving: bool,
+    blocked: Option<&str>,
     out: &mut Out,
 ) {
     let r = w::text_input(ui, &mut s.query, &format!("/  search modrinth {}s", kind.noun()), ui.available_width(), focus);
@@ -539,8 +875,8 @@ fn browse(
                                     } else if have {
                                         ui.label(RichText::new("installed").color(t.green));
                                     } else if w::button(ui, "install").clicked() || (picked && install_key) {
-                                        if moving {
-                                            out.error = Some("Shared folders are moving; install again in a moment".into());
+                                        if let Some(why) = blocked {
+                                            out.error = Some(why.into());
                                         } else {
                                             let task = Task::new(format!("installing {}", h.title));
                                             task.stage(format!("Installing {}", h.title), 0);
@@ -582,6 +918,54 @@ fn browse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mod jar with a fabric.mod.json, as `mods/<id>.jar`.
+    fn jar(inst: &Instance, id: &str, version: &str) {
+        use std::io::Write;
+        let dir = inst.game_dir().join("mods");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut z = zip::ZipWriter::new(std::fs::File::create(dir.join(format!("{id}.jar"))).unwrap());
+        z.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default()).unwrap();
+        write!(z, r#"{{"schemaVersion": 1, "id": "{id}", "version": "{version}"}}"#).unwrap();
+        z.finish().unwrap();
+    }
+
+    #[test]
+    fn a_rollback_offers_the_worlds_played_with_newer_mods() {
+        use crate::backups::{self, Owner};
+        let mut inst = Instance::new("prompt", "1.21.1", crate::loaders::Loader::Fabric("0.16.5".into()));
+        inst.assign_id().unwrap();
+        jar(&inst, "create", "6.0.0");
+        let saves = inst.saves_dir();
+        for w in ["Played", "Untouched"] {
+            std::fs::create_dir_all(saves.join(w)).unwrap();
+            std::fs::write(saves.join(w).join("level.dat"), "").unwrap();
+        }
+        let world = saves.join("Played");
+        crate::world_sets::write_records(&inst, &[world.clone(), saves.join("Untouched")]);
+        backups::snapshot_world(&world, Owner::of(&inst), "before the update", false).unwrap();
+
+        // Update create, back up its mods first, then play the world with the new one.
+        std::thread::sleep(Duration::from_millis(10));
+        let mods = backups::snapshot_instance(&inst, "before updating create", 5).unwrap();
+        jar(&inst, "create", "6.1.0");
+        crate::world_sets::write_records(&inst, std::slice::from_ref(&world));
+        std::thread::sleep(Duration::from_millis(10));
+        backups::snapshot_world(&world, Owner::of(&inst), "after playing", true).unwrap();
+
+        let snap = backups::instance_snapshots(&inst.id).into_iter().find(|s| s.dir == mods).unwrap();
+        backups::roll_back(&inst, &snap, 5).unwrap();
+        let prompts = world_prompts(&inst, snap.info.taken);
+        assert_eq!(prompts.len(), 1, "only the world played with the newer create");
+        let p = &prompts[0];
+        assert_eq!(p.name, "Played");
+        assert!(p.what.contains("create 6.1.0"), "{}", p.what);
+        // The world as it was before the update is picked, not the newer one.
+        assert_eq!(p.snaps.len(), 2);
+        assert_eq!(p.snaps[p.selected].info.reason, "before the update");
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+        backups::forget_instance(&inst.id);
+    }
 
     fn file(dir: &std::path::Path, name: &str, size: u64, secs: u64) -> ModFile {
         let modified = Some(std::time::UNIX_EPOCH + Duration::from_secs(secs));

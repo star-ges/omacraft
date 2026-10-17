@@ -36,19 +36,19 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim 
 | `auth.rs` | MSA device code → XBL → XSTS → Minecraft; offline accounts |
 | `skins.rs` | Profile skins/capes (upload, classic/slim, cape, reset; refresh + retry on 401), textures cached by hash in `cache/textures/`, Steve/Alex default by UUID. Skins always go up as multipart PNGs: the API's firewall 403s the JSON `{"url": …}` form, so classic/slim re-uploads the cached texture |
 | `instance.rs`, `groups.rs` | `instance.toml` per instance; `groups.toml` (order, colour by palette name) |
-| `modrinth.rs`, `content_meta.rs` | Search/install by `ContentKind`; name/icon from jar or pack, else Modrinth hash lookup |
+| `modrinth.rs`, `content_meta.rs` | Search/install by `ContentKind`, mod updates (`check_updates`/`update` via `version_files/update`); name/icon from jar or pack, else Modrinth hash lookup |
 | `import.rs` | Prism/MultiMC folder or zip, `.mrpack` file or URL, auto-detects other launchers |
 | `export.rs` | Instance zip (MultiMC format) or `.mrpack` (Modrinth-hosted files via `content_meta::hosted`, rest in `overrides/`) |
 | `saves.rs` | `level.dat` and `servers.dat` via fastnbt `Value` (round-trips unknown fields) |
 | `keymap.rs` | Every action, default chords, scopes, parse/label, conflict detection |
 | `shares.rs` | Shared folders, by `Kind`: share sets (`shared/sets/<name>/{resourcepacks,shaderpacks,schematics}`, `share_set` in instance.toml) and world sets (`shared/worlds/<name>/saves`, `world_set`); `apply` turns an instance's folders into relative links or back into copies |
-| `world_sets.rs`, `backups.rs` | World sets' rules: one version + loader per set, `omacraft.toml` play records in each world, the pre-launch mod check; reflink world snapshots under `backups/worlds/` |
+| `world_sets.rs`, `backups.rs` | World sets' rules: one version + loader per set, `omacraft.toml` play records in each world, the pre-launch mod check; reflink snapshots of worlds (`backups/worlds/`) and of an instance's `mods` + `config` (`backups/instances/`), restore, rollback, pruning |
 | `store.rs` | Content store: Modrinth installs and `.mrpack` files go through `cache/content/<sha1>` and are reflinked into instances; `reclaim` merges duplicates (`FIDEDUPERANGE`) and prunes the store |
 | `icons.rs`, `fsutil.rs`, `net.rs`, `task.rs` | Instance icons, reflink copy, HTTP + downloads, background `Task`/`Promise` |
 | `ui/mod.rs` | `App`, top/status bars, modals, key routing, launching, imports |
 | `ui/nav.rs` | Focus zones, `Nav`, hints bar and `?` help, both built from the keymap |
 | `ui/instances.rs` | Sidebar (groups, drag-and-drop, context menu) + instance header + tab dispatch |
-| `ui/{version,content,worlds,servers,screenshots,logs}.rs` | Per-instance tabs |
+| `ui/{version,content,worlds,servers,screenshots,logs}.rs` | Per-instance tabs (content also has mod updates and the rollback dialogs; worlds has the backups pane) |
 | `ui/{new_instance,export,version_picker,icon_picker,group_manager,settings,accounts}.rs` | Dialogs and pages |
 | `ui/skin_view.rs` | 3D player model: one coloured quad per texel, rotated, projected and painted back to front as an `egui::Mesh` |
 | `ui/widgets.rs` | The widget kit, listed under Patterns below |
@@ -69,7 +69,8 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim 
 - **Keyboard:** the screen has zones (`Zone::List/Main/Side`).
   - `App::keys` turns key presses into a `Nav` through the `Keymap`.
   - Each pane takes it with `app.nav_for(zone)` and acts on it like its buttons do (`|| key(Nav::X)`), so mouse and keyboard can't drift apart.
-  - Dialogs use `app.modal_nav()`.
+  - Dialogs use `app.modal_nav()`. While one is open `nav_for` returns nothing, so the panes drawn under it
+    can't take its keys.
   - New actions go in `keymap.rs` `actions!` (with a scope), plus `nav::hints`. The `?` hint always comes first.
   - Never hard-code a key.
 - **Background work:** `Promise::spawn(&app.rt, ctx, fut)` and poll `take()` each frame.
@@ -94,6 +95,12 @@ test (and a rule here) with any fix that sets a new one.
   test touches real data. Put test scratch under `paths::test_root()`.
 - **Pack imports:** Modrinth version URLs (`/modpack/<slug>/version/<id or number>`) install that
   version or fail; `.mrpack` files are checked before the instance exists (HTTPS downloads, a valid SHA-1 per file).
+- **Mod updates:** `modrinth::check_updates` offers a file only if Modrinth's newest compatible build is newer *by date*
+  than the installed one (a hand-installed beta isn't "updated" to an older release). `update` first snapshots the
+  instance's `mods` + `config` and every world no snapshot covers since it last changed (`backups::cover_worlds`), and
+  stops if that fails; an update keeps a disabled mod disabled and installs new required dependencies. Updates and
+  rollbacks count as installs for `busy_with`. Tests: `modrinth::tests::updates_only_go_forward`,
+  `modrinth::tests::finds_and_applies_updates` (network).
 - **Content installs:** `modrinth::plan` works out the whole set before downloading. Pins beat the
   newest build, installed files count by Modrinth project (hash lookup) as well as filename, and required
   dependencies that can't be met come back in `Installed::missing` (error toast, non-zero CLI exit).
@@ -141,11 +148,20 @@ test (and a rule here) with any fix that sets a new one.
   member runs or duplicates a world (a leave would copy a world mid-write). When a game exits, each world it played
   gets an `omacraft.toml` (instance, version, loader, mod id → version from the jars). A world counts as played if
   this game's pid held its `session.lock` (polled with `F_GETLK` every 3 s; Java's `FileChannel.tryLock` is a POSIX
-  lock) or, never seen locked by another game, its `level.dat` changed during the run. Before a world-set member
-  launches, any world last played with a mod it lacks, a newer mod version or a newer Minecraft gets a log warning
+  lock) or, never seen locked by another game, its `level.dat` changed during the run. Before any instance
+  launches (world set or not: a mod rollback leaves the same gap), any world last played with a mod it lacks, a newer mod version or a newer Minecraft gets a log warning
   and a snapshot first, unless it's open in another game or a snapshot taken since its last play covers it. Never
   blocks the launch. Tests: `world_sets::tests`, `backups::tests`,
   `shares::tests::world_sets_share_saves_apart_from_share_sets`.
+- **Backups:** snapshots are reflink copies made under a dot-name and renamed in whole, with a `<stamp>.toml`
+  (`auto` marks the prunable ones). When a game exits, each world it played gets an automatic snapshot, the oldest
+  pruned past `backups_keep` (0 = off); snapshots by hand, by the pre-launch check and before a restore are never
+  pruned. Restoring a world or rolling back mods snapshots what's there first, stages the copy beside the snapshots
+  (never in `saves/`, where the game would list it) and swaps it in (`fsutil::swap_in`); a world open in a game is
+  refused. Worlds that are gone but have snapshots stay listed. After a mod rollback, each world last played with a
+  mod it took away or made older is offered for restore, newest snapshot from before the rolled-back update
+  preselected. Deleting an instance deletes its backups (a world set's stay with the set). Tests: `backups::tests`,
+  `ui::content::tests::a_rollback_offers_the_worlds_played_with_newer_mods`, `ui::worlds::tests`.
 - **Screenshots stay per instance:** never pool them on disk (a shared pool needed guessed ownership, which lost or
   misattributed files). The screenshots tab's "all instances" toggle (config `all_screenshots`) lists every
   instance's folder in the background, each tile captioned with its instance. Test:

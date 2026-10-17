@@ -106,6 +106,26 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 );
             });
 
+            ui.add_space(10.0);
+            w::section(ui, &t, "backups");
+            ui.horizontal(|ui| {
+                w::field_label(ui, &t, "keep");
+                changed |= ui.add(egui::Slider::new(&mut app.cfg.backups_keep, 0..=30).suffix(" per world")).changed();
+                if w::button(ui, "open backups folder").clicked() {
+                    let _ = std::fs::create_dir_all(crate::backups::root());
+                    super::open_path(&crate::backups::root());
+                }
+            });
+            egui::Frame::new().inner_margin(egui::Margin { left: (t.body_size() * 9.0 + 8.0) as i8, ..Default::default() }).show(ui, |ui| {
+                w::para(
+                    ui,
+                    RichText::new(
+                        "A world is backed up whenever a game that played it exits, keeping this many (0 turns that off). Mods and config are backed up before every update, keeping as many. Backups taken by hand or before a world is played with older mods are never removed. On btrfs or xfs backups share their bytes with the world.",
+                    )
+                    .color(t.muted),
+                );
+            });
+
             if changed && let Err(e) = app.cfg.save() {
                 app.toast(ToastKind::Error, format!("Couldn't save settings: {e}"));
             }

@@ -22,6 +22,9 @@ pub struct Config {
     pub show_snapshots: bool,
     /// The screenshots tab shows every instance's screenshots, not just the current one's.
     pub all_screenshots: bool,
+    /// Automatic backups kept per world (taken when a game exits) and per instance
+    /// (its mods, before updates). 0 turns the world ones off.
+    pub backups_keep: u32,
     /// Instance groups folded shut in the list.
     pub collapsed_groups: Vec<String>,
     /// Rebound keys: action id → chords (see keymap.rs).
@@ -37,6 +40,7 @@ impl Default for Config {
             global_jvm_args: String::new(),
             show_snapshots: false,
             all_screenshots: false,
+            backups_keep: 5,
             collapsed_groups: Vec::new(),
             keys: BTreeMap::new(),
         }

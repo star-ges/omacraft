@@ -706,7 +706,7 @@ impl App {
         } else if self.exports.iter().any(|(.., i)| i == id) {
             Some("it's exporting")
         } else if self.worlds.busy_with(id) {
-            Some("a world is duplicating")
+            Some("a world is being copied")
         } else if self.sharing.is_some() {
             Some("shared folders are moving")
         } else {
@@ -724,7 +724,7 @@ impl App {
             } else if self.content.busy_with(&i.id) {
                 Some(format!("{} is installing content", i.name))
             } else if kind == Kind::Worlds && self.worlds.busy_with(&i.id) {
-                Some(format!("{} is duplicating a world", i.name))
+                Some(format!("{} is copying a world", i.name))
             } else if kind == Kind::Worlds && i.id != changing && self.is_running(&i.id) {
                 Some(format!("{} is running", i.name))
             } else {
@@ -741,7 +741,7 @@ impl App {
         }
         self.modal = Some(Modal::Confirm(Confirm {
             title: "delete instance".into(),
-            body: format!("Permanently delete “{name}” and all of its worlds, mods and settings?"),
+            body: format!("Permanently delete “{name}” and all of its worlds, mods and settings, and their backups?"),
             button: "delete".into(),
             action: ConfirmAction::DeleteInstance(id.to_string()),
         }));
