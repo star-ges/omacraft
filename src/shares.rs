@@ -147,6 +147,7 @@ pub fn apply(inst: &Instance) -> anyhow::Result<Vec<String>> {
     for folder in SET_FOLDERS {
         let link = game.join(folder);
         let want = target(inst, folder);
+        recover(&link, folder, want.is_some(), &mut notes).with_context(|| format!("finishing an interrupted change to {folder}"))?;
         let current = std::fs::read_link(&link).ok();
         match (want, current) {
             (Some(w), Some(c)) if w == c => std::fs::create_dir_all(game.join(&w))?,
@@ -192,25 +193,85 @@ fn link_to(link: &Path, target: &Path) -> std::io::Result<()> {
     })
 }
 
-/// Replace a link to share set `set` with a full copy of what it points to.
+/// Where leaving a set stages the instance's copy of `link`: `.<folder>.copying`
+/// while it's made, `.<folder>.copied` once it's whole.
+fn staging(link: &Path, stage: &str) -> PathBuf {
+    link.with_file_name(format!(".{}.{stage}", link.file_name().unwrap_or_default().to_string_lossy()))
+}
+
+/// Replace a link to share set `set` with a full copy of what it points to. The copy
+/// is made under a fixed staging name and swapped in once whole, so [`recover`] can
+/// finish or discard whatever an interruption leaves.
 fn unshare(link: &Path, set: &str, notes: &mut Vec<String>) -> anyhow::Result<()> {
     let name = link.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = link.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let copied = match link.canonicalize() {
+    let (copying, copied) = (staging(link, "copying"), staging(link, "copied"));
+    let made = match link.canonicalize() {
         Ok(_) if !lands_in_set(link, set, &name) => bail!("it leads outside the shared folders; left it alone"),
-        Ok(src) => fsutil::copy_tree(&src, &tmp, &|_| {}),
+        Ok(src) => fsutil::copy_tree(&src, &copying, &|_| {}),
         // The shared folder is gone; start empty.
-        Err(_) => std::fs::create_dir(&tmp).map(|_| Vec::new()),
+        Err(_) => std::fs::create_dir(&copying).map(|_| Vec::new()),
     };
-    match copied {
+    match made {
         Ok(skipped) => notes.extend(skipped),
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = std::fs::remove_dir_all(&copying);
             return Err(e.into());
         }
     }
-    std::fs::remove_file(link)?;
-    std::fs::rename(&tmp, link)?;
+    std::fs::rename(&copying, &copied)?;
+    publish(link, &copied)
+}
+
+/// Put the finished copy where `link` is: swapped in one step where the filesystem
+/// can, then the old link (now under the staging name) removed.
+fn publish(link: &Path, copied: &Path) -> anyhow::Result<()> {
+    match exchange(copied, link) {
+        Ok(()) => std::fs::remove_file(copied)?,
+        // No atomic swap here; `recover` covers the moment with neither in place.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)) => {
+            std::fs::remove_file(link)?;
+            std::fs::rename(copied, link)?;
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+/// Swap two paths in one step (`renameat2` with `RENAME_EXCHANGE`).
+fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(std::io::Error::other);
+    let (a, b) = (c(a)?, c(b)?);
+    if unsafe { libc::renameat2(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_EXCHANGE) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Clean up after a leave that was cut short at `link`: drop a half-made copy, drop
+/// the old link if it was already swapped out, and put a whole copy in place if the
+/// instance is still leaving (or discard it if it has joined a set again since).
+fn recover(link: &Path, folder: &str, want_shared: bool, notes: &mut Vec<String>) -> anyhow::Result<()> {
+    let (copying, copied) = (staging(link, "copying"), staging(link, "copied"));
+    if std::fs::symlink_metadata(&copying).is_ok_and(|m| m.is_dir()) {
+        std::fs::remove_dir_all(&copying)?;
+    }
+    let Ok(m) = std::fs::symlink_metadata(&copied) else { return Ok(()) };
+    if m.is_symlink() {
+        return Ok(std::fs::remove_file(&copied)?);
+    }
+    if !m.is_dir() {
+        return Ok(());
+    }
+    let current = std::fs::symlink_metadata(link).ok();
+    let ours = std::fs::read_link(link).ok().is_some_and(|t| link_set(folder, &t).is_some());
+    match (want_shared, current) {
+        (true, _) => std::fs::remove_dir_all(&copied)?,
+        (false, None) => std::fs::rename(&copied, link)?,
+        (false, Some(_)) if ours => publish(link, &copied)?,
+        (false, Some(_)) => notes.push(format!("{} holds an unfinished copy of {folder}; left it for you to check", copied.display())),
+    }
     Ok(())
 }
 
@@ -441,6 +502,67 @@ mod tests {
         std::fs::remove_file(set_dir(&bad)).unwrap();
         std::fs::remove_dir_all(out_dir).unwrap();
         for i in [&a, &b] {
+            std::fs::remove_dir_all(i.dir()).unwrap();
+        }
+        delete_set(&set).unwrap();
+    }
+
+    #[test]
+    fn an_interrupted_leave_is_finished_by_the_next_apply() {
+        let set = set_name();
+        let other = instance("other", &set, &[("shaderpacks/s.zip", "s")]);
+        apply(&other).unwrap();
+        let mut a = instance("a", &set, &[]);
+        apply(&a).unwrap();
+        a.share_set.clear();
+        let link = a.game_dir().join("shaderpacks");
+        let target = std::fs::read_link(&link).unwrap();
+        let (copying, copied) = (staging(&link, "copying"), staging(&link, "copied"));
+        let whole = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("s.zip"), "s").unwrap();
+        };
+        let check = || {
+            assert!(!std::fs::symlink_metadata(&link).unwrap().is_symlink());
+            assert_eq!(names(&link), ["s.zip"]);
+            assert!(std::fs::symlink_metadata(&copying).is_err() && std::fs::symlink_metadata(&copied).is_err());
+            // Back to a link for the next case.
+            std::fs::remove_dir_all(&link).unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+        };
+
+        // Cut short while copying: the half-made copy goes, and the leave runs again.
+        std::fs::create_dir_all(&copying).unwrap();
+        std::fs::write(copying.join("half.zip"), "h").unwrap();
+        apply(&a).unwrap();
+        check();
+        // Copied, but not swapped in yet.
+        whole(&copied);
+        apply(&a).unwrap();
+        check();
+        // Link removed, copy not yet renamed in (filesystems without an atomic swap).
+        std::fs::remove_file(&link).unwrap();
+        whole(&copied);
+        apply(&a).unwrap();
+        check();
+        // Swapped, but the old link not yet removed.
+        std::fs::remove_file(&link).unwrap();
+        whole(&link);
+        std::os::unix::fs::symlink(&target, &copied).unwrap();
+        apply(&a).unwrap();
+        assert!(std::fs::symlink_metadata(&copied).is_err());
+        assert_eq!(names(&link), ["s.zip"]);
+        // The set itself was never touched.
+        assert_eq!(names(&set_dir(&set).join("shaderpacks")), ["s.zip"]);
+
+        // A copy left behind by an instance that has since joined again is dropped.
+        a.share_set = set.clone();
+        std::fs::remove_dir_all(&link).unwrap();
+        whole(&copied);
+        apply(&a).unwrap();
+        assert!(is_share_link(&link) && std::fs::symlink_metadata(&copied).is_err());
+
+        for i in [&a, &other] {
             std::fs::remove_dir_all(i.dir()).unwrap();
         }
         delete_set(&set).unwrap();
