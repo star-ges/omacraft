@@ -546,14 +546,16 @@ mod tests {
             assert!(launch_blocked(&content, &worlds, i).is_none());
         }
         // A restore started through b holds off a and b, not c.
-        worlds.start(rt.handle(), &ctx, &b, "restore", "Restoring".into(), || {
-            std::thread::sleep(Duration::from_secs(60));
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        worlds.start(rt.handle(), &ctx, &b, "restore", "Restoring".into(), move || {
+            let _ = wait.recv();
             Ok(JobDone { select: None, note: None })
         });
         assert!(launch_blocked(&content, &worlds, &a).is_some(), "a plays the worlds b is restoring");
         assert!(launch_blocked(&content, &worlds, &b).is_some());
         assert!(launch_blocked(&content, &worlds, &c).is_none());
         assert!(jobs_on(&content, &worlds, &saves_key(&a)).is_some(), "a second world job through a waits");
+        drop(done);
         worlds.jobs.clear();
 
         // A mod update in c holds off c only; one in a (backing up its worlds) holds off b too.

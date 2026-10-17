@@ -398,8 +398,18 @@ pub struct Updated {
     pub missing: Vec<String>,
 }
 
-/// Update mods to the versions `check_updates` found. Their mods and config are
-/// snapshotted first (stopping here if that fails), so it can all be rolled back.
+/// The backups an update takes before it changes anything. Worlds come first: played
+/// with the new mods they can't go back on their own, so each gets a copy from before
+/// unless one already covers it. The mods and config are snapshotted last, so every world
+/// copy for this update is older than it, and a rollback to it picks those.
+pub(crate) fn back_up_for_update(inst: &Instance, reason: &str, keep: u32) -> anyhow::Result<()> {
+    crate::backups::cover_worlds(inst, reason)?;
+    crate::backups::snapshot_instance(inst, reason, keep)?;
+    Ok(())
+}
+
+/// Update mods to the versions `check_updates` found. Their mods, config and worlds are
+/// backed up first (stopping here if any of that fails), so it can all be rolled back.
 /// New required dependencies are installed too.
 pub async fn update(inst: &Instance, updates: Vec<Update>, keep: u32, task: &Task) -> anyhow::Result<Updated> {
     task.stage("Backing up mods, config and worlds", 0);
@@ -409,16 +419,7 @@ pub async fn update(inst: &Instance, updates: Vec<Update>, keep: u32, task: &Tas
         many => format!("before updating {} mods: {}", many.len(), many.join(", ")),
     };
     let i = inst.clone();
-    let worlds = tokio::task::spawn_blocking(move || {
-        crate::backups::snapshot_instance(&i, &reason, keep)?;
-        // Worlds played with the new mods can't go back on their own: keep a copy from before.
-        Ok::<_, anyhow::Error>(crate::backups::cover_worlds(&i, &reason))
-    })
-    .await?
-    .context("backing up first")?;
-    for n in worlds {
-        eprintln!("{n}");
-    }
+    tokio::task::spawn_blocking(move || back_up_for_update(&i, &reason, keep)).await?.context("backing up first; nothing was updated")?;
 
     let dir = inst.game_dir().join(ContentKind::Mods.dir());
     let mut out = Updated::default();
@@ -605,6 +606,38 @@ mod tests {
         let ups = pick_updates(&held, &current, &latest, &titles);
         assert_eq!(ups.iter().map(|u| (u.title.as_str(), u.to.id.as_str(), u.enabled)).collect::<Vec<_>>(), [("Alpha", "a-2", true), ("b-1", "b-2", false)]);
         assert_eq!(ups[0].from, "a-1");
+    }
+
+    /// G15: a world that can't be backed up stops the update before any mod changes.
+    #[tokio::test]
+    async fn an_update_stops_if_a_world_cant_be_backed_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut inst = Instance::new("update stops", "1.21.1", Loader::Fabric("0.16.5".into()));
+        inst.assign_id().unwrap();
+        let mods = inst.game_dir().join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::write(mods.join("a-1.jar"), "a1").unwrap();
+        let world = inst.saves_dir().join("W");
+        std::fs::create_dir_all(world.join("region")).unwrap();
+        std::fs::write(world.join("level.dat"), "L").unwrap();
+        let unreadable = world.join("region/r.0.0.mca");
+        std::fs::write(&unreadable, "R").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&unreadable).is_ok() {
+            eprintln!("skipped: running as root, the file is still readable");
+            std::fs::remove_dir_all(inst.dir()).unwrap();
+            return;
+        }
+        let file = VersionFile { url: "https://cdn.modrinth.com/a-2.jar".into(), filename: "a-2.jar".into(), primary: true, size: 2, hashes: Hashes { sha1: "0".repeat(40) } };
+        let up = Update { path: mods.join("a-1.jar"), enabled: true, title: "A".into(), from: "1".into(), to: Version { files: vec![file], ..v("a-2", "a", &[]) } };
+        let e = update(&inst, vec![up], 5, &Task::new("t")).await.unwrap_err();
+        assert!(format!("{e:#}").contains("couldn't back up W"), "{e:#}");
+        let left: Vec<String> = std::fs::read_dir(&mods).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, ["a-1.jar"], "nothing changed");
+        assert!(crate::backups::instance_snapshots(&inst.id).is_empty(), "the mods snapshot comes after the worlds'");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+        crate::backups::forget_instance(&inst.id);
     }
 
     /// Hits the network; run with `cargo test -- --ignored`.

@@ -217,10 +217,10 @@ pub fn after_play(world: &Path, owner: Owner, inst_name: &str, keep: u32) -> Vec
 
 /// Snapshot every world in `inst`'s saves that no snapshot covers since it was last
 /// changed, so a rollback has a version from before now to go back to. Skips worlds
-/// open in a game. Returns warnings.
-pub fn cover_worlds(inst: &Instance, reason: &str) -> Vec<String> {
+/// open in a game; fails if any other world couldn't be backed up.
+pub fn cover_worlds(inst: &Instance, reason: &str) -> anyhow::Result<()> {
     let owner = Owner::of(inst);
-    let mut notes = Vec::new();
+    let mut failed = Vec::new();
     for w in crate::saves::list_worlds(&inst.saves_dir()) {
         let modified = std::fs::metadata(w.dir.join("level.dat")).and_then(|m| m.modified()).ok().map(DateTime::<Utc>::from);
         let covered = snapshots(owner, &w.folder).iter().any(|s| modified.is_some_and(|m| s.info.taken >= m));
@@ -228,10 +228,13 @@ pub fn cover_worlds(inst: &Instance, reason: &str) -> Vec<String> {
             continue;
         }
         if let Err(e) = snapshot_world(&w.dir, owner, reason, false) {
-            notes.push(format!("couldn't back up {}: {e:#}", w.name));
+            failed.push(format!("{}: {e:#}", w.name));
         }
     }
-    notes
+    if !failed.is_empty() {
+        bail!("couldn't back up {}", failed.join("; "));
+    }
+    Ok(())
 }
 
 /// The finished snapshots of world folder `world`, newest first.
@@ -609,12 +612,12 @@ mod tests {
         let w = inst.saves_dir().join("W");
         std::fs::create_dir_all(&w).unwrap();
         std::fs::write(w.join("level.dat"), "L").unwrap();
-        assert!(cover_worlds(&inst, "before updating").is_empty());
-        assert!(cover_worlds(&inst, "before updating").is_empty());
+        cover_worlds(&inst, "before updating").unwrap();
+        cover_worlds(&inst, "before updating").unwrap();
         assert_eq!(snapshots(Owner::of(&inst), "W").len(), 1, "a snapshot since its last change covers it");
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(w.join("level.dat"), "played").unwrap();
-        cover_worlds(&inst, "before updating");
+        cover_worlds(&inst, "before updating").unwrap();
         assert_eq!(snapshots(Owner::of(&inst), "W").len(), 2);
         std::fs::remove_dir_all(inst.dir()).unwrap();
         forget_instance(&inst.id);

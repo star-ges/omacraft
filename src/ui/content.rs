@@ -621,19 +621,20 @@ pub struct WorldPrompt {
     name: String,
     what: String,
     snaps: Vec<crate::backups::Snapshot>,
-    selected: usize,
+    /// None when no backup is from before the rolled-back mods: nothing is picked for the player.
+    selected: Option<usize>,
 }
 
 /// The worlds `inst` (just rolled back to mods from `before`) last played with newer
 /// mods, each with its backups. The newest backup from before `before` is picked: the
-/// world as it was before those mods were installed.
+/// world as it was before those mods were installed. If there's none, none is picked.
 fn world_prompts(inst: &Instance, before: chrono::DateTime<chrono::Utc>) -> Vec<WorldPrompt> {
     let owner = crate::backups::Owner::of(inst);
     crate::world_sets::behind(inst)
         .into_iter()
         .map(|(w, d)| {
             let snaps = crate::backups::snapshots(owner, &w.folder);
-            let selected = snaps.iter().position(|s| s.info.taken <= before).unwrap_or(0);
+            let selected = snaps.iter().position(|s| s.info.taken <= before);
             WorldPrompt { inst_id: inst.id.clone(), name: w.name, what: d.describe(), snaps, selected }
         })
         .collect()
@@ -653,20 +654,24 @@ pub fn world_prompt_dialog(app: &mut App, p: &mut WorldPrompt, ui: &mut Ui) -> b
         ui.add_space(14.0);
         return w::button(ui, "ok").clicked() || kb == Some(Nav::Activate);
     }
-    if let Some(n) = kb.filter(|n| n.is_move()).and_then(|n| n.step(p.snaps.len(), Some(p.selected))) {
-        p.selected = n;
+    if p.selected.is_none() {
+        w::para(ui, RichText::new("None of its backups is from before those mods. A newer one may already have been played with them.").color(t.yellow));
+        ui.add_space(8.0);
+    }
+    if let Some(n) = kb.filter(|n| n.is_move()).and_then(|n| n.step(p.snaps.len(), p.selected)) {
+        p.selected = Some(n);
     }
     let mut restore = kb == Some(Nav::Activate);
     egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
         for (n, snap) in p.snaps.iter().enumerate() {
-            let on = n == p.selected;
+            let on = p.selected == Some(n);
             let r = w::rich_row(ui, &t, on, w::Lead::Glyph("\u{f006f}"), &snap.when(), &snap.info.reason, if snap.info.auto { "auto" } else { "" });
             if on {
                 w::focus_mark(ui, &t, r.rect);
             }
             if r.clicked() {
-                p.selected = n;
+                p.selected = Some(n);
             }
             if r.double_clicked() {
                 restore = true;
@@ -679,7 +684,7 @@ pub fn world_prompt_dialog(app: &mut App, p: &mut WorldPrompt, ui: &mut Ui) -> b
         restore |= w::primary_button(ui, &t, "restore").clicked();
         no = w::button(ui, "no").clicked();
     });
-    if restore && let Some(snap) = p.snaps.get(p.selected).cloned() {
+    if restore && let Some(snap) = p.selected.and_then(|n| p.snaps.get(n)).cloned() {
         super::worlds::start_restore(app, ui.ctx(), &p.inst_id.clone(), snap);
         return true;
     }
@@ -978,11 +983,12 @@ mod tests {
         }
         let world = saves.join("Played");
         crate::world_sets::write_records(&inst, &[world.clone(), saves.join("Untouched")]);
-        backups::snapshot_world(&world, Owner::of(&inst), "before the update", false).unwrap();
 
-        // Update create, back up its mods first, then play the world with the new one.
+        // Update create, backing up as `update` does (the world has no backup yet), then
+        // play the world with the new one.
         std::thread::sleep(Duration::from_millis(10));
-        let mods = backups::snapshot_instance(&inst, "before updating create", 5).unwrap();
+        modrinth::back_up_for_update(&inst, "before the update", 5).unwrap();
+        let mods = backups::instance_snapshots(&inst.id)[0].dir.clone();
         jar(&inst, "create", "6.1.0");
         crate::world_sets::write_records(&inst, std::slice::from_ref(&world));
         std::thread::sleep(Duration::from_millis(10));
@@ -997,7 +1003,10 @@ mod tests {
         assert!(p.what.contains("create 6.1.0"), "{}", p.what);
         // The world as it was before the update is picked, not the newer one.
         assert_eq!(p.snaps.len(), 2);
-        assert_eq!(p.snaps[p.selected].info.reason, "before the update");
+        assert_eq!(p.snaps[p.selected.unwrap()].info.reason, "before the update");
+        // With no backup from before the cutoff, none is picked (not the newest).
+        let early = p.snaps[1].info.taken - chrono::Duration::seconds(1);
+        assert_eq!(world_prompts(&inst, early)[0].selected, None);
         std::fs::remove_dir_all(inst.dir()).unwrap();
         backups::forget_instance(&inst.id);
     }
