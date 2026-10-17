@@ -72,6 +72,8 @@ pub enum ConfirmAction {
     DeletePath(std::path::PathBuf),
     /// Back to the default skin, for this account UUID.
     ResetSkin(String),
+    /// A share set no instance uses, with its files.
+    DeleteShareSet(String),
 }
 
 enum Phase {
@@ -155,6 +157,10 @@ pub struct App {
     exports: Vec<(Task, Promise<crate::export::Exported>, String)>,
     /// Settings → reclaim disk space, while it runs.
     pub reclaim: Option<(Task, Promise<crate::store::Reclaimed>)>,
+    /// Shared folders being linked or unlinked: (task, (notes, errors)).
+    pub sharing: Option<(Task, Promise<(Vec<String>, Vec<String>)>)>,
+    /// Share sets with a folder on disk, re-read when sharing changes.
+    pub share_sets: Vec<String>,
     /// "new group" text in the instance context menu.
     pub group_buf: String,
     pub toasts: Vec<Toast>,
@@ -208,6 +214,8 @@ impl App {
             imports: Vec::new(),
             exports: Vec::new(),
             reclaim: None,
+            sharing: None,
+            share_sets: crate::shares::sets_on_disk(),
             group_buf: String::new(),
             toasts: Vec::new(),
         };
@@ -449,6 +457,28 @@ impl App {
             }
         }
 
+        if let Some((task, p)) = self.sharing.take_if(|(_, p)| p.ready()) {
+            let r = p.take().unwrap();
+            task.finish(&r.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
+            match r {
+                Ok((notes, errors)) => {
+                    for e in &errors {
+                        self.toast(ToastKind::Error, format!("Shared folders: {e}"));
+                    }
+                    match notes.as_slice() {
+                        [] if errors.is_empty() => self.toast(ToastKind::Info, "Shared folders updated"),
+                        [] => {}
+                        [n] => self.toast(ToastKind::Info, n.clone()),
+                        [n, rest @ ..] => self.toast(ToastKind::Info, format!("{n} (and {} more)", rest.len())),
+                    }
+                }
+                Err(e) => self.toast(ToastKind::Error, format!("Shared folders: {e:#}")),
+            }
+            self.share_sets = crate::shares::sets_on_disk();
+            self.shots.invalidate();
+            self.content.invalidate();
+        }
+
         let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.worlds.dups).into_iter().partition(|(_, p, _)| p.ready());
         self.worlds.dups = running;
         for (task, p, id) in done {
@@ -481,6 +511,38 @@ impl App {
             let p = Promise::spawn(&self.rt, ctx, crate::store::reclaim(task.clone()));
             self.reclaim = Some((task, p));
         }
+    }
+
+    /// Bring these instances' shared folders in line with their settings. Running
+    /// instances are left for their next launch, which does the same.
+    pub fn start_sharing(&mut self, ctx: &egui::Context, insts: Vec<Instance>) {
+        if self.sharing.is_some() {
+            self.toast(ToastKind::Error, "Shared folders are still moving; try again in a moment");
+            return;
+        }
+        let insts: Vec<Instance> = insts.into_iter().filter(|i| !self.is_running(&i.id)).collect();
+        let task = Task::new("shared folders");
+        task.stage("Updating shared folders", insts.len() as u64);
+        let (t, shots) = (task.clone(), self.cfg.share_screenshots);
+        let p = Promise::spawn(&self.rt, ctx, async move {
+            Ok(tokio::task::spawn_blocking(move || {
+                let (mut notes, mut errors) = (Vec::new(), Vec::new());
+                for i in &insts {
+                    match crate::shares::apply(i, shots) {
+                        Ok(n) => notes.extend(n),
+                        Err(e) => errors.push(format!("{}: {e:#}", i.name)),
+                    }
+                    t.inc(1);
+                }
+                let left = if shots { 0 } else { crate::shares::untraced_screenshots() };
+                if left > 0 {
+                    notes.insert(0, format!("{left} shared screenshot{} couldn't be traced to an instance; they stay in {}", if left == 1 { "" } else { "s" }, crate::shares::dir().join(crate::shares::SCREENSHOTS).display()));
+                }
+                (notes, errors)
+            })
+            .await?)
+        });
+        self.sharing = Some((task, p));
     }
 
     pub fn start_import(&mut self, ctx: &egui::Context, req: crate::import::Request) {
@@ -834,6 +896,9 @@ impl App {
                     self.toast(ToastKind::Error, format!("Delete failed: {e}"));
                     return;
                 }
+                if let Err(e) = crate::shares::delete_screenshots_of(id) {
+                    self.toast(ToastKind::Error, format!("Couldn't delete its shared screenshots: {e:#}"));
+                }
                 self.toast(ToastKind::Info, format!("Deleted {name}"));
                 self.instances.retain(|i| &i.id != id);
                 self.sessions.remove(id);
@@ -849,6 +914,15 @@ impl App {
                 self.content.invalidate();
             }
             ConfirmAction::ResetSkin(uuid) => accounts::skin_change(self, ctx, uuid, crate::skins::Change::Reset),
+            ConfirmAction::DeleteShareSet(name) => {
+                // Checked again: an instance may have joined since the dialog opened.
+                if self.sharing.is_some() || self.instances.iter().any(|i| &i.share_set == name) {
+                    self.toast(ToastKind::Error, format!("{name} is in use"));
+                } else if let Err(e) = crate::shares::delete_set(name) {
+                    self.toast(ToastKind::Error, format!("{e:#}"));
+                }
+                self.share_sets = crate::shares::sets_on_disk();
+            }
         }
     }
 

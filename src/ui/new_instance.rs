@@ -101,11 +101,11 @@ fn name_and_group(app: &App, s: &mut NewInstance, ui: &mut Ui, name_hint: &str) 
     }
     ui.add_space(6.0);
     w::section(ui, t, "group");
-    group_field(ui, t, &mut s.group, &app.groups.names(), ui.available_width());
+    group_field(ui, t, &mut s.group, &app.groups.names(), "no group", ui.available_width());
 }
 
-/// Text field with a dropdown of existing groups.
-pub fn group_field(ui: &mut Ui, t: &crate::theme::Theme, value: &mut String, groups: &[String], width: f32) {
+/// Text field with a dropdown of existing groups (or share sets); `none` clears it.
+pub fn group_field(ui: &mut Ui, t: &crate::theme::Theme, value: &mut String, groups: &[String], none: &str, width: f32) {
     ui.horizontal(|ui| {
         let has = !groups.is_empty();
         w::text_input(ui, value, "none", width - if has { 40.0 } else { 0.0 }, false);
@@ -118,7 +118,7 @@ pub fn group_field(ui: &mut Ui, t: &crate::theme::Theme, value: &mut String, gro
                     }
                 }
                 ui.separator();
-                if ui.button(RichText::new("no group").color(t.muted)).clicked() {
+                if ui.button(RichText::new(none).color(t.muted)).clicked() {
                     value.clear();
                     ui.close();
                 }

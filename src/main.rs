@@ -17,6 +17,7 @@ mod mojang;
 mod net;
 mod paths;
 mod saves;
+mod shares;
 mod skins;
 mod store;
 mod task;

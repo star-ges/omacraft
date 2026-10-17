@@ -385,6 +385,9 @@ fn detail(app: &mut App, ui: &mut Ui, inst: &Instance) {
                     push(&mut sub, "  ·  ".into(), t.fg);
                     push(&mut sub, format!("󰉋 {}", inst.group), tint.unwrap_or(t.fg));
                 }
+                if !inst.share_set.is_empty() {
+                    push(&mut sub, format!("  ·  \u{f0c1} {}", inst.share_set), t.fg);
+                }
                 ui.add(egui::Label::new(sub).truncate());
                 let size = disk.map(w::size_label).unwrap_or_else(|| "measuring…".into());
                 let stats = format!("played {}  ·  last played {}  ·  {size}", instance::format_duration(inst.played_secs), w::ago(inst.last_played));
@@ -453,6 +456,11 @@ pub struct EditState {
     pub id: String,
     name: String,
     group: String,
+    share_set: String,
+    /// The share set when the dialog opened, and what leaving it would copy.
+    old_share: String,
+    leave_size: Option<crate::task::Promise<u64>>,
+    leave_bytes: Option<u64>,
     memory_mb: u32,
     custom_memory: bool,
     jvm_args: String,
@@ -467,6 +475,10 @@ impl EditState {
             id: i.id.clone(),
             name: i.name.clone(),
             group: i.group.clone(),
+            share_set: i.share_set.clone(),
+            old_share: i.share_set.clone(),
+            leave_size: None,
+            leave_bytes: None,
             memory_mb: i.memory_mb.unwrap_or(4096),
             custom_memory: i.memory_mb.is_some(),
             jvm_args: i.jvm_args.clone(),
@@ -492,13 +504,22 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
 
     let field_w = 340.0;
     let groups = app.groups.names();
+    let mut sets = app.share_sets.clone();
+    sets.extend(app.instances.iter().map(|i| i.share_set.clone()).filter(|s| !s.is_empty() && !app.share_sets.contains(s)));
+    sets.sort_by_key(|s| s.to_lowercase());
+    sets.dedup();
     egui::Grid::new("edit-grid").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
         ui.label(RichText::new("name").color(t.muted));
         w::text_input(ui, &mut s.name, "", field_w, false);
         ui.end_row();
 
         ui.label(RichText::new("group").color(t.muted));
-        new_instance::group_field(ui, &t, &mut s.group, &groups, field_w);
+        new_instance::group_field(ui, &t, &mut s.group, &groups, "no group", field_w);
+        ui.end_row();
+
+        ui.label(RichText::new("share set").color(t.muted))
+            .on_hover_text("instances in the same share set share resource packs, shader packs and schematics");
+        new_instance::group_field(ui, &t, &mut s.share_set, &sets, "not shared", field_w);
         ui.end_row();
 
         ui.label(RichText::new("memory").color(t.muted));
@@ -534,6 +555,8 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
         ui.end_row();
     });
 
+    share_warning(app, s, ui);
+
     ui.add_space(18.0);
     let mut out = EditOutcome::Keep;
     ui.horizontal(|ui| {
@@ -546,8 +569,14 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
                 out = EditOutcome::Delete;
             }
         });
+        let share_set = s.share_set.trim().to_string();
+        let share_changed = app.instances.iter().any(|i| i.id == s.id && i.share_set != share_set);
         if save && let Err(e) = crate::launch::split_args(&s.jvm_args) {
             app.toast(ToastKind::Error, format!("JVM arguments: {e}"));
+        } else if save && share_changed && let Some(e) = (!share_set.is_empty()).then(|| crate::shares::check_set_name(&share_set).err()).flatten() {
+            app.toast(ToastKind::Error, format!("{e}"));
+        } else if save && share_changed && let Some(why) = app.instance_busy(&s.id) {
+            app.toast(ToastKind::Error, format!("Can't change the share set while {why}"));
         } else if save {
             if let Some(i) = app.instances.iter_mut().find(|i| i.id == s.id) {
                 if !s.name.trim().is_empty() {
@@ -558,14 +587,50 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
                 i.window = s.custom_window.then_some(s.window);
                 i.jvm_args = s.jvm_args.trim().to_string();
                 i.java_path = s.java_path.trim().to_string();
+                i.share_set = share_set;
                 if let Err(e) = i.save() {
                     app.toast(ToastKind::Error, format!("Save failed: {e}"));
+                } else if share_changed {
+                    let i = i.clone();
+                    app.start_sharing(ui.ctx(), vec![i]);
                 }
             }
             out = EditOutcome::Close;
         }
     });
     out
+}
+
+/// What changing the share set will do to the files, before saving.
+fn share_warning(app: &App, s: &mut EditState, ui: &mut Ui) {
+    let t = &app.t;
+    let new = s.share_set.trim();
+    if new == s.old_share {
+        return;
+    }
+    let old = s.old_share.clone();
+    let (text, color) = if new.is_empty() {
+        if s.leave_size.is_none() && s.leave_bytes.is_none() {
+            let dir = crate::shares::set_dir(&old);
+            s.leave_size = Some(crate::task::Promise::spawn(&app.rt, ui.ctx(), async move {
+                Ok(tokio::task::spawn_blocking(move || crate::shares::SET_FOLDERS.iter().map(|f| crate::fsutil::tree_size(&dir.join(f))).sum()).await?)
+            }));
+        }
+        if let Some(Ok(n)) = s.leave_size.as_ref().and_then(|p| p.take()) {
+            s.leave_bytes = Some(n);
+        }
+        let size = s.leave_bytes.map(w::size_label).unwrap_or_else(|| "measuring…".into());
+        (
+            format!("\u{f071} Leaving “{old}” gives this instance its own copy of the set's resource packs, shader packs and schematics ({size}). Free on btrfs or xfs; on other filesystems it takes that much space again."),
+            t.yellow,
+        )
+    } else if old.is_empty() {
+        (format!("This instance's resource packs, shader packs and schematics move into “{new}”, shared with its other instances. Name clashes keep both."), t.muted)
+    } else {
+        (format!("The packs and schematics stay with “{old}”; this instance uses “{new}”'s instead."), t.muted)
+    };
+    ui.add_space(10.0);
+    w::para(ui, RichText::new(text).color(color));
 }
 
 impl App {
@@ -580,6 +645,8 @@ impl App {
             Some("it's exporting")
         } else if self.worlds.busy_with(id) {
             Some("a world is duplicating")
+        } else if self.sharing.is_some() {
+            Some("shared folders are moving")
         } else {
             None
         }

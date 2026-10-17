@@ -3,7 +3,7 @@ use egui::{CornerRadius, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
 use super::widgets as w;
 use super::{App, ToastKind};
 use crate::keymap::{self, Action};
-use crate::paths;
+use crate::{paths, shares};
 
 pub fn show(app: &mut App, ui: &mut Ui) {
     let t = app.t.clone();
@@ -76,6 +76,9 @@ pub fn show(app: &mut App, ui: &mut Ui) {
             });
 
             ui.add_space(10.0);
+            shared(app, ui);
+
+            ui.add_space(10.0);
             keys(app, ui);
 
             ui.add_space(10.0);
@@ -106,6 +109,62 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 app.toast(ToastKind::Error, format!("Couldn't save settings: {e}"));
             }
         });
+    });
+}
+
+/// Shared screenshots, and the share sets with their members.
+fn shared(app: &mut App, ui: &mut Ui) {
+    let t = app.t.clone();
+    let indent = egui::Margin { left: (t.body_size() * 9.0 + 8.0) as i8, ..Default::default() };
+    w::section(ui, &t, "shared folders");
+    let busy = app.sharing.is_some();
+    let mut on = app.cfg.share_screenshots;
+    let r = ui.add_enabled(!busy, egui::Checkbox::new(&mut on, "share screenshots between all instances"));
+    let r = r.on_hover_text("Omacraft remembers which instance took each one; turning this off moves them back");
+    if r.changed() {
+        app.cfg.share_screenshots = on;
+        if let Err(e) = app.cfg.save() {
+            app.toast(ToastKind::Error, format!("Couldn't save settings: {e}"));
+        }
+        let all = app.instances.clone();
+        app.start_sharing(ui.ctx(), all);
+    }
+    let mut sets = app.share_sets.clone();
+    sets.extend(app.instances.iter().map(|i| i.share_set.clone()).filter(|s| !s.is_empty()));
+    sets.sort_by_key(|s| s.to_lowercase());
+    sets.dedup();
+    ui.add_space(4.0);
+    for set in &sets {
+        let members: Vec<&str> = app.instances.iter().filter(|i| &i.share_set == set).map(|i| i.name.as_str()).collect();
+        ui.horizontal(|ui| {
+            w::field_label(ui, &t, set);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if members.is_empty() && ui.add_enabled(!busy, egui::Button::new(RichText::new("delete…").color(t.red))).clicked() {
+                    app.modal = Some(super::Modal::Confirm(super::Confirm {
+                        title: "delete share set".into(),
+                        body: format!("No instance uses “{set}”. Permanently delete it and the packs and schematics in it?"),
+                        button: "delete".into(),
+                        action: super::ConfirmAction::DeleteShareSet(set.clone()),
+                    }));
+                }
+                if w::button(ui, "folder").clicked() {
+                    super::open_path(&shares::set_dir(set));
+                }
+                let who = if members.is_empty() { "no instances".to_string() } else { members.join(", ") };
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(who).color(if members.is_empty() { t.muted } else { t.fg })).truncate());
+                });
+            });
+        });
+    }
+    egui::Frame::new().inner_margin(indent).show(ui, |ui| {
+        w::para(
+            ui,
+            RichText::new(
+                "Instances in the same share set (edit an instance to pick one) use one folder of resource packs, shader packs and schematics. Joining moves the instance's files in, keeping both on a name clash; leaving gives it its own copy.",
+            )
+            .color(t.muted),
+        );
     });
 }
 

@@ -41,6 +41,7 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim 
 | `export.rs` | Instance zip (MultiMC format) or `.mrpack` (Modrinth-hosted files via `content_meta::hosted`, rest in `overrides/`) |
 | `saves.rs` | `level.dat` and `servers.dat` via fastnbt `Value` (round-trips unknown fields) |
 | `keymap.rs` | Every action, default chords, scopes, parse/label, conflict detection |
+| `shares.rs` | Shared folders: global `shared/screenshots` (config `share_screenshots`) and share sets (`shared/sets/<name>/{resourcepacks,shaderpacks,schematics}`, `share_set` in instance.toml); `apply` turns an instance's folders into relative links or back into copies |
 | `store.rs` | Content store: Modrinth installs and `.mrpack` files go through `cache/content/<sha1>` and are reflinked into instances; `reclaim` merges duplicates (`FIDEDUPERANGE`) and prunes the store |
 | `icons.rs`, `fsutil.rs`, `net.rs`, `task.rs` | Instance icons, reflink copy, HTTP + downloads, background `Task`/`Promise` |
 | `ui/mod.rs` | `App`, top/status bars, modals, key routing, launching, imports |
@@ -112,6 +113,16 @@ test (and a rule here) with any fix that sets a new one.
   moved in on filesystems without reflinks), so every instance file is independent. `reclaim` merges only
   through the kernel's dedupe ioctl, which compares the bytes first, and deletes only store entries no instance
   file matches. Tests: `store::tests` (run with `TMPDIR` on btrfs to cover the reflink path, since `/tmp` is tmpfs).
+- **Shared folders:** sharing turns the instance's folder into a relative link into `shared/`, moving its files in
+  (identical files kept once, other clashes renamed `name (<instance id>).ext`, folders merged except unzipped packs).
+  Unsharing a set folder replaces the link with a full copy; moving between sets only relinks. Screenshots record
+  their owner (`shared/screenshots.owners.toml`, from the game's "Saved screenshot as" log line, else by time when no
+  other game ran alongside), so unsharing *moves* each instance's own back (never copies the pool), export includes
+  only its own, and deleting an instance deletes its own. `shares::apply` is idempotent and
+  runs at every launch, so new, imported or running-at-the-time instances catch up. Deleting an instance removes
+  only its links. Export follows top-level share links only; reclaim counts each shared file once. Tests:
+  `shares::tests`, `export::tests::shared_folders_export_like_normal_ones` (exports are self-contained: real files,
+  mods included), `launch::tests::log_names_saved_screenshots`.
 - **Saving:** write config/state files with `fsutil::write_atomic` (unique temp + rename; accounts at 0600).
 
 ## Testing the GUI safely

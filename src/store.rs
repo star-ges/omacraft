@@ -114,12 +114,15 @@ pub fn human(bytes: u64) -> String {
     }
 }
 
-/// Every instance's content files (mods, resource packs, shader packs; enabled or not).
+/// Every instance's content files (mods, resource packs, shader packs; enabled or not),
+/// each once: instances in a share set reach the same packs through their links.
 fn instance_files() -> Vec<PathBuf> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     for inst in instance::load_all() {
         for kind in KINDS {
-            out.extend(inst.content(kind).into_iter().filter(|f| !f.is_dir).map(|f| f.path));
+            let files = inst.content(kind).into_iter().filter(|f| !f.is_dir).map(|f| f.path);
+            out.extend(files.filter(|p| p.canonicalize().is_ok_and(|c| seen.insert(c))));
         }
     }
     out

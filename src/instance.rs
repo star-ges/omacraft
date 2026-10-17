@@ -16,6 +16,9 @@ pub struct Instance {
     pub loader: Loader,
     #[serde(default)]
     pub group: String,
+    /// Share set whose resource packs, shader packs and schematics this instance uses (see shares.rs).
+    #[serde(default)]
+    pub share_set: String,
     /// Built-in icon name, or `custom:<file>` under the icons dir.
     #[serde(default = "default_icon")]
     pub icon: String,
@@ -45,6 +48,7 @@ impl Instance {
             mc_version: mc_version.to_string(),
             loader,
             group: String::new(),
+            share_set: String::new(),
             icon: default_icon(),
             notes: String::new(),
             memory_mb: None,
