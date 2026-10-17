@@ -102,12 +102,21 @@ fn lock(shelf: &Path) -> anyhow::Result<fsutil::FileLock> {
     fsutil::lock(&lock_path(shelf)).with_context(|| format!("locking {}", shelf.display()))
 }
 
-/// Take `shelf`'s lock, or fail at once if a job holds it (for the UI thread).
+/// Take `shelf`'s lock, or fail soon if a job holds it (for the UI thread). It tries
+/// for up to 200 ms: a process forked just as a job let go (a game being launched)
+/// holds the job's lock until it execs.
 fn try_lock(shelf: &Path) -> anyhow::Result<fsutil::FileLock> {
-    match fsutil::try_lock(&lock_path(shelf)).with_context(|| format!("locking {}", shelf.display()))? {
-        Some(l) => Ok(l),
-        None => bail!("a backup or restore of it is running; try again once it's done"),
+    lock_soon(shelf)?.context("a backup or restore of it is running; try again once it's done")
+}
+
+fn lock_soon(shelf: &Path) -> anyhow::Result<Option<fsutil::FileLock>> {
+    for _ in 0..20 {
+        if let Some(l) = fsutil::try_lock(&lock_path(shelf)).with_context(|| format!("locking {}", shelf.display()))? {
+            return Ok(Some(l));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
+    Ok(None)
 }
 
 /// Take a snapshot into `shelf` (a folder of snapshots), whose lock the caller holds:
@@ -319,7 +328,7 @@ fn recover_shelf(shelf: &Path) -> anyhow::Result<()> {
     if !shelf.is_dir() {
         return Ok(());
     }
-    match fsutil::try_lock(&lock_path(shelf))? {
+    match lock_soon(shelf)? {
         Some(_l) => recover_locked(shelf),
         None => Ok(()),
     }
