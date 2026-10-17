@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, bail};
@@ -95,12 +95,7 @@ pub fn sets_in_use() -> BTreeMap<String, Vec<String>> {
 
 /// The share set `link` points into, if it's a link to one.
 fn linked_set(link: &Path) -> Option<String> {
-    let t = std::fs::read_link(link).ok()?;
-    let rest = t.strip_prefix(format!("{UP}/shared/sets")).or_else(|_| t.strip_prefix(sets_dir())).ok()?;
-    match rest.components().next()? {
-        std::path::Component::Normal(n) => Some(n.to_string_lossy().into_owned()).filter(|n| check_set_name(n).is_ok()),
-        _ => None,
-    }
+    link_set(link.file_name()?.to_str()?, &std::fs::read_link(link).ok()?)
 }
 
 /// Where `folder` in the game dir should link to, relative to the game dir.
@@ -108,14 +103,34 @@ fn target(inst: &Instance, folder: &str) -> Option<PathBuf> {
     (!inst.share_set.is_empty()).then(|| PathBuf::from(format!("{UP}/shared/sets/{}/{folder}", inst.share_set)))
 }
 
-/// A link Omacraft made: relative into `shared/`, or (made elsewhere) absolute into it.
-fn is_ours(target: &Path) -> bool {
-    target.starts_with(format!("{UP}/shared")) || (target.is_absolute() && target.starts_with(dir()))
+/// The share set a link from the game dir's `folder` names, if its target has
+/// exactly the shape Omacraft makes: `../../../shared/sets/<set>/<folder>`, or (made
+/// elsewhere) the absolute path to it. Nothing else, so no `..` or other folder.
+/// Only looks at the text; [`lands_in_set`] checks where it really leads.
+fn link_set(folder: &str, target: &Path) -> Option<String> {
+    let rest = target.strip_prefix(format!("{UP}/shared/sets")).or_else(|_| target.strip_prefix(sets_dir())).ok()?;
+    let mut parts = rest.components();
+    let (Some(Component::Normal(set)), Some(Component::Normal(f)), None) = (parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    let set = set.to_str()?;
+    (f == folder && SET_FOLDERS.contains(&folder) && check_set_name(set).is_ok()).then(|| set.to_string())
 }
 
-/// Whether `path` is a link to a shared folder (export follows these).
+/// Whether `path` really leads to `shared/sets/<set>/<folder>`, following every link
+/// on the way (a set folder swapped for a link elsewhere doesn't count).
+fn lands_in_set(path: &Path, set: &str, folder: &str) -> bool {
+    match (path.canonicalize(), sets_dir().canonicalize()) {
+        (Ok(real), Ok(sets)) => real == sets.join(set).join(folder),
+        _ => false,
+    }
+}
+
+/// Whether `path` is a link to a share set's folder that really leads there
+/// (export follows these, so nothing else may pass).
 pub fn is_share_link(path: &Path) -> bool {
-    std::fs::read_link(path).is_ok_and(|t| is_ours(&t))
+    let Some(folder) = path.file_name().and_then(|f| f.to_str()) else { return false };
+    std::fs::read_link(path).ok().and_then(|t| link_set(folder, &t)).is_some_and(|set| lands_in_set(path, &set, folder))
 }
 
 /// Make the instance's folders match its settings: linked to the shared folders
@@ -136,15 +151,18 @@ pub fn apply(inst: &Instance) -> anyhow::Result<Vec<String>> {
         match (want, current) {
             (Some(w), Some(c)) if w == c => std::fs::create_dir_all(game.join(&w))?,
             // Moved to another share set: the files stay with the old one.
-            (Some(w), Some(c)) if is_ours(&c) => {
+            (Some(w), Some(c)) if link_set(folder, &c).is_some() => {
                 std::fs::create_dir_all(game.join(&w))?;
                 link_to(&link, &w)?;
             }
-            (None, Some(c)) if is_ours(&c) => unshare(&link, &mut notes).with_context(|| format!("unsharing {folder}"))?,
+            (None, Some(c)) if let Some(set) = link_set(folder, &c) => unshare(&link, &set, &mut notes).with_context(|| format!("unsharing {folder}"))?,
             (Some(_), Some(_)) => notes.push(format!("{}: left {folder} alone, it's a link Omacraft didn't make", inst.name)),
             (Some(w), None) => {
                 let shared = game.join(&w);
                 std::fs::create_dir_all(&shared)?;
+                if !lands_in_set(&shared, &inst.share_set, folder) {
+                    bail!("{} leads outside the shared folders; left {folder} alone", shared.display());
+                }
                 match std::fs::symlink_metadata(&link) {
                     Ok(m) if m.is_dir() => {
                         // Pack folders (unzipped packs) clash as a whole; other folders merge.
@@ -174,11 +192,12 @@ fn link_to(link: &Path, target: &Path) -> std::io::Result<()> {
     })
 }
 
-/// Replace a shared-folder link with a full copy of what it points to.
-fn unshare(link: &Path, notes: &mut Vec<String>) -> anyhow::Result<()> {
+/// Replace a link to share set `set` with a full copy of what it points to.
+fn unshare(link: &Path, set: &str, notes: &mut Vec<String>) -> anyhow::Result<()> {
     let name = link.file_name().unwrap_or_default().to_string_lossy();
     let tmp = link.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
     let copied = match link.canonicalize() {
+        Ok(_) if !lands_in_set(link, set, &name) => bail!("it leads outside the shared folders; left it alone"),
         Ok(src) => fsutil::copy_tree(&src, &tmp, &|_| {}),
         // The shared folder is gone; start empty.
         Err(_) => std::fs::create_dir(&tmp).map(|_| Vec::new()),
@@ -378,6 +397,53 @@ mod tests {
         assert!(!sets_in_use().contains_key(&set));
         delete_set(&set).unwrap();
         std::fs::remove_dir_all(a.dir()).unwrap();
+    }
+
+    #[test]
+    fn only_links_that_really_lead_into_a_set_count() {
+        let set = set_name();
+        let a = instance("a", &set, &[("resourcepacks/p.zip", "p")]);
+        apply(&a).unwrap();
+        let game = a.game_dir();
+        assert!(is_share_link(&game.join("resourcepacks")));
+        // Somewhere outside shared/, reachable from the game dir.
+        let outside = format!("outside-{}", uuid::Uuid::new_v4().simple());
+        let out_dir = paths::data_dir().join(&outside);
+        std::fs::create_dir_all(out_dir.join("resourcepacks")).unwrap();
+        std::fs::write(out_dir.join("resourcepacks/secret.txt"), "s").unwrap();
+        let fake = |name: &str, target: String| {
+            std::os::unix::fs::symlink(target, game.join(name)).unwrap();
+            game.join(name)
+        };
+        // Starts like a share link but climbs back out.
+        assert!(!is_share_link(&fake("loot", format!("{UP}/shared/../{outside}"))));
+        assert!(!is_share_link(&fake("schematics2", format!("{UP}/shared/sets/{set}/../../../{outside}/resourcepacks"))));
+        // A set's folder under another folder's name.
+        std::fs::remove_dir_all(game.join("shaderpacks")).unwrap();
+        assert!(!is_share_link(&fake("shaderpacks", format!("{UP}/shared/sets/{set}/resourcepacks"))));
+        std::fs::remove_file(game.join("shaderpacks")).unwrap();
+
+        // A set folder swapped for a link elsewhere: the right shape, the wrong place.
+        let bad = set_name();
+        std::fs::create_dir_all(sets_dir()).unwrap();
+        std::os::unix::fs::symlink(&out_dir, set_dir(&bad)).unwrap();
+        let mut b = instance("b", &bad, &[("resourcepacks/mine.zip", "m")]);
+        assert!(apply(&b).is_err(), "moved files into a folder outside shared/");
+        assert!(b.game_dir().join("resourcepacks/mine.zip").is_file());
+        std::fs::remove_dir_all(b.game_dir().join("resourcepacks")).unwrap();
+        std::os::unix::fs::symlink(format!("{UP}/shared/sets/{bad}/resourcepacks"), b.game_dir().join("resourcepacks")).unwrap();
+        assert!(!is_share_link(&b.game_dir().join("resourcepacks")));
+        // Leaving it doesn't copy the outside folder in either.
+        b.share_set.clear();
+        assert!(apply(&b).is_err());
+        assert!(std::fs::symlink_metadata(b.game_dir().join("resourcepacks")).unwrap().is_symlink());
+
+        std::fs::remove_file(set_dir(&bad)).unwrap();
+        std::fs::remove_dir_all(out_dir).unwrap();
+        for i in [&a, &b] {
+            std::fs::remove_dir_all(i.dir()).unwrap();
+        }
+        delete_set(&set).unwrap();
     }
 
     #[test]

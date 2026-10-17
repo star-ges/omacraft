@@ -593,10 +593,17 @@ mod tests {
         for f in ["resourcepacks", "schematics"] {
             assert!(crate::shares::is_share_link(&src.game_dir().join(f)), "{f}");
         }
+        // A link that only looks like a share link stays out, even when asked for (G4).
+        let outside = format!("outside-{tag}");
+        std::fs::create_dir_all(crate::paths::data_dir().join(&outside)).unwrap();
+        std::fs::write(crate::paths::data_dir().join(&outside).join("private.txt"), b"p").unwrap();
+        std::os::unix::fs::symlink(format!("../../../shared/../{outside}"), src.game_dir().join("loot")).unwrap();
+        assert!(!default_include(&src).contains(&"loot".to_string()));
 
         // The export holds real files: mods and config as always, and the set's packs.
         let dest = d.join("out.zip");
-        let include = default_include(&src);
+        let mut include = default_include(&src);
+        include.push("loot".into());
         let req = Request { inst: src.clone(), format: Format::Zip, dest, include, version: String::new() };
         let out = export(Task::new("export"), req).await.unwrap();
         let req = crate::import::Request { source: out.path.display().to_string(), name: None, group: String::new() };
@@ -612,6 +619,7 @@ mod tests {
             std::fs::remove_dir_all(i.dir()).unwrap();
         }
         crate::shares::delete_set(&set).unwrap();
+        std::fs::remove_dir_all(crate::paths::data_dir().join(&outside)).unwrap();
         std::fs::remove_dir_all(d).unwrap();
     }
 }
