@@ -125,15 +125,8 @@ fn shared(app: &mut App, ui: &mut Ui) {
     sets.dedup();
     for set in &sets {
         // Instances that left on paper but still link in (a leave that failed) count too.
-        let linked = app.share_links.get(set);
-        let members: Vec<String> = app
-            .instances
-            .iter()
-            .filter_map(|i| match (&i.share_set == set, linked.is_some_and(|l| l.contains(&i.id))) {
-                (true, _) => Some(i.name.clone()),
-                (false, true) => Some(format!("{} (leaving)", i.name)),
-                (false, false) => None,
-            })
+        let members: Vec<String> = super::instances::set_members(set, &app.instances, &app.share_links)
+            .map(|(i, leaving)| if leaving { format!("{} (leaving)", i.name) } else { i.name.clone() })
             .collect();
         ui.horizontal(|ui| {
             w::field_label(ui, &t, set);

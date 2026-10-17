@@ -498,12 +498,22 @@ impl App {
     }
 
     pub fn start_export_dialog(&mut self, ctx: &egui::Context, id: &str) {
+        if self.sharing.is_some() {
+            self.toast(ToastKind::Error, "Shared folders are moving; export again in a moment");
+            return;
+        }
         if let Some(inst) = self.instances.iter().find(|i| i.id == id).cloned() {
             self.modal = Some(Modal::Export(Box::new(export::ExportDialog::new(self, ctx, inst))));
         }
     }
 
     fn start_export(&mut self, ctx: &egui::Context, req: crate::export::Request) {
+        // Checked again: sharing may have started while the dialog was open. An export
+        // reading a folder mid-move would skip what had already left it.
+        if self.sharing.is_some() {
+            self.toast(ToastKind::Error, "Shared folders are moving; export again in a moment");
+            return;
+        }
         let task = Task::new("export");
         task.stage(format!("Exporting {}", req.inst.name), 0);
         let id = req.inst.id.clone();

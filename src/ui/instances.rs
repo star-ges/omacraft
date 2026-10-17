@@ -577,6 +577,8 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
             app.toast(ToastKind::Error, format!("{e}"));
         } else if save && share_changed && let Some(why) = app.instance_busy(&s.id) {
             app.toast(ToastKind::Error, format!("Can't change the share set while {why}"));
+        } else if save && share_changed && let Some(why) = [&s.old_share, &share_set].into_iter().find_map(|set| app.set_busy(set)) {
+            app.toast(ToastKind::Error, format!("Can't change the share set while {why}"));
         } else if save {
             if let Some(i) = app.instances.iter_mut().find(|i| i.id == s.id) {
                 if !s.name.trim().is_empty() {
@@ -599,6 +601,17 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
         }
     });
     out
+}
+
+/// The instances in share set `set`, and whether each is only still linked in (it
+/// left on paper, but the leave hasn't finished).
+pub fn set_members<'a>(set: &'a str, instances: &'a [Instance], links: &'a std::collections::BTreeMap<String, Vec<String>>) -> impl Iterator<Item = (&'a Instance, bool)> {
+    let linked = links.get(set);
+    instances.iter().filter_map(move |i| match (!set.is_empty() && i.share_set == set, !set.is_empty() && linked.is_some_and(|l| l.contains(&i.id))) {
+        (true, _) => Some((i, false)),
+        (false, true) => Some((i, true)),
+        (false, false) => None,
+    })
 }
 
 /// What changing the share set will do to the files, before saving.
@@ -652,6 +665,20 @@ impl App {
         }
     }
 
+    /// Why share set `set`'s folders can't change right now: another instance in it is
+    /// exporting them or installing into them.
+    pub fn set_busy(&self, set: &str) -> Option<String> {
+        set_members(set, &self.instances, &self.share_links).find_map(|(i, _)| {
+            if self.exports.iter().any(|(.., id)| *id == i.id) {
+                Some(format!("{} is exporting", i.name))
+            } else if self.content.busy_with(&i.id) {
+                Some(format!("{} is installing content", i.name))
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn confirm_delete_instance(&mut self, id: &str) {
         let name = self.instances.iter().find(|i| i.id == id).map(|i| i.name.clone()).unwrap_or_default();
         if let Some(why) = self.instance_busy(id) {
@@ -664,5 +691,29 @@ impl App {
             button: "delete".into(),
             action: ConfirmAction::DeleteInstance(id.to_string()),
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loaders::Loader;
+
+    #[test]
+    fn set_members_count_instances_still_linked_in() {
+        let inst = |id: &str, set: &str| {
+            let mut i = Instance::new(id, "1.21.1", Loader::Vanilla);
+            i.id = id.into();
+            i.share_set = set.into();
+            i
+        };
+        // b left "packs" on paper, but its leave hasn't finished: its folders still link in.
+        let all = [inst("a", "packs"), inst("b", ""), inst("c", "other"), inst("d", "")];
+        let links = [("packs".to_string(), vec!["a".to_string(), "b".to_string()])].into();
+        let got: Vec<(&str, bool)> = set_members("packs", &all, &links).map(|(i, leaving)| (i.id.as_str(), leaving)).collect();
+        assert_eq!(got, [("a", false), ("b", true)]);
+        // So an export or install in b holds up changes to the set, as one in a does.
+        assert_eq!(set_members("other", &all, &links).count(), 1);
+        assert_eq!(set_members("", &all, &links).count(), 0);
     }
 }

@@ -124,9 +124,12 @@ test (and a rule here) with any fix that sets a new one.
   `.<folder>.copied` once whole and swaps it in (`RENAME_EXCHANGE`, else remove + rename); `apply` first recovers
   any of those states, so a crash at any step is finished (or a half copy discarded) by the next launch. A set counts as
   in use while any instance's folder still links into it (`shares::sets_in_use`), not just by `share_set`, so a
-  leave that failed halfway keeps it from being deleted until the next `apply` finishes. Tests:
+  leave that failed halfway keeps it from being deleted until the next `apply` finishes. Moving shared folders and
+  reading or writing them exclude each other in the GUI: no export or pack install starts while `app.sharing` runs,
+  and a share set change waits for exports and installs in the instance or any member of the old or new set
+  (`App::set_busy`, members from `instances::set_members`). Tests:
   `shares::tests` (incl. `a_failed_leave_keeps_the_set_from_being_deleted`, `only_links_that_really_lead_into_a_set_count`,
-  `an_interrupted_leave_is_finished_by_the_next_apply`), `export::tests::shared_folders_export_like_normal_ones` (exports are self-contained: real files,
+  `an_interrupted_leave_is_finished_by_the_next_apply`), `ui::instances::tests::set_members_count_instances_still_linked_in`, `export::tests::shared_folders_export_like_normal_ones` (exports are self-contained: real files,
   mods included).
 - **Screenshots stay per instance:** never pool them on disk (a shared pool needed guessed ownership, which lost or
   misattributed files). The screenshots tab's "all instances" toggle (config `all_screenshots`) lists every

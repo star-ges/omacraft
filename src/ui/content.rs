@@ -312,9 +312,12 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
     }
     meta.ensure(&s.files(inst, kind), kind, &rt, &ctx);
     let mut out = Out::default();
+    // Installing into a folder that's being moved into or out of a share set could land
+    // the file in the old place or get it renamed on a clash.
+    let moving = app.sharing.is_some() && crate::shares::SET_FOLDERS.contains(&kind.dir());
     ui.columns(2, |cols| {
         installed(&mut cols[0], &t, s, &meta, inst, kind, main_nav, zone == Zone::Main, &mut out);
-        browse(&mut cols[1], &t, s, &meta, &remote, inst, kind, &rt, &ctx, focus, side_nav, zone == Zone::Side, &mut out);
+        browse(&mut cols[1], &t, s, &meta, &remote, inst, kind, &rt, &ctx, focus, side_nav, zone == Zone::Side, moving, &mut out);
     });
     if focus || out.to_results {
         app.focus = Zone::Side;
@@ -455,6 +458,7 @@ fn browse(
     focus: bool,
     kb: Option<Nav>,
     focused: bool,
+    moving: bool,
     out: &mut Out,
 ) {
     let r = w::text_input(ui, &mut s.query, &format!("/  search modrinth {}s", kind.noun()), ui.available_width(), focus);
@@ -535,16 +539,20 @@ fn browse(
                                     } else if have {
                                         ui.label(RichText::new("installed").color(t.green));
                                     } else if w::button(ui, "install").clicked() || (picked && install_key) {
-                                        let task = Task::new(format!("installing {}", h.title));
-                                        task.stage(format!("Installing {}", h.title), 0);
-                                        let (i, pid, tk) = (inst.clone(), h.project_id.clone(), task.clone());
-                                        let p = Promise::spawn(rt, ctx, async move {
-                                            let r = modrinth::install(kind, &pid, &i).await;
-                                            tk.finish(&r.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
-                                            r
-                                        });
-                                        let dir = inst.game_dir().join(kind.dir());
-                                        s.installing.insert(job.clone(), Job { task, promise: p, title: h.title.clone(), dir });
+                                        if moving {
+                                            out.error = Some("Shared folders are moving; install again in a moment".into());
+                                        } else {
+                                            let task = Task::new(format!("installing {}", h.title));
+                                            task.stage(format!("Installing {}", h.title), 0);
+                                            let (i, pid, tk) = (inst.clone(), h.project_id.clone(), task.clone());
+                                            let p = Promise::spawn(rt, ctx, async move {
+                                                let r = modrinth::install(kind, &pid, &i).await;
+                                                tk.finish(&r.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
+                                                r
+                                            });
+                                            let dir = inst.game_dir().join(kind.dir());
+                                            s.installing.insert(job.clone(), Job { task, promise: p, title: h.title.clone(), dir });
+                                        }
                                     }
                                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                         let title = RichText::new(&h.title).font(crate::theme::bold(t.body_size())).color(t.fg_light);
