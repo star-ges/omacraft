@@ -52,7 +52,7 @@ fn save_icon(key: &str, ext: &str, bytes: &[u8]) -> Option<PathBuf> {
     Some(path)
 }
 
-fn zip_bytes(zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<Vec<u8>> {
+pub(crate) fn zip_bytes<R: std::io::Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Option<Vec<u8>> {
     fsutil::read_capped(zip.by_name(name.trim_start_matches('/')).ok()?).ok()
 }
 
@@ -110,7 +110,7 @@ fn parse_mod(zip: &mut zip::ZipArchive<std::fs::File>, meta: &mut FileMeta) -> O
 }
 
 /// `Implementation-Version` from the jar's manifest.
-fn manifest_version(zip: &mut zip::ZipArchive<std::fs::File>) -> Option<String> {
+pub(crate) fn manifest_version<R: std::io::Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>) -> Option<String> {
     let text = String::from_utf8(zip_bytes(zip, "META-INF/MANIFEST.MF")?).ok()?;
     text.lines().find_map(|l| l.strip_prefix("Implementation-Version:")).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
@@ -121,15 +121,6 @@ fn read_mod(zip: &mut zip::ZipArchive<std::fs::File>, key: &str, meta: &mut File
     {
         meta.icon = save_icon(key, ext_of(&p), &bytes);
     }
-}
-
-/// A mod jar's own id and version (`sodium`, `0.6.0`), read from its metadata only:
-/// no hashing, icons or network. None if the jar names no id.
-pub fn mod_identity(path: &Path) -> Option<(String, Option<String>)> {
-    let mut zip = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
-    let mut meta = FileMeta::default();
-    parse_mod(&mut zip, &mut meta);
-    Some((meta.mod_id.filter(|id| !id.is_empty())?, meta.version))
 }
 
 /// Everything we can learn without the network. `key` identifies the file

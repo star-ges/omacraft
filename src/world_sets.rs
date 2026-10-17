@@ -66,15 +66,105 @@ pub fn game_label(i: &Instance) -> String {
     }
 }
 
-/// The instance's enabled mods: id → version.
+/// The instance's enabled mods: id → version, nested ones included (see [`mod_inventory`]).
 pub fn mods(inst: &Instance) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for m in inst.mods().into_iter().filter(|m| m.enabled) {
-        if let Some((id, version)) = content_meta::mod_identity(&m.path) {
-            out.entry(id).or_insert(version.unwrap_or_default());
+        for (id, version) in mod_inventory(&m.path) {
+            add_mod(&mut out, id, version);
         }
     }
     out
+}
+
+/// How deep [`mod_inventory`] follows jars inside jars (the file itself is depth 0).
+const NEST_DEPTH: usize = 4;
+/// The most nested jars one file may bring in, at any depth.
+const NEST_JARS: usize = 512;
+
+/// Every mod a jar declares, id → version ("" if it doesn't say): Fabric's or Quilt's
+/// one, each of Forge's and NeoForge's `[[mods]]`, each `mcmod.info` entry, and those of
+/// the jars nested inside (Fabric's and Quilt's `jars`, Forge's jarjar), up to
+/// [`NEST_DEPTH`] deep. Nested jars are read into memory through `fsutil::read_capped`.
+/// Separate from `content_meta`'s display metadata, which names one mod per file.
+pub fn mod_inventory(jar: &Path) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if let Ok(mut zip) = std::fs::File::open(jar).map_err(anyhow::Error::from).and_then(|f| Ok(zip::ZipArchive::new(f)?)) {
+        let mut budget = NEST_JARS;
+        inventory(&mut zip, 0, &mut budget, &mut out);
+    }
+    out
+}
+
+/// Note a mod, keeping the newer version if it's already there, as the loaders do.
+fn add_mod(out: &mut BTreeMap<String, String>, id: String, version: String) {
+    if id.is_empty() {
+        return;
+    }
+    match out.get(&id) {
+        Some(had) if compare_versions(&version, had) != Ordering::Greater => {}
+        _ => {
+            out.insert(id, version);
+        }
+    }
+}
+
+fn inventory<R: std::io::Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, depth: usize, budget: &mut usize, out: &mut BTreeMap<String, String>) {
+    use serde_json::Value;
+    let json = |zip: &mut zip::ZipArchive<R>, name| content_meta::zip_bytes(zip, name).and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+    // A nested jar is a string (Quilt) or an object's "file" (Fabric) or "path" (jarjar).
+    let paths = |v: &Value| -> Vec<String> {
+        v.as_array().into_iter().flatten().filter_map(|j| j.as_str().or(j["file"].as_str()).or(j["path"].as_str())).map(String::from).collect()
+    };
+    let mut nested = Vec::new();
+    if let Some(f) = json(zip, "fabric.mod.json") {
+        add_mod(out, text(&f["id"]), text(&f["version"]));
+        nested.extend(paths(&f["jars"]));
+    } else if let Some(q) = json(zip, "quilt.mod.json") {
+        let l = &q["quilt_loader"];
+        add_mod(out, text(&l["id"]), text(&l["version"]));
+        nested.extend(paths(&l["jars"]));
+    } else if let Some(t) = ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"]
+        .iter()
+        .find_map(|n| content_meta::zip_bytes(zip, n).and_then(|b| toml::from_str::<toml::Value>(&String::from_utf8_lossy(&b)).ok()))
+    {
+        // Versions like "${file.jarVersion}" are filled in from the manifest at build time.
+        let mut jar_version = None;
+        for m in t.get("mods").and_then(|m| m.as_array()).into_iter().flatten() {
+            let field = |k: &str| m.get(k).and_then(|v| v.as_str()).map(String::from);
+            let version = match field("version").filter(|v| !v.starts_with("${")) {
+                Some(v) => v,
+                None => jar_version.get_or_insert_with(|| content_meta::manifest_version(zip).unwrap_or_default()).clone(),
+            };
+            add_mod(out, field("modId").unwrap_or_default(), version);
+        }
+    } else if let Some(info) = json(zip, "mcmod.info") {
+        // Forge 1.6–1.12: a list of mods, or {"modList": [...]}.
+        let list = if info.is_array() { &info } else { &info["modList"] };
+        for m in list.as_array().into_iter().flatten() {
+            let version = m["version"].as_str().filter(|v| !v.contains("${")).unwrap_or_default();
+            add_mod(out, text(&m["modid"]), version.to_string());
+        }
+    }
+    if let Some(j) = json(zip, "META-INF/jarjar/metadata.json") {
+        nested.extend(paths(&j["jars"]));
+    }
+    if depth + 1 > NEST_DEPTH {
+        return;
+    }
+    nested.sort();
+    nested.dedup();
+    for path in nested {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let Some(bytes) = content_meta::zip_bytes(zip, &path) else { continue };
+        if let Ok(mut inner) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) {
+            inventory(&mut inner, depth + 1, budget, out);
+        }
+    }
 }
 
 pub fn read_record(world: &Path) -> Option<Record> {
@@ -372,6 +462,88 @@ mod tests {
         z.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default()).unwrap();
         write!(z, r#"{{"schemaVersion": 1, "id": "{id}", "version": "{version}", "name": "{id}"}}"#).unwrap();
         z.finish().unwrap();
+    }
+
+    /// A jar holding these entries, as bytes.
+    fn jar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes) in entries {
+            z.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+            z.write_all(bytes).unwrap();
+        }
+        z.finish().unwrap().into_inner()
+    }
+
+    fn fabric_json(id: &str, version: &str, nested: &[&str]) -> Vec<u8> {
+        let jars: Vec<String> = nested.iter().map(|f| format!(r#"{{"file": "{f}"}}"#)).collect();
+        format!(r#"{{"schemaVersion": 1, "id": "{id}", "version": "{version}", "jars": [{}]}}"#, jars.join(",")).into_bytes()
+    }
+
+    fn inventory_of(bytes: Vec<u8>) -> Vec<(String, String)> {
+        let path = crate::paths::test_root().join(format!("inv-{}.jar", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let out = mod_inventory(&path).into_iter().collect();
+        std::fs::remove_file(path).unwrap();
+        out
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    #[test]
+    fn the_inventory_lists_every_mod_a_jar_declares() {
+        // Forge/NeoForge: every [[mods]] entry, "${file.jarVersion}" from the manifest.
+        let toml = br#"
+            modLoader = "javafml"
+            [[mods]]
+            modId = "create"
+            version = "${file.jarVersion}"
+            [[mods]]
+            modId = "flywheel"
+            version = "1.0.1"
+        "#;
+        let manifest = b"Manifest-Version: 1.0\nImplementation-Version: 6.0.4\n";
+        assert_eq!(inventory_of(jar(&[("META-INF/mods.toml", toml), ("META-INF/MANIFEST.MF", manifest)])), pairs(&[("create", "6.0.4"), ("flywheel", "1.0.1")]));
+        // NeoForge with a jarjar'd mod, which has its own mods.toml.
+        let inner = jar(&[("META-INF/neoforge.mods.toml", b"[[mods]]\nmodId = \"ponder\"\nversion = \"1.0.2\"\n")]);
+        let meta = br#"{"jars": [{"identifier": {"group": "x", "artifact": "ponder"}, "path": "META-INF/jarjar/ponder.jar"}]}"#;
+        let outer = jar(&[("META-INF/neoforge.mods.toml", b"[[mods]]\nmodId = \"create\"\nversion = \"6.0.4\"\n"), ("META-INF/jarjar/metadata.json", meta), ("META-INF/jarjar/ponder.jar", &inner)]);
+        assert_eq!(inventory_of(outer), pairs(&[("create", "6.0.4"), ("ponder", "1.0.2")]));
+        // mcmod.info, both shapes, every entry.
+        let list = br#"[{"modid": "ic2", "version": "2.8"}, {"modid": "ic2-classic", "version": "${version}"}]"#;
+        assert_eq!(inventory_of(jar(&[("mcmod.info", list)])), pairs(&[("ic2", "2.8"), ("ic2-classic", "")]));
+        let wrapped = br#"{"modListVersion": 2, "modList": [{"modid": "a", "version": "1"}, {"modid": "b", "version": "2"}]}"#;
+        assert_eq!(inventory_of(jar(&[("mcmod.info", wrapped)])), pairs(&[("a", "1"), ("b", "2")]));
+        // Quilt, whose nested jars are plain strings.
+        let inner = jar(&[("quilt.mod.json", br#"{"quilt_loader": {"id": "qsl_base", "version": "7.0"}}"#)]);
+        let q = br#"{"quilt_loader": {"id": "qsl", "version": "7.0", "jars": ["META-INF/jars/base.jar"]}}"#;
+        assert_eq!(inventory_of(jar(&[("quilt.mod.json", q), ("META-INF/jars/base.jar", &inner)])), pairs(&[("qsl", "7.0"), ("qsl_base", "7.0")]));
+    }
+
+    #[test]
+    fn a_nested_mod_going_back_counts_as_drift() {
+        // The bundle keeps its own version; only the content mod inside it goes back.
+        let bundle = |inner_version: &str| {
+            let inner = jar(&[("fabric.mod.json", &fabric_json("content", inner_version, &[]))]);
+            jar(&[("fabric.mod.json", &fabric_json("bundle", "1.0", &["META-INF/jars/content.jar"])), ("META-INF/jars/content.jar", &inner)])
+        };
+        let was: BTreeMap<String, String> = inventory_of(bundle("2.0")).into_iter().collect();
+        let now: BTreeMap<String, String> = inventory_of(bundle("1.0")).into_iter().collect();
+        assert_eq!(was.get("content").map(String::as_str), Some("2.0"));
+        let mut r = rec("1.21.1", &[]);
+        r.mods = was;
+        assert_eq!(drift(&r, "1.21.1", &now).older, [("content".to_string(), "2.0".to_string(), "1.0".to_string())]);
+
+        // Nesting is followed NEST_DEPTH deep and no further.
+        let mut deepest = jar(&[("fabric.mod.json", &fabric_json(&format!("level{}", NEST_DEPTH + 1), "1", &[]))]);
+        for level in (0..=NEST_DEPTH).rev() {
+            deepest = jar(&[("fabric.mod.json", &fabric_json(&format!("level{level}"), "1", &["in.jar"])), ("in.jar", &deepest)]);
+        }
+        let ids: Vec<String> = inventory_of(deepest).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids.len(), NEST_DEPTH + 1, "{ids:?}");
+        assert!(!ids.contains(&format!("level{}", NEST_DEPTH + 1)));
     }
 
     fn world(saves: &Path, folder: &str) -> PathBuf {
