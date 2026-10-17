@@ -5,6 +5,7 @@ use super::{App, Confirm, ConfirmAction, Modal, ToastKind, content, logs, new_in
 use super::nav::{Nav, Zone};
 use crate::icons;
 use crate::instance::{self, ContentKind, Instance};
+use crate::shares::Kind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstTab {
@@ -388,6 +389,9 @@ fn detail(app: &mut App, ui: &mut Ui, inst: &Instance) {
                 if !inst.share_set.is_empty() {
                     push(&mut sub, format!("  ·  \u{f0c1} {}", inst.share_set), t.fg);
                 }
+                if !inst.world_set.is_empty() {
+                    push(&mut sub, format!("  ·  \u{f0ac} {}", inst.world_set), t.fg);
+                }
                 ui.add(egui::Label::new(sub).truncate());
                 let size = disk.map(w::size_label).unwrap_or_else(|| "measuring…".into());
                 let stats = format!("played {}  ·  last played {}  ·  {size}", instance::format_duration(inst.played_secs), w::ago(inst.last_played));
@@ -456,11 +460,8 @@ pub struct EditState {
     pub id: String,
     name: String,
     group: String,
-    share_set: String,
-    /// The share set when the dialog opened, and what leaving it would copy.
-    old_share: String,
-    leave_size: Option<crate::task::Promise<u64>>,
-    leave_bytes: Option<u64>,
+    /// The share set and the world set, in `Kind::ALL` order.
+    sets: [SetField; 2],
     memory_mb: u32,
     custom_memory: bool,
     jvm_args: String,
@@ -469,16 +470,29 @@ pub struct EditState {
     window: (u32, u32),
 }
 
+/// A share set or world set field in the edit dialog.
+struct SetField {
+    kind: Kind,
+    value: String,
+    /// The set when the dialog opened, and what leaving it would copy.
+    old: String,
+    leave_size: Option<crate::task::Promise<u64>>,
+    leave_bytes: Option<u64>,
+}
+
+impl SetField {
+    fn new(kind: Kind, i: &Instance) -> Self {
+        Self { kind, value: kind.set_of(i).to_string(), old: kind.set_of(i).to_string(), leave_size: None, leave_bytes: None }
+    }
+}
+
 impl EditState {
     pub fn from(i: &Instance) -> Self {
         Self {
             id: i.id.clone(),
             name: i.name.clone(),
             group: i.group.clone(),
-            share_set: i.share_set.clone(),
-            old_share: i.share_set.clone(),
-            leave_size: None,
-            leave_bytes: None,
+            sets: Kind::ALL.map(|k| SetField::new(k, i)),
             memory_mb: i.memory_mb.unwrap_or(4096),
             custom_memory: i.memory_mb.is_some(),
             jvm_args: i.jvm_args.clone(),
@@ -504,10 +518,7 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
 
     let field_w = 340.0;
     let groups = app.groups.names();
-    let mut sets = app.share_sets.clone();
-    sets.extend(app.instances.iter().map(|i| i.share_set.clone()).filter(|s| !s.is_empty() && !app.share_sets.contains(s)));
-    sets.sort_by_key(|s| s.to_lowercase());
-    sets.dedup();
+    let sets = Kind::ALL.map(|k| app.all_sets(k));
     egui::Grid::new("edit-grid").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
         ui.label(RichText::new("name").color(t.muted));
         w::text_input(ui, &mut s.name, "", field_w, false);
@@ -519,7 +530,12 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
 
         ui.label(RichText::new("share set").color(t.muted))
             .on_hover_text("instances in the same share set share resource packs, shader packs and schematics");
-        new_instance::group_field(ui, &t, &mut s.share_set, &sets, "not shared", field_w);
+        new_instance::group_field(ui, &t, &mut s.sets[0].value, &sets[0], "not shared", field_w);
+        ui.end_row();
+
+        ui.label(RichText::new("world set").color(t.muted))
+            .on_hover_text("instances in the same world set share their worlds; they must play the same minecraft version and loader");
+        new_instance::group_field(ui, &t, &mut s.sets[1].value, &sets[1], "not shared", field_w);
         ui.end_row();
 
         ui.label(RichText::new("memory").color(t.muted));
@@ -555,7 +571,9 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
         ui.end_row();
     });
 
-    share_warning(app, s, ui);
+    for f in &mut s.sets {
+        share_warning(app, &s.id, f, ui);
+    }
 
     ui.add_space(18.0);
     let mut out = EditOutcome::Keep;
@@ -569,16 +587,12 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
                 out = EditOutcome::Delete;
             }
         });
-        let share_set = s.share_set.trim().to_string();
-        let share_changed = app.instances.iter().any(|i| i.id == s.id && i.share_set != share_set);
+        let new: [String; 2] = [0, 1].map(|n| s.sets[n].value.trim().to_string());
+        let changed: Vec<Kind> = Kind::ALL.into_iter().zip(&new).filter(|(k, v)| app.instances.iter().any(|i| i.id == s.id && k.set_of(i) != v.as_str())).map(|(k, _)| k).collect();
         if save && let Err(e) = crate::launch::split_args(&s.jvm_args) {
             app.toast(ToastKind::Error, format!("JVM arguments: {e}"));
-        } else if save && share_changed && let Some(e) = (!share_set.is_empty()).then(|| crate::shares::check_set_name(&share_set).err()).flatten() {
-            app.toast(ToastKind::Error, format!("{e}"));
-        } else if save && share_changed && let Some(why) = app.instance_busy(&s.id) {
-            app.toast(ToastKind::Error, format!("Can't change the share set while {why}"));
-        } else if save && share_changed && let Some(why) = [&s.old_share, &share_set].into_iter().find_map(|set| app.set_busy(set)) {
-            app.toast(ToastKind::Error, format!("Can't change the share set while {why}"));
+        } else if save && let Some(e) = set_change_error(app, s, &new, &changed) {
+            app.toast(ToastKind::Error, e);
         } else if save {
             if let Some(i) = app.instances.iter_mut().find(|i| i.id == s.id) {
                 if !s.name.trim().is_empty() {
@@ -589,10 +603,10 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
                 i.window = s.custom_window.then_some(s.window);
                 i.jvm_args = s.jvm_args.trim().to_string();
                 i.java_path = s.java_path.trim().to_string();
-                i.share_set = share_set;
+                [i.share_set, i.world_set] = new;
                 if let Err(e) = i.save() {
                     app.toast(ToastKind::Error, format!("Save failed: {e}"));
-                } else if share_changed {
+                } else if !changed.is_empty() {
                     let i = i.clone();
                     app.start_sharing(ui.ctx(), vec![i]);
                 }
@@ -603,44 +617,79 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
     out
 }
 
-/// The instances in share set `set`, and whether each is only still linked in (it
-/// left on paper, but the leave hasn't finished).
-pub fn set_members<'a>(set: &'a str, instances: &'a [Instance], links: &'a std::collections::BTreeMap<String, Vec<String>>) -> impl Iterator<Item = (&'a Instance, bool)> {
+/// Why the edit dialog can't save these set changes, if it can't.
+fn set_change_error(app: &App, s: &EditState, new: &[String; 2], changed: &[Kind]) -> Option<String> {
+    for &kind in changed {
+        let set = &new[kind as usize];
+        let old = &s.sets[kind as usize].old;
+        if let Some(e) = (!set.is_empty()).then(|| crate::shares::check_set_name(set).err()).flatten() {
+            return Some(format!("{e}"));
+        }
+        if let Some(why) = app.instance_busy(&s.id) {
+            return Some(format!("Can't change the {} while {why}", kind.noun()));
+        }
+        if let Some(why) = [old, set].into_iter().find_map(|set| app.set_busy(kind, set, &s.id)) {
+            return Some(format!("Can't change the {} while {why}", kind.noun()));
+        }
+        if kind == Kind::Worlds
+            && let Some(inst) = app.instances.iter().find(|i| i.id == s.id)
+            && let Some(why) = crate::world_sets::mismatch(inst, set, &app.instances)
+        {
+            return Some(format!("{why}. Change this instance's version to match first."));
+        }
+    }
+    None
+}
+
+/// The instances in set `set` of this kind, and whether each is only still linked in
+/// (it left on paper, but the leave hasn't finished).
+pub fn set_members<'a>(kind: Kind, set: &'a str, instances: &'a [Instance], links: &'a std::collections::BTreeMap<String, Vec<String>>) -> impl Iterator<Item = (&'a Instance, bool)> {
     let linked = links.get(set);
-    instances.iter().filter_map(move |i| match (!set.is_empty() && i.share_set == set, !set.is_empty() && linked.is_some_and(|l| l.contains(&i.id))) {
+    instances.iter().filter_map(move |i| match (!set.is_empty() && kind.set_of(i) == set, !set.is_empty() && linked.is_some_and(|l| l.contains(&i.id))) {
         (true, _) => Some((i, false)),
         (false, true) => Some((i, true)),
         (false, false) => None,
     })
 }
 
-/// What changing the share set will do to the files, before saving.
-fn share_warning(app: &App, s: &mut EditState, ui: &mut Ui) {
+/// What changing a set will do to the files, before saving.
+fn share_warning(app: &App, id: &str, f: &mut SetField, ui: &mut Ui) {
     let t = &app.t;
-    let new = s.share_set.trim();
-    if new == s.old_share {
+    let new = f.value.trim();
+    if new == f.old {
         return;
     }
-    let old = s.old_share.clone();
-    let (text, color) = if new.is_empty() {
-        if s.leave_size.is_none() && s.leave_bytes.is_none() {
-            let dir = crate::shares::set_dir(&old);
-            s.leave_size = Some(crate::task::Promise::spawn(&app.rt, ui.ctx(), async move {
-                Ok(tokio::task::spawn_blocking(move || crate::shares::SET_FOLDERS.iter().map(|f| crate::fsutil::tree_size(&dir.join(f))).sum()).await?)
+    let old = f.old.clone();
+    let what = match f.kind {
+        Kind::Packs => "resource packs, shader packs and schematics",
+        Kind::Worlds => "worlds",
+    };
+    let mismatch = (f.kind == Kind::Worlds).then(|| app.instances.iter().find(|i| i.id == id)).flatten().and_then(|i| crate::world_sets::mismatch(i, new, &app.instances));
+    let (text, color) = if let Some(why) = mismatch {
+        (format!("\u{f071} {why}."), t.red)
+    } else if new.is_empty() {
+        if f.leave_size.is_none() && f.leave_bytes.is_none() {
+            let (kind, dir) = (f.kind, crate::shares::set_dir(f.kind, &old));
+            f.leave_size = Some(crate::task::Promise::spawn(&app.rt, ui.ctx(), async move {
+                Ok(tokio::task::spawn_blocking(move || kind.folders().iter().map(|f| crate::fsutil::tree_size(&dir.join(f))).sum()).await?)
             }));
         }
-        if let Some(Ok(n)) = s.leave_size.as_ref().and_then(|p| p.take()) {
-            s.leave_bytes = Some(n);
+        if let Some(Ok(n)) = f.leave_size.as_ref().and_then(|p| p.take()) {
+            f.leave_bytes = Some(n);
         }
-        let size = s.leave_bytes.map(w::size_label).unwrap_or_else(|| "measuring…".into());
+        let size = f.leave_bytes.map(w::size_label).unwrap_or_else(|| "measuring…".into());
         (
-            format!("\u{f071} Leaving “{old}” gives this instance its own copy of the set's resource packs, shader packs and schematics ({size}). Free on btrfs or xfs; on other filesystems it takes that much space again."),
+            format!("\u{f071} Leaving “{old}” gives this instance its own copy of the set's {what} ({size}). Free on btrfs or xfs; on other filesystems it takes that much space again."),
             t.yellow,
         )
     } else if old.is_empty() {
-        (format!("This instance's resource packs, shader packs and schematics move into “{new}”, shared with its other instances. Name clashes keep both."), t.muted)
+        let more = match f.kind {
+            Kind::Packs => "",
+            Kind::Worlds => " Before each launch, worlds last played with mods this instance lacks are snapshotted first.",
+        };
+        (format!("This instance's {what} move into “{new}”, shared with its other instances. Name clashes keep both.{more}"), t.muted)
     } else {
-        (format!("The packs and schematics stay with “{old}”; this instance uses “{new}”'s instead."), t.muted)
+        (format!("This instance's {what} stay with “{old}”; it uses “{new}”'s instead."), t.muted)
     };
     ui.add_space(10.0);
     w::para(ui, RichText::new(text).color(color));
@@ -665,14 +714,19 @@ impl App {
         }
     }
 
-    /// Why share set `set`'s folders can't change right now: another instance in it is
-    /// exporting them or installing into them.
-    pub fn set_busy(&self, set: &str) -> Option<String> {
-        set_members(set, &self.instances, &self.share_links).find_map(|(i, _)| {
+    /// Why set `set`'s folders can't change right now: another instance in it is
+    /// exporting them or installing into them, or (for worlds) duplicating or playing
+    /// one, which a leave would copy halfway. `changing` is the instance asking.
+    pub fn set_busy(&self, kind: Kind, set: &str, changing: &str) -> Option<String> {
+        set_members(kind, set, &self.instances, self.set_links(kind)).find_map(|(i, _)| {
             if self.exports.iter().any(|(.., id)| *id == i.id) {
                 Some(format!("{} is exporting", i.name))
             } else if self.content.busy_with(&i.id) {
                 Some(format!("{} is installing content", i.name))
+            } else if kind == Kind::Worlds && self.worlds.busy_with(&i.id) {
+                Some(format!("{} is duplicating a world", i.name))
+            } else if kind == Kind::Worlds && i.id != changing && self.is_running(&i.id) {
+                Some(format!("{} is running", i.name))
             } else {
                 None
             }
@@ -710,10 +764,10 @@ mod tests {
         // b left "packs" on paper, but its leave hasn't finished: its folders still link in.
         let all = [inst("a", "packs"), inst("b", ""), inst("c", "other"), inst("d", "")];
         let links = [("packs".to_string(), vec!["a".to_string(), "b".to_string()])].into();
-        let got: Vec<(&str, bool)> = set_members("packs", &all, &links).map(|(i, leaving)| (i.id.as_str(), leaving)).collect();
+        let got: Vec<(&str, bool)> = set_members(Kind::Packs, "packs", &all, &links).map(|(i, leaving)| (i.id.as_str(), leaving)).collect();
         assert_eq!(got, [("a", false), ("b", true)]);
         // So an export or install in b holds up changes to the set, as one in a does.
-        assert_eq!(set_members("other", &all, &links).count(), 1);
-        assert_eq!(set_members("", &all, &links).count(), 0);
+        assert_eq!(set_members(Kind::Packs, "other", &all, &links).count(), 1);
+        assert_eq!(set_members(Kind::Packs, "", &all, &links).count(), 0);
     }
 }

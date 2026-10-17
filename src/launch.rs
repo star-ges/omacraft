@@ -573,6 +573,14 @@ async fn start(
     // changed while this one was running. A failure here shouldn't stop the game.
     let i = inst.clone();
     let shared = tokio::task::spawn_blocking(move || crate::shares::apply(&i)).await?;
+    // Worlds shared with other instances may have been played with mods this one lacks.
+    let worlds = if inst.world_set.is_empty() {
+        Vec::new()
+    } else {
+        task.stage("Checking worlds", 0);
+        let i = inst.clone();
+        tokio::task::spawn_blocking(move || crate::world_sets::check(&i)).await?
+    };
     let args = build_command(&prepared, inst, cfg, account, token, features, quick)?;
 
     {
@@ -585,6 +593,7 @@ async fn start(
             Ok(notes) => notes.iter().for_each(|n| l.push(LogLevel::Warn, n.clone())),
             Err(e) => l.push(LogLevel::Warn, format!("shared folders: {e:#}")),
         }
+        worlds.into_iter().for_each(|n| l.push(LogLevel::Warn, n));
         match quick {
             Some(QuickPlay::World(w)) if supports_quick_play(&prepared.version) => l.push(LogLevel::Launcher, format!("opening world {w}")),
             Some(QuickPlay::World(_)) => l.push(LogLevel::Warn, "this version can't open a world on launch; pick it from the menu"),
@@ -650,8 +659,27 @@ pub async fn launch(
     };
     let a = pump(Box::new(child.stdout.take().unwrap()), false, log.clone());
     let b = pump(Box::new(child.stderr.take().unwrap()), true, log.clone());
-    let status = child.wait().await;
+    // Note which worlds this game holds open, to record what they were played with.
+    // The game is running now, so nothing below may return early.
+    let child_pid = child.id().unwrap_or(0);
+    let watcher = || crate::world_sets::PlayWatch::new(inst.saves_dir(), child_pid);
+    let mut watch = watcher();
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+    let status = loop {
+        tokio::select! {
+            s = child.wait() => break s,
+            _ = tick.tick() => watch = tokio::task::spawn_blocking(move || { watch.look(); watch }).await.unwrap_or_else(|_| watcher()),
+        }
+    };
     let _ = tokio::join!(a, b);
+    let i = inst.clone();
+    let (played, failed) = tokio::task::spawn_blocking(move || {
+        let played = watch.played();
+        let failed = crate::world_sets::write_records(&i, &played);
+        (played, failed)
+    })
+    .await
+    .unwrap_or_default();
 
     let exit = match status {
         Ok(s) => s.code().ok_or_else(|| "killed by signal".to_string()),
@@ -666,6 +694,11 @@ pub async fn launch(
             Err(e) => format!("game {e}"),
         };
         l.push(if exit == Ok(0) { LogLevel::Launcher } else { LogLevel::Error }, msg);
+        if !played.is_empty() {
+            let names: Vec<String> = played.iter().filter_map(|w| w.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+            l.push(LogLevel::Launcher, format!("recorded the mods {} was played with", names.join(", ")));
+        }
+        failed.into_iter().for_each(|f| l.push(LogLevel::Warn, f));
         l.exited = Some(exit.clone());
     }
     Ok(LaunchResult { played: started.elapsed(), exit })

@@ -3,6 +3,7 @@ use egui::{CornerRadius, RichText, Sense, Stroke, StrokeKind, Ui, vec2};
 use super::widgets as w;
 use super::{App, ToastKind};
 use crate::keymap::{self, Action};
+use crate::shares::Kind;
 use crate::{paths, shares};
 
 pub fn show(app: &mut App, ui: &mut Ui) {
@@ -112,48 +113,54 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     });
 }
 
-/// The share sets with their members.
+/// The share sets and world sets with their members.
 fn shared(app: &mut App, ui: &mut Ui) {
     let t = app.t.clone();
     let indent = egui::Margin { left: (t.body_size() * 9.0 + 8.0) as i8, ..Default::default() };
     w::section(ui, &t, "shared folders");
     let busy = app.sharing.is_some();
-    let mut sets = app.share_sets.clone();
-    sets.extend(app.instances.iter().map(|i| i.share_set.clone()).filter(|s| !s.is_empty()));
-    sets.extend(app.share_links.keys().cloned());
-    sets.sort_by_key(|s| s.to_lowercase());
-    sets.dedup();
-    for set in &sets {
-        // Instances that left on paper but still link in (a leave that failed) count too.
-        let members: Vec<String> = super::instances::set_members(set, &app.instances, &app.share_links)
-            .map(|(i, leaving)| if leaving { format!("{} (leaving)", i.name) } else { i.name.clone() })
-            .collect();
-        ui.horizontal(|ui| {
-            w::field_label(ui, &t, set);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if members.is_empty() && ui.add_enabled(!busy, egui::Button::new(RichText::new("delete…").color(t.red))).clicked() {
-                    app.modal = Some(super::Modal::Confirm(super::Confirm {
-                        title: "delete share set".into(),
-                        body: format!("No instance uses “{set}”. Permanently delete it and the packs and schematics in it?"),
-                        button: "delete".into(),
-                        action: super::ConfirmAction::DeleteShareSet(set.clone()),
-                    }));
-                }
-                if w::button(ui, "folder").clicked() {
-                    super::open_path(&shares::set_dir(set));
-                }
-                let who = if members.is_empty() { "no instances".to_string() } else { members.join(", ") };
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.add(egui::Label::new(RichText::new(who).color(if members.is_empty() { t.muted } else { t.fg })).truncate());
+    for kind in Kind::ALL {
+        let sets = app.all_sets(kind);
+        if kind == Kind::Worlds && !sets.is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new("world sets").color(t.muted).size(t.body_size() - 1.0));
+        }
+        for set in &sets {
+            // Instances that left on paper but still link in (a leave that failed) count too.
+            let members: Vec<String> = super::instances::set_members(kind, set, &app.instances, app.set_links(kind))
+                .map(|(i, leaving)| if leaving { format!("{} (leaving)", i.name) } else { i.name.clone() })
+                .collect();
+            ui.horizontal(|ui| {
+                w::field_label(ui, &t, set);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if members.is_empty() && ui.add_enabled(!busy, egui::Button::new(RichText::new("delete…").color(t.red))).clicked() {
+                        let what = match kind {
+                            Kind::Packs => "the packs and schematics",
+                            Kind::Worlds => "the worlds",
+                        };
+                        app.modal = Some(super::Modal::Confirm(super::Confirm {
+                            title: format!("delete {}", kind.noun()),
+                            body: format!("No instance uses “{set}”. Permanently delete it and {what} in it?"),
+                            button: "delete".into(),
+                            action: super::ConfirmAction::DeleteSet(kind, set.clone()),
+                        }));
+                    }
+                    if w::button(ui, "folder").clicked() {
+                        super::open_path(&shares::set_dir(kind, set));
+                    }
+                    let who = if members.is_empty() { "no instances".to_string() } else { members.join(", ") };
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new(who).color(if members.is_empty() { t.muted } else { t.fg })).truncate());
+                    });
                 });
             });
-        });
+        }
     }
     egui::Frame::new().inner_margin(indent).show(ui, |ui| {
         w::para(
             ui,
             RichText::new(
-                "Instances in the same share set (edit an instance to pick one) use one folder of resource packs, shader packs and schematics. Joining moves the instance's files in, keeping both on a name clash; leaving gives it its own copy.",
+                "Instances in the same share set (edit an instance to pick one) use one folder of resource packs, shader packs and schematics. Instances in the same world set share their worlds, and must play the same Minecraft version and loader. Joining moves the instance's files in, keeping both on a name clash; leaving gives it its own copy.",
             )
             .color(t.muted),
         );

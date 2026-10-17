@@ -20,6 +20,8 @@ pub struct FileMeta {
     pub icon: Option<PathBuf>,
     pub project_id: Option<String>,
     pub sha1: Option<String>,
+    /// The id the mod gives itself (`fabric.mod.json` `id`, Forge's `modId`).
+    pub mod_id: Option<String>,
 }
 
 pub fn icon_dir() -> PathBuf {
@@ -67,44 +69,67 @@ fn fabric_icon(v: &Value) -> Option<String> {
     }
 }
 
-fn read_mod(zip: &mut zip::ZipArchive<std::fs::File>, key: &str, meta: &mut FileMeta) {
+/// Fill in name, version and mod id from the jar's metadata; returns its icon's path in the jar.
+fn parse_mod(zip: &mut zip::ZipArchive<std::fs::File>, meta: &mut FileMeta) -> Option<String> {
     let json = |zip: &mut zip::ZipArchive<std::fs::File>, name| {
         zip_bytes(zip, name).and_then(|b| serde_json::from_slice::<Value>(&b).ok())
     };
-    let icon_path = if let Some(f) = json(zip, "fabric.mod.json") {
+    if let Some(f) = json(zip, "fabric.mod.json") {
         meta.name = f["name"].as_str().map(String::from);
         meta.version = f["version"].as_str().map(String::from);
+        meta.mod_id = f["id"].as_str().map(String::from);
         fabric_icon(&f["icon"])
     } else if let Some(q) = json(zip, "quilt.mod.json") {
         let l = &q["quilt_loader"];
         meta.name = l["metadata"]["name"].as_str().map(String::from);
         meta.version = l["version"].as_str().map(String::from);
+        meta.mod_id = l["id"].as_str().map(String::from);
         fabric_icon(&l["metadata"]["icon"])
     } else if let Some(t) = ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"]
         .iter()
         .find_map(|n| zip_bytes(zip, n).and_then(|b| toml::from_str::<toml::Value>(&String::from_utf8_lossy(&b)).ok()))
     {
         // Forge 1.13+ / NeoForge. Versions like "${file.jarVersion}" are
-        // filled in at build time from the manifest, which we skip.
+        // filled in at build time from the manifest.
         let m = t.get("mods").and_then(|m| m.get(0));
         let field = |k: &str| m.and_then(|m| m.get(k)).and_then(|v| v.as_str()).map(String::from);
         meta.name = field("displayName");
-        meta.version = field("version").filter(|v| !v.starts_with("${"));
+        meta.version = field("version").filter(|v| !v.starts_with("${")).or_else(|| manifest_version(zip));
+        meta.mod_id = field("modId");
         field("logoFile").or_else(|| t.get("logoFile").and_then(|v| v.as_str()).map(String::from))
     } else if let Some(info) = json(zip, "mcmod.info") {
         // Forge 1.6–1.12: a list of mods, or {"modList": [...]}.
         let m = if info.is_array() { &info[0] } else { &info["modList"][0] };
         meta.name = m["name"].as_str().map(String::from);
         meta.version = m["version"].as_str().filter(|v| !v.contains("${")).map(String::from);
+        meta.mod_id = m["modid"].as_str().map(String::from);
         m["logoFile"].as_str().filter(|p| !p.is_empty()).map(String::from)
     } else {
         None
-    };
-    if let Some(p) = icon_path
+    }
+}
+
+/// `Implementation-Version` from the jar's manifest.
+fn manifest_version(zip: &mut zip::ZipArchive<std::fs::File>) -> Option<String> {
+    let text = String::from_utf8(zip_bytes(zip, "META-INF/MANIFEST.MF")?).ok()?;
+    text.lines().find_map(|l| l.strip_prefix("Implementation-Version:")).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+fn read_mod(zip: &mut zip::ZipArchive<std::fs::File>, key: &str, meta: &mut FileMeta) {
+    if let Some(p) = parse_mod(zip, meta)
         && let Some(bytes) = zip_bytes(zip, &p)
     {
         meta.icon = save_icon(key, ext_of(&p), &bytes);
     }
+}
+
+/// A mod jar's own id and version (`sodium`, `0.6.0`), read from its metadata only:
+/// no hashing, icons or network. None if the jar names no id.
+pub fn mod_identity(path: &Path) -> Option<(String, Option<String>)> {
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
+    let mut meta = FileMeta::default();
+    parse_mod(&mut zip, &mut meta);
+    Some((meta.mod_id.filter(|id| !id.is_empty())?, meta.version))
 }
 
 /// Everything we can learn without the network. `key` identifies the file

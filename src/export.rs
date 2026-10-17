@@ -577,20 +577,23 @@ mod tests {
         // Another instance in the set, with packs of its own.
         let mut other = Instance::new("other", "1.21.1", Loader::Vanilla);
         other.share_set = set.clone();
+        other.world_set = set.clone();
         other.assign_id().unwrap();
         other.save().unwrap();
-        for rel in ["resourcepacks/theirs.zip"] {
+        for rel in ["resourcepacks/theirs.zip", "saves/Theirs/level.dat"] {
             std::fs::create_dir_all(other.game_dir().join(&rel).parent().unwrap()).unwrap();
             std::fs::write(other.game_dir().join(&rel), b"o").unwrap();
         }
         let mut want = tree(&src.game_dir());
-        assert!(want.remove("saves/World/level.dat").is_some());
+        assert!(want.contains_key("saves/World/level.dat"));
         want.insert("resourcepacks/theirs.zip".into(), Some(b"o".to_vec()));
+        want.insert("saves/Theirs/level.dat".into(), Some(b"o".to_vec()));
         want.insert("shaderpacks".into(), None);
         src.share_set = set.clone();
+        src.world_set = set.clone();
         crate::shares::apply(&src).unwrap();
         crate::shares::apply(&other).unwrap();
-        for f in ["resourcepacks", "schematics"] {
+        for f in ["resourcepacks", "schematics", "saves"] {
             assert!(crate::shares::is_share_link(&src.game_dir().join(f)), "{f}");
         }
         // A link that only looks like a share link stays out, even when asked for (G4).
@@ -604,6 +607,8 @@ mod tests {
         let dest = d.join("out.zip");
         let mut include = default_include(&src);
         include.push("loot".into());
+        // Worlds are left out by default; asked for, the set's come along.
+        include.push("saves".into());
         let req = Request { inst: src.clone(), format: Format::Zip, dest, include, version: String::new() };
         let out = export(Task::new("export"), req).await.unwrap();
         let req = crate::import::Request { source: out.path.display().to_string(), name: None, group: String::new() };
@@ -613,12 +618,13 @@ mod tests {
         for e in std::fs::read_dir(back.game_dir()).unwrap().flatten() {
             assert!(!e.file_type().unwrap().is_symlink(), "{:?} is a link", e.file_name());
         }
-        assert!(back.share_set.is_empty());
+        assert!(back.share_set.is_empty() && back.world_set.is_empty());
 
         for i in [&src, &other, &back] {
             std::fs::remove_dir_all(i.dir()).unwrap();
         }
-        crate::shares::delete_set(&set).unwrap();
+        crate::shares::delete_set(crate::shares::Kind::Packs, &set).unwrap();
+        crate::shares::delete_set(crate::shares::Kind::Worlds, &set).unwrap();
         std::fs::remove_dir_all(crate::paths::data_dir().join(&outside)).unwrap();
         std::fs::remove_dir_all(d).unwrap();
     }

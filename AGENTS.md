@@ -41,7 +41,8 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim 
 | `export.rs` | Instance zip (MultiMC format) or `.mrpack` (Modrinth-hosted files via `content_meta::hosted`, rest in `overrides/`) |
 | `saves.rs` | `level.dat` and `servers.dat` via fastnbt `Value` (round-trips unknown fields) |
 | `keymap.rs` | Every action, default chords, scopes, parse/label, conflict detection |
-| `shares.rs` | Shared folders: share sets (`shared/sets/<name>/{resourcepacks,shaderpacks,schematics}`, `share_set` in instance.toml); `apply` turns an instance's folders into relative links or back into copies |
+| `shares.rs` | Shared folders, by `Kind`: share sets (`shared/sets/<name>/{resourcepacks,shaderpacks,schematics}`, `share_set` in instance.toml) and world sets (`shared/worlds/<name>/saves`, `world_set`); `apply` turns an instance's folders into relative links or back into copies |
+| `world_sets.rs`, `backups.rs` | World sets' rules: one version + loader per set, `omacraft.toml` play records in each world, the pre-launch mod check; reflink world snapshots under `backups/worlds/` |
 | `store.rs` | Content store: Modrinth installs and `.mrpack` files go through `cache/content/<sha1>` and are reflinked into instances; `reclaim` merges duplicates (`FIDEDUPERANGE`) and prunes the store |
 | `icons.rs`, `fsutil.rs`, `net.rs`, `task.rs` | Instance icons, reflink copy, HTTP + downloads, background `Task`/`Promise` |
 | `ui/mod.rs` | `App`, top/status bars, modals, key routing, launching, imports |
@@ -133,6 +134,18 @@ test (and a rule here) with any fix that sets a new one.
   `shares::tests` (incl. `a_failed_leave_keeps_the_set_from_being_deleted`, `only_links_that_really_lead_into_a_set_count`,
   `an_interrupted_leave_is_finished_by_the_next_apply`), `shares::tests::links_inside_a_shared_folder_become_copies`, `ui::instances::tests::set_members_count_instances_still_linked_in`, `export::tests::shared_folders_export_like_normal_ones` (exports are self-contained: real files,
   mods included).
+- **World sets:** a world set shares `saves` through the same `shares::apply` as share sets (worlds clash whole,
+  never merge). Every member plays the same Minecraft version and loader kind (`world_sets::same_game`; the loader's
+  own version may differ): joining a set that plays something else is refused, and changing one member's version
+  asks to change the whole set or leave it (`Modal::SetVersion`). Changes to a world set also wait while another
+  member runs or duplicates a world (a leave would copy a world mid-write). When a game exits, each world it played
+  gets an `omacraft.toml` (instance, version, loader, mod id → version from the jars). A world counts as played if
+  this game's pid held its `session.lock` (polled with `F_GETLK` every 3 s; Java's `FileChannel.tryLock` is a POSIX
+  lock) or, never seen locked by another game, its `level.dat` changed during the run. Before a world-set member
+  launches, any world last played with a mod it lacks, a newer mod version or a newer Minecraft gets a log warning
+  and a snapshot first, unless it's open in another game or a snapshot taken since its last play covers it. Never
+  blocks the launch. Tests: `world_sets::tests`, `backups::tests`,
+  `shares::tests::world_sets_share_saves_apart_from_share_sets`.
 - **Screenshots stay per instance:** never pool them on disk (a shared pool needed guessed ownership, which lost or
   misattributed files). The screenshots tab's "all instances" toggle (config `all_screenshots`) lists every
   instance's folder in the background, each tile captioned with its instance. Test:

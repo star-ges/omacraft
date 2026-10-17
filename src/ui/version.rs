@@ -6,8 +6,11 @@ use super::nav::{Nav, Zone};
 use super::version_picker::VersionPicker;
 use super::widgets as w;
 use super::App;
+use super::{Toast, ToastKind};
 use crate::instance::Instance;
 use crate::loaders::Loader;
+use crate::shares::Kind;
+use crate::world_sets;
 
 #[derive(Default)]
 pub struct VersionState {
@@ -85,20 +88,16 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
     ui.horizontal(|ui| {
         if (ui.add_enabled_ui(changed, |ui| w::primary_button(ui, &t, "apply")).inner.clicked() || (changed && apply_key))
             && let Some((mc, loader)) = sel.clone()
-            && let Some(i) = app.instances.iter_mut().find(|i| i.id == inst.id)
         {
-            let mc_changed = i.mc_version != mc;
-            i.mc_version = mc.clone();
-            i.loader = loader.clone();
-            match i.save() {
-                Ok(()) => {
-                    let what = if loader == Loader::Vanilla { mc.clone() } else { format!("{mc} with {}", loader.display()) };
-                    app.toasts.push(super::Toast::info(format!("{} now uses {what}", inst.name)));
-                    if mc_changed && !inst.mods().is_empty() {
-                        app.toasts.push(super::Toast::info("Mods are built for one Minecraft version; check yours still match."));
-                    }
-                }
-                Err(e) => app.toasts.push(super::Toast::error(format!("Save failed: {e}"))),
+            let mut after = inst.clone();
+            after.mc_version = mc.clone();
+            after.loader = loader.clone();
+            let members: Vec<String> = world_sets::others(&inst.world_set, &inst.id, &app.instances).map(|i| i.name.clone()).collect();
+            if !members.is_empty() && world_sets::mismatch(&after, &inst.world_set, &app.instances).is_some() {
+                // Everyone in a world set plays the same game: ask what to do.
+                app.modal = Some(super::Modal::SetVersion(Box::new(SetVersion { id: inst.id.clone(), name: inst.name.clone(), set: inst.world_set.clone(), members, mc, loader })));
+            } else {
+                set_version(app, &[inst.id.clone()], &mc, &loader);
             }
             close = true;
         }
@@ -125,3 +124,92 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
         *slot = picker;
     }
 }
+
+/// Save these instances with Minecraft `mc` and `loader`.
+fn set_version(app: &mut App, ids: &[String], mc: &str, loader: &Loader) {
+    let what = if *loader == Loader::Vanilla { mc.to_string() } else { format!("{mc} with {}", loader.display()) };
+    let mut done = Vec::new();
+    let mut mods = false;
+    for i in app.instances.iter_mut().filter(|i| ids.contains(&i.id)) {
+        let mc_changed = i.mc_version != mc;
+        i.mc_version = mc.to_string();
+        i.loader = loader.clone();
+        match i.save() {
+            Ok(()) => {
+                done.push(i.name.clone());
+                mods |= mc_changed && !i.mods().is_empty();
+            }
+            Err(e) => app.toasts.push(Toast::error(format!("Save failed for {}: {e}", i.name))),
+        }
+    }
+    if !done.is_empty() {
+        app.toasts.push(Toast::info(format!("{} now {} {what}", done.join(", "), if done.len() == 1 { "uses" } else { "use" })));
+    }
+    if mods {
+        app.toasts.push(Toast::info("Mods are built for one Minecraft version; check yours still match."));
+    }
+}
+
+/// A world set member's version change, waiting on what to do with the rest of the set.
+pub struct SetVersion {
+    id: String,
+    name: String,
+    set: String,
+    /// The other members' names.
+    members: Vec<String>,
+    mc: String,
+    loader: Loader,
+}
+
+/// The dialog for [`SetVersion`]. Returns true once it's done.
+pub fn set_version_dialog(app: &mut App, s: &SetVersion, ui: &mut Ui) -> bool {
+    let t = app.t.clone();
+    let activate = app.modal_nav() == Some(Nav::Activate);
+    ui.set_width(460.0);
+    w::heading(ui, &t, "change the world set's version?");
+    ui.add_space(8.0);
+    let what = if s.loader == Loader::Vanilla { s.mc.clone() } else { format!("{} with {}", s.mc, s.loader.display()) };
+    w::para(
+        ui,
+        format!(
+            "{} shares the worlds of “{}” with {}, and every instance in a world set plays the same Minecraft version and loader. Change them all to {what}, or have {} leave the set with its own copy of the worlds?",
+            s.name,
+            s.set,
+            s.members.join(", "),
+            s.name
+        ),
+    );
+    ui.add_space(14.0);
+    let mut done = false;
+    ui.horizontal(|ui| {
+        let all = format!("change all {}", s.members.len() + 1);
+        if w::primary_button(ui, &t, &all).clicked() || activate {
+            let ids: Vec<String> = app.instances.iter().filter(|i| i.id == s.id || i.world_set == s.set).map(|i| i.id.clone()).collect();
+            let busy = ids.iter().find_map(|id| {
+                let name = app.instances.iter().find(|i| &i.id == id).map(|i| i.name.clone()).unwrap_or_default();
+                app.instance_busy(id).map(|why| format!("{name}: {why}"))
+            });
+            match busy {
+                Some(why) => app.toast(ToastKind::Error, format!("Can't change the set's version ({why})")),
+                None => set_version(app, &ids, &s.mc, &s.loader),
+            }
+            done = true;
+        }
+        if w::button(ui, "leave the set").clicked() {
+            if let Some(why) = app.instance_busy(&s.id).map(String::from).or_else(|| app.set_busy(Kind::Worlds, &s.set, &s.id)) {
+                app.toast(ToastKind::Error, format!("Can't leave “{}” while {why}", s.set));
+            } else if let Some(i) = app.instances.iter_mut().find(|i| i.id == s.id) {
+                i.world_set.clear();
+                let i = i.clone();
+                set_version(app, std::slice::from_ref(&s.id), &s.mc, &s.loader);
+                app.start_sharing(ui.ctx(), vec![i]);
+            }
+            done = true;
+        }
+        if w::button(ui, "cancel").clicked() {
+            done = true;
+        }
+    });
+    done
+}
+

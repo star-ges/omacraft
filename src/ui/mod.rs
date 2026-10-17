@@ -26,6 +26,7 @@ use crate::auth::{self, Account, Accounts, MsaAccount};
 use crate::config::Config;
 use crate::instance::{self, Instance};
 use crate::launch::{self, GameLog, LaunchResult, LogLevel, QuickPlay, SharedLog};
+use crate::shares::Kind;
 use instances::{InstTab, ListRow};
 use crate::keymap::{Action, Keymap};
 use nav::{Nav, Zone};
@@ -56,6 +57,8 @@ pub enum Modal {
     Export(Box<export::ExportDialog>),
     Help,
     Confirm(Confirm),
+    /// A world set member's version change.
+    SetVersion(Box<version::SetVersion>),
 }
 
 /// A yes/no question before something destructive.
@@ -72,8 +75,8 @@ pub enum ConfirmAction {
     DeletePath(std::path::PathBuf),
     /// Back to the default skin, for this account UUID.
     ResetSkin(String),
-    /// A share set no instance uses, with its files.
-    DeleteShareSet(String),
+    /// A share or world set no instance uses, with its files.
+    DeleteSet(Kind, String),
 }
 
 enum Phase {
@@ -164,6 +167,9 @@ pub struct App {
     /// Share set → ids of instances whose folders link into it, re-read with `share_sets`.
     /// Can name an instance that has left on paper but whose leave hasn't finished.
     pub share_links: std::collections::BTreeMap<String, Vec<String>>,
+    /// The same two for world sets.
+    pub world_sets: Vec<String>,
+    pub world_links: std::collections::BTreeMap<String, Vec<String>>,
     /// "new group" text in the instance context menu.
     pub group_buf: String,
     pub toasts: Vec<Toast>,
@@ -218,8 +224,10 @@ impl App {
             exports: Vec::new(),
             reclaim: None,
             sharing: None,
-            share_sets: crate::shares::sets_on_disk(),
-            share_links: crate::shares::sets_in_use(),
+            share_sets: crate::shares::sets_on_disk(Kind::Packs),
+            share_links: crate::shares::sets_in_use(Kind::Packs),
+            world_sets: crate::shares::sets_on_disk(Kind::Worlds),
+            world_links: crate::shares::sets_in_use(Kind::Worlds),
             group_buf: String::new(),
             toasts: Vec::new(),
         };
@@ -352,6 +360,7 @@ impl App {
         }
 
         let ids: Vec<String> = self.sessions.keys().cloned().collect();
+        let mut ended = false;
         for id in ids {
             let s = self.sessions.get_mut(&id).unwrap();
             match &s.phase {
@@ -383,8 +392,8 @@ impl App {
                 Phase::Game(p) => {
                     let Some(r) = p.take() else { continue };
                     s.phase = Phase::Ended;
-                    // The launch may have finished a share set change.
-                    self.share_links = crate::shares::sets_in_use();
+                    // The launch may have finished a share set change, and recorded worlds.
+                    ended = true;
                     match r {
                         Ok(res) => {
                             if let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) {
@@ -412,6 +421,10 @@ impl App {
                 }
                 Phase::Ended => {}
             }
+        }
+        if ended {
+            self.refresh_shares();
+            self.worlds.invalidate();
         }
         if self.sessions.values().any(|s| s.running()) {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -483,6 +496,7 @@ impl App {
             self.refresh_shares();
             self.shots.invalidate();
             self.content.invalidate();
+            self.worlds.invalidate();
         }
 
         let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.worlds.dups).into_iter().partition(|(_, p, _)| p.ready());
@@ -530,8 +544,36 @@ impl App {
     }
 
     pub fn refresh_shares(&mut self) {
-        self.share_sets = crate::shares::sets_on_disk();
-        self.share_links = crate::shares::sets_in_use();
+        self.share_sets = crate::shares::sets_on_disk(Kind::Packs);
+        self.share_links = crate::shares::sets_in_use(Kind::Packs);
+        self.world_sets = crate::shares::sets_on_disk(Kind::Worlds);
+        self.world_links = crate::shares::sets_in_use(Kind::Worlds);
+    }
+
+    /// Sets of this kind with a folder on disk.
+    pub fn sets_on_disk(&self, kind: Kind) -> &[String] {
+        match kind {
+            Kind::Packs => &self.share_sets,
+            Kind::Worlds => &self.world_sets,
+        }
+    }
+
+    /// Set → ids of instances whose folders link into it now.
+    pub fn set_links(&self, kind: Kind) -> &std::collections::BTreeMap<String, Vec<String>> {
+        match kind {
+            Kind::Packs => &self.share_links,
+            Kind::Worlds => &self.world_links,
+        }
+    }
+
+    /// Every set of this kind: on disk, named by an instance, or still linked into. Sorted.
+    pub fn all_sets(&self, kind: Kind) -> Vec<String> {
+        let mut sets = self.sets_on_disk(kind).to_vec();
+        sets.extend(self.instances.iter().map(|i| kind.set_of(i).to_string()).filter(|s| !s.is_empty()));
+        sets.extend(self.set_links(kind).keys().cloned());
+        sets.sort_by_key(|s| s.to_lowercase());
+        sets.dedup();
+        sets
     }
 
     /// Bring these instances' shared folders in line with their settings. Running
@@ -928,13 +970,13 @@ impl App {
                 self.content.invalidate();
             }
             ConfirmAction::ResetSkin(uuid) => accounts::skin_change(self, ctx, uuid, crate::skins::Change::Reset),
-            ConfirmAction::DeleteShareSet(name) => {
+            ConfirmAction::DeleteSet(kind, name) => {
                 // Checked again: an instance may have joined since the dialog opened.
                 // `delete_set` also refuses while any instance still links into the set.
                 self.refresh_shares();
-                if self.sharing.is_some() || self.instances.iter().any(|i| &i.share_set == name) || self.share_links.contains_key(name) {
+                if self.sharing.is_some() || self.instances.iter().any(|i| kind.set_of(i) == name) || self.set_links(*kind).contains_key(name) {
                     self.toast(ToastKind::Error, format!("{name} is in use"));
-                } else if let Err(e) = crate::shares::delete_set(name) {
+                } else if let Err(e) = crate::shares::delete_set(*kind, name) {
                     self.toast(ToastKind::Error, format!("{e:#}"));
                 }
                 self.refresh_shares();
@@ -1097,6 +1139,13 @@ impl App {
                     .backdrop_color(widgets::scrim(&t))
                     .show(ctx, |ui| group_manager::show(self, &mut s, ui));
                 if r.inner || r.should_close() { None } else { Some(Modal::Groups(s)) }
+            }
+            Modal::SetVersion(s) => {
+                let r = egui::Modal::new(egui::Id::new("set-version"))
+                    .frame(widgets::modal_frame(&t))
+                    .backdrop_color(widgets::scrim(&t))
+                    .show(ctx, |ui| version::set_version_dialog(self, &s, ui));
+                if r.inner || r.should_close() { None } else { Some(Modal::SetVersion(s)) }
             }
             Modal::Confirm(c) => {
                 let mut yes = false;

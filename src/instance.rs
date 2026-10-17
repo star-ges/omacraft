@@ -19,6 +19,9 @@ pub struct Instance {
     /// Share set whose resource packs, shader packs and schematics this instance uses (see shares.rs).
     #[serde(default)]
     pub share_set: String,
+    /// World set whose `saves` this instance uses (see shares.rs, world_sets.rs).
+    #[serde(default)]
+    pub world_set: String,
     /// Built-in icon name, or `custom:<file>` under the icons dir.
     #[serde(default = "default_icon")]
     pub icon: String,
@@ -49,6 +52,7 @@ impl Instance {
             loader,
             group: String::new(),
             share_set: String::new(),
+            world_set: String::new(),
             icon: default_icon(),
             notes: String::new(),
             memory_mb: None,

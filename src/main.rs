@@ -1,4 +1,5 @@
 mod auth;
+mod backups;
 mod cli;
 mod config;
 mod content_meta;
@@ -20,6 +21,7 @@ mod saves;
 mod shares;
 mod skins;
 mod store;
+mod world_sets;
 mod task;
 mod theme;
 mod ui;

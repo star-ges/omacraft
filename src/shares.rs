@@ -2,7 +2,9 @@
 //! the instance's folder into a link to one under `shared/`:
 //! `shared/sets/<name>/{resourcepacks,shaderpacks,schematics}`, one pool per share
 //! set, a named set of instances (packs are tied to versions, so one global pool
-//! fills up with packs half the instances can't use).
+//! fills up with packs half the instances can't use). World sets do the same for
+//! `saves`, under `shared/worlds/<name>/saves`; worlds.rs keeps their members on one
+//! version and loader and checks each world's mods before launch.
 //!
 //! `apply` makes an instance's folders match its settings. Sharing moves the
 //! instance's files into the shared folder (a name clash keeps both and renames the
@@ -25,6 +27,55 @@ use crate::{fsutil, paths};
 /// Folders a share set shares.
 pub const SET_FOLDERS: [&str; 3] = ["resourcepacks", "shaderpacks", "schematics"];
 
+/// Folders a world set shares.
+pub const WORLD_FOLDERS: [&str; 1] = ["saves"];
+
+/// What a set shares: packs (`share_set`) or worlds (`world_set`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Packs,
+    Worlds,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 2] = [Kind::Packs, Kind::Worlds];
+
+    pub fn folders(self) -> &'static [&'static str] {
+        match self {
+            Kind::Packs => &SET_FOLDERS,
+            Kind::Worlds => &WORLD_FOLDERS,
+        }
+    }
+
+    /// The folder under `shared/` holding this kind's sets.
+    fn root(self) -> &'static str {
+        match self {
+            Kind::Packs => "sets",
+            Kind::Worlds => "worlds",
+        }
+    }
+
+    fn of(folder: &str) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|k| k.folders().contains(&folder))
+    }
+
+    /// The set of this kind the instance is in ("" for none).
+    pub fn set_of(self, inst: &Instance) -> &str {
+        match self {
+            Kind::Packs => &inst.share_set,
+            Kind::Worlds => &inst.world_set,
+        }
+    }
+
+    /// For messages: "share set" or "world set".
+    pub fn noun(self) -> &'static str {
+        match self {
+            Kind::Packs => "share set",
+            Kind::Worlds => "world set",
+        }
+    }
+}
+
 /// From an instance's game dir (`instances/<id>/minecraft`) back to the data dir.
 const UP: &str = "../../..";
 
@@ -35,25 +86,25 @@ pub fn dir() -> PathBuf {
     paths::data_dir().join("shared")
 }
 
-pub fn sets_dir() -> PathBuf {
-    dir().join("sets")
+pub fn sets_dir(kind: Kind) -> PathBuf {
+    dir().join(kind.root())
 }
 
-pub fn set_dir(name: &str) -> PathBuf {
-    sets_dir().join(name)
+pub fn set_dir(kind: Kind, name: &str) -> PathBuf {
+    sets_dir(kind).join(name)
 }
 
-/// A share set's name doubles as its folder name.
+/// A set's name doubles as its folder name.
 pub fn check_set_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) || name.chars().any(char::is_control) || name.len() > 64 {
-        bail!("“{name}” can't be a share set name: use up to 64 characters, no slashes, not starting with a dot");
+        bail!("“{name}” can't be a set name: use up to 64 characters, no slashes, not starting with a dot");
     }
     Ok(())
 }
 
-/// Share sets with a folder on disk, sorted. Reads one directory.
-pub fn sets_on_disk() -> Vec<String> {
-    let mut out: Vec<String> = std::fs::read_dir(sets_dir())
+/// Sets of this kind with a folder on disk, sorted. Reads one directory.
+pub fn sets_on_disk(kind: Kind) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(sets_dir(kind))
         .into_iter()
         .flatten()
         .flatten()
@@ -65,26 +116,26 @@ pub fn sets_on_disk() -> Vec<String> {
     out
 }
 
-/// Delete a share set's folder and everything in it. Refuses while any instance's
-/// folder still links into it (say, one whose leave failed halfway), whatever its
-/// `share_set` says: deleting would take that instance's only packs with it.
-pub fn delete_set(name: &str) -> anyhow::Result<()> {
+/// Delete a set's folder and everything in it. Refuses while any instance's folder
+/// still links into it (say, one whose leave failed halfway), whatever its settings
+/// say: deleting would take that instance's only packs or worlds with it.
+pub fn delete_set(kind: Kind, name: &str) -> anyhow::Result<()> {
     check_set_name(name)?;
-    if let Some(ids) = sets_in_use().remove(name) {
+    if let Some(ids) = sets_in_use(kind).remove(name) {
         bail!("“{name}” is still linked from {} (Omacraft finishes leaving it at the next launch)", ids.join(", "));
     }
-    std::fs::remove_dir_all(set_dir(name)).with_context(|| format!("deleting share set {name}"))
+    std::fs::remove_dir_all(set_dir(kind, name)).with_context(|| format!("deleting {} {name}", kind.noun()))
 }
 
-/// Share set name → ids of the instances whose folders link into it now. This is
-/// what's on disk, which lags `share_set` until a change finishes. Reads a few links
-/// per instance.
-pub fn sets_in_use() -> BTreeMap<String, Vec<String>> {
+/// Set name → ids of the instances whose folders link into it now. This is what's
+/// on disk, which lags `share_set`/`world_set` until a change finishes. Reads a few
+/// links per instance.
+pub fn sets_in_use(kind: Kind) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for e in std::fs::read_dir(paths::instances_dir()).into_iter().flatten().flatten() {
         let id = e.file_name().to_string_lossy().into_owned();
         let game = e.path().join("minecraft");
-        let mut sets: Vec<String> = SET_FOLDERS.iter().filter_map(|f| linked_set(&game.join(f))).collect();
+        let mut sets: Vec<String> = kind.folders().iter().filter_map(|f| linked_set(&game.join(f))).collect();
         sets.dedup();
         for set in sets {
             out.entry(set).or_default().push(id.clone());
@@ -100,34 +151,38 @@ fn linked_set(link: &Path) -> Option<String> {
 
 /// Where `folder` in the game dir should link to, relative to the game dir.
 fn target(inst: &Instance, folder: &str) -> Option<PathBuf> {
-    (!inst.share_set.is_empty()).then(|| PathBuf::from(format!("{UP}/shared/sets/{}/{folder}", inst.share_set)))
+    let kind = Kind::of(folder)?;
+    let set = kind.set_of(inst);
+    (!set.is_empty()).then(|| PathBuf::from(format!("{UP}/shared/{}/{set}/{folder}", kind.root())))
 }
 
-/// The share set a link from the game dir's `folder` names, if its target has
-/// exactly the shape Omacraft makes: `../../../shared/sets/<set>/<folder>`, or (made
+/// The set a link from the game dir's `folder` names, if its target has exactly the
+/// shape Omacraft makes: `../../../shared/<sets|worlds>/<set>/<folder>`, or (made
 /// elsewhere) the absolute path to it. Nothing else, so no `..` or other folder.
 /// Only looks at the text; [`lands_in_set`] checks where it really leads.
 fn link_set(folder: &str, target: &Path) -> Option<String> {
-    let rest = target.strip_prefix(format!("{UP}/shared/sets")).or_else(|_| target.strip_prefix(sets_dir())).ok()?;
+    let kind = Kind::of(folder)?;
+    let rest = target.strip_prefix(format!("{UP}/shared/{}", kind.root())).or_else(|_| target.strip_prefix(sets_dir(kind))).ok()?;
     let mut parts = rest.components();
     let (Some(Component::Normal(set)), Some(Component::Normal(f)), None) = (parts.next(), parts.next(), parts.next()) else {
         return None;
     };
     let set = set.to_str()?;
-    (f == folder && SET_FOLDERS.contains(&folder) && check_set_name(set).is_ok()).then(|| set.to_string())
+    (f == folder && check_set_name(set).is_ok()).then(|| set.to_string())
 }
 
-/// Whether `path` really leads to `shared/sets/<set>/<folder>`, following every link
-/// on the way (a set folder swapped for a link elsewhere doesn't count).
+/// Whether `path` really leads to `shared/<sets|worlds>/<set>/<folder>`, following
+/// every link on the way (a set folder swapped for a link elsewhere doesn't count).
 fn lands_in_set(path: &Path, set: &str, folder: &str) -> bool {
-    match (path.canonicalize(), sets_dir().canonicalize()) {
+    let Some(kind) = Kind::of(folder) else { return false };
+    match (path.canonicalize(), sets_dir(kind).canonicalize()) {
         (Ok(real), Ok(sets)) => real == sets.join(set).join(folder),
         _ => false,
     }
 }
 
-/// Whether `path` is a link to a share set's folder that really leads there
-/// (export follows these, so nothing else may pass).
+/// Whether `path` is a link to a set's folder that really leads there (export
+/// follows these, so nothing else may pass).
 pub fn is_share_link(path: &Path) -> bool {
     let Some(folder) = path.file_name().and_then(|f| f.to_str()) else { return false };
     std::fs::read_link(path).ok().and_then(|t| link_set(folder, &t)).is_some_and(|set| lands_in_set(path, &set, folder))
@@ -138,13 +193,17 @@ pub fn is_share_link(path: &Path) -> bool {
 /// links) for the user. Safe to run again after an interruption.
 pub fn apply(inst: &Instance) -> anyhow::Result<Vec<String>> {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if !inst.share_set.is_empty() {
-        check_set_name(&inst.share_set)?;
+    for kind in Kind::ALL {
+        let set = kind.set_of(inst);
+        if !set.is_empty() {
+            check_set_name(set)?;
+        }
     }
     let game = inst.game_dir();
     std::fs::create_dir_all(&game)?;
     let mut notes = Vec::new();
-    for folder in SET_FOLDERS {
+    for &folder in Kind::ALL.iter().flat_map(|k| k.folders()) {
+        let set = Kind::of(folder).map_or("", |k| k.set_of(inst));
         let link = game.join(folder);
         let want = target(inst, folder);
         recover(&link, folder, want.is_some(), &mut notes).with_context(|| format!("finishing an interrupted change to {folder}"))?;
@@ -161,13 +220,13 @@ pub fn apply(inst: &Instance) -> anyhow::Result<Vec<String>> {
             (Some(w), None) => {
                 let shared = game.join(&w);
                 std::fs::create_dir_all(&shared)?;
-                if !lands_in_set(&shared, &inst.share_set, folder) {
+                if !lands_in_set(&shared, set, folder) {
                     bail!("{} leads outside the shared folders; left {folder} alone", shared.display());
                 }
                 match std::fs::symlink_metadata(&link) {
                     Ok(m) if m.is_dir() => {
-                        // Pack folders (unzipped packs) clash as a whole; other folders merge.
-                        let merge = folder != "resourcepacks" && folder != "shaderpacks";
+                        // Pack folders (unzipped packs) and worlds clash as a whole; schematics merge.
+                        let merge = folder == "schematics";
                         copy_through_links(&link, &mut notes).with_context(|| format!("can't share {folder}"))?;
                         move_into(&link, &shared, merge, &inst.id, &mut notes).with_context(|| format!("moving {folder} into the shared folder"))?;
                     }
@@ -449,7 +508,7 @@ mod tests {
         let notes = apply(&b).unwrap();
         assert_eq!(notes.len(), 1, "{notes:?}");
 
-        let shared = set_dir(&set).join("resourcepacks");
+        let shared = set_dir(Kind::Packs, &set).join("resourcepacks");
         let clash = format!("clash ({}).zip", b.id);
         let mut want = vec!["a.zip".to_string(), "b.zip".into(), "clash.zip".into(), clash.clone(), "same.zip".into()];
         want.sort();
@@ -471,7 +530,7 @@ mod tests {
         std::fs::remove_dir_all(b.dir()).unwrap();
         assert_eq!(names(&shared), want);
         std::fs::remove_dir_all(a.dir()).unwrap();
-        delete_set(&set).unwrap();
+        delete_set(Kind::Packs, &set).unwrap();
     }
 
     #[test]
@@ -492,7 +551,7 @@ mod tests {
         for i in [&a, &b] {
             std::fs::remove_dir_all(i.dir()).unwrap();
         }
-        delete_set(&set).unwrap();
+        delete_set(Kind::Packs, &set).unwrap();
     }
 
     #[test]
@@ -502,22 +561,22 @@ mod tests {
         let mut a = instance("a", &set, &[("resourcepacks/p.zip", "p")]);
         apply(&a).unwrap();
         // The copy out of the set fails partway, as on a full disk.
-        let pack = set_dir(&set).join("resourcepacks/p.zip");
+        let pack = set_dir(Kind::Packs, &set).join("resourcepacks/p.zip");
         std::fs::set_permissions(&pack, std::fs::Permissions::from_mode(0o000)).unwrap();
         a.share_set.clear();
         a.save().unwrap();
         assert!(apply(&a).is_err());
-        assert_eq!(sets_in_use().get(&set), Some(&vec![a.id.clone()]));
+        assert_eq!(sets_in_use(Kind::Packs).get(&set), Some(&vec![a.id.clone()]));
         // No instance names the set any more, but deleting it would take a's packs.
-        assert!(delete_set(&set).is_err());
+        assert!(delete_set(Kind::Packs, &set).is_err());
         assert!(std::fs::symlink_metadata(&pack).is_ok());
 
         // The next try finishes leaving; then the set can go.
         std::fs::set_permissions(&pack, std::fs::Permissions::from_mode(0o644)).unwrap();
         apply(&a).unwrap();
         assert_eq!(std::fs::read_to_string(a.game_dir().join("resourcepacks/p.zip")).unwrap(), "p");
-        assert!(!sets_in_use().contains_key(&set));
-        delete_set(&set).unwrap();
+        assert!(!sets_in_use(Kind::Packs).contains_key(&set));
+        delete_set(Kind::Packs, &set).unwrap();
         std::fs::remove_dir_all(a.dir()).unwrap();
     }
 
@@ -547,8 +606,8 @@ mod tests {
 
         // A set folder swapped for a link elsewhere: the right shape, the wrong place.
         let bad = set_name();
-        std::fs::create_dir_all(sets_dir()).unwrap();
-        std::os::unix::fs::symlink(&out_dir, set_dir(&bad)).unwrap();
+        std::fs::create_dir_all(sets_dir(Kind::Packs)).unwrap();
+        std::os::unix::fs::symlink(&out_dir, set_dir(Kind::Packs, &bad)).unwrap();
         let mut b = instance("b", &bad, &[("resourcepacks/mine.zip", "m")]);
         assert!(apply(&b).is_err(), "moved files into a folder outside shared/");
         assert!(b.game_dir().join("resourcepacks/mine.zip").is_file());
@@ -560,12 +619,12 @@ mod tests {
         assert!(apply(&b).is_err());
         assert!(std::fs::symlink_metadata(b.game_dir().join("resourcepacks")).unwrap().is_symlink());
 
-        std::fs::remove_file(set_dir(&bad)).unwrap();
+        std::fs::remove_file(set_dir(Kind::Packs, &bad)).unwrap();
         std::fs::remove_dir_all(out_dir).unwrap();
         for i in [&a, &b] {
             std::fs::remove_dir_all(i.dir()).unwrap();
         }
-        delete_set(&set).unwrap();
+        delete_set(Kind::Packs, &set).unwrap();
     }
 
     #[test]
@@ -614,7 +673,7 @@ mod tests {
         assert!(std::fs::symlink_metadata(&copied).is_err());
         assert_eq!(names(&link), ["s.zip"]);
         // The set itself was never touched.
-        assert_eq!(names(&set_dir(&set).join("shaderpacks")), ["s.zip"]);
+        assert_eq!(names(&set_dir(Kind::Packs, &set).join("shaderpacks")), ["s.zip"]);
 
         // A copy left behind by an instance that has since joined again is dropped.
         a.share_set = set.clone();
@@ -626,7 +685,7 @@ mod tests {
         for i in [&a, &other] {
             std::fs::remove_dir_all(i.dir()).unwrap();
         }
-        delete_set(&set).unwrap();
+        delete_set(Kind::Packs, &set).unwrap();
     }
 
     #[test]
@@ -640,7 +699,7 @@ mod tests {
         std::os::unix::fs::symlink("../../packs-elsewhere/p", game.join("resourcepacks/nested/p")).unwrap();
         let notes = apply(&a).unwrap();
         assert_eq!(notes.len(), 2, "{notes:?}");
-        let shared = set_dir(&set).join("resourcepacks");
+        let shared = set_dir(Kind::Packs, &set).join("resourcepacks");
         assert!(!std::fs::symlink_metadata(shared.join("link.zip")).unwrap().is_symlink());
         assert_eq!(std::fs::read_to_string(shared.join("link.zip")).unwrap(), "o");
         assert_eq!(std::fs::read_to_string(shared.join("nested/p/pack.mcmeta")).unwrap(), "m");
@@ -654,12 +713,55 @@ mod tests {
         assert!(err.contains("broken.zip"), "{err}");
         assert!(b.game_dir().join("shaderpacks/s.zip").is_file());
         assert!(!std::fs::symlink_metadata(b.game_dir().join("shaderpacks")).unwrap().is_symlink());
-        assert!(!set_dir(&set).join("shaderpacks/s.zip").exists());
+        assert!(!set_dir(Kind::Packs, &set).join("shaderpacks/s.zip").exists());
 
         for i in [&a, &b] {
             std::fs::remove_dir_all(i.dir()).unwrap();
         }
-        delete_set(&set).unwrap();
+        delete_set(Kind::Packs, &set).unwrap();
+    }
+
+    #[test]
+    fn world_sets_share_saves_apart_from_share_sets() {
+        let set = set_name();
+        // A pack set and a world set of the same name stay apart.
+        let mut a = instance("a", &set, &[("saves/Base/level.dat", "a"), ("saves/Clash/level.dat", "A"), ("resourcepacks/p.zip", "p")]);
+        let mut b = instance("b", "", &[("saves/Clash/level.dat", "B"), ("saves/Clash/region/r.0.0.mca", "r")]);
+        a.world_set = set.clone();
+        b.world_set = set.clone();
+        assert!(apply(&a).unwrap().is_empty());
+        let notes = apply(&b).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+
+        // Worlds clash whole, never merge: b's comes in renamed, with all its files.
+        let saves = set_dir(Kind::Worlds, &set).join("saves");
+        let clash = format!("Clash ({})", b.id);
+        assert_eq!(names(&saves), ["Base".to_string(), "Clash".into(), clash.clone()]);
+        assert_eq!(std::fs::read_to_string(saves.join("Clash/level.dat")).unwrap(), "A");
+        assert_eq!(names(&saves.join(&clash)), ["level.dat", "region"]);
+        for i in [&a, &b] {
+            assert!(is_share_link(&i.saves_dir()));
+            assert_eq!(names(&i.saves_dir()), names(&saves));
+        }
+        assert!(is_share_link(&a.game_dir().join("resourcepacks")) && set_dir(Kind::Packs, &set).join("resourcepacks/p.zip").is_file());
+        let mut users = sets_in_use(Kind::Worlds).remove(&set).unwrap();
+        users.sort();
+        let mut both = vec![a.id.clone(), b.id.clone()];
+        both.sort();
+        assert_eq!(users, both);
+        assert_eq!(sets_in_use(Kind::Packs).get(&set), Some(&vec![a.id.clone()]));
+
+        // Leaving gives b its own copy of every world in the set.
+        b.world_set.clear();
+        apply(&b).unwrap();
+        assert!(!std::fs::symlink_metadata(b.saves_dir()).unwrap().is_symlink());
+        assert_eq!(names(&b.saves_dir()), names(&saves));
+        assert!(delete_set(Kind::Worlds, &set).is_err(), "a still links in");
+        for i in [&a, &b] {
+            std::fs::remove_dir_all(i.dir()).unwrap();
+        }
+        delete_set(Kind::Worlds, &set).unwrap();
+        delete_set(Kind::Packs, &set).unwrap();
     }
 
     #[test]
@@ -671,10 +773,10 @@ mod tests {
         apply(&a).unwrap();
         assert_eq!(std::fs::read_link(a.game_dir().join("resourcepacks")).unwrap(), PathBuf::from(format!("{UP}/shared/sets/{two}/resourcepacks")));
         assert!(names(&a.game_dir().join("resourcepacks")).is_empty());
-        assert_eq!(names(&set_dir(&one).join("resourcepacks")), ["p.zip"]);
+        assert_eq!(names(&set_dir(Kind::Packs, &one).join("resourcepacks")), ["p.zip"]);
         std::fs::remove_dir_all(a.dir()).unwrap();
-        delete_set(&one).unwrap();
-        delete_set(&two).unwrap();
+        delete_set(Kind::Packs, &one).unwrap();
+        delete_set(Kind::Packs, &two).unwrap();
     }
 
     #[test]
@@ -691,7 +793,7 @@ mod tests {
         assert!(is_share_link(&a.game_dir().join("schematics")));
         std::fs::remove_dir_all(a.dir()).unwrap();
         std::fs::remove_dir_all(elsewhere).unwrap();
-        delete_set(&a2.share_set).unwrap();
+        delete_set(Kind::Packs, &a2.share_set).unwrap();
     }
 
     #[test]

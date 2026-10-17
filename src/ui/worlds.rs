@@ -59,7 +59,16 @@ impl WorldsState {
         }
         let fresh = self.fetched.is_some_and(|at| at.elapsed() < Duration::from_secs(3));
         if !fresh && self.loading.is_none() {
-            let p = Promise::spawn(rt, ctx, async move { Ok(tokio::task::spawn_blocking(move || saves::list_worlds(&saves)).await?) });
+            let p = Promise::spawn(rt, ctx, async move {
+                Ok(tokio::task::spawn_blocking(move || {
+                    let mut list = saves::list_worlds(&saves);
+                    for w in &mut list {
+                        w.played_in = crate::world_sets::read_record(&w.dir).map(|r| (r.instance, r.instance_name));
+                    }
+                    list
+                })
+                .await?)
+            });
             self.loading = Some((inst_id.to_string(), p));
         }
         self.list.as_ref().map(|(_, l)| l.as_slice())
@@ -112,6 +121,7 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
     let sel = s.selected.as_ref().and_then(|f| worlds.iter().find(|w| &w.folder == f)).cloned();
 
     let mut play = None;
+    let moving = app.sharing.is_some();
     ui.horizontal(|ui| {
         if let Some(wd) = &sel {
             if w::primary_button(ui, &t, "󰐊 play").clicked() || key(Nav::Activate) {
@@ -121,7 +131,8 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
                 s.rename = Some((wd.dir.clone(), wd.name.clone()));
             }
             // One at a time per instance, so two copies can't pick the same folder name.
-            if (w::button(ui, "duplicate").clicked() || key(Nav::Duplicate)) && !s.busy_with(&inst.id) {
+            // Not while shared folders move: the copy could land in a folder on its way out.
+            if (w::button(ui, "duplicate").clicked() || key(Nav::Duplicate)) && !s.busy_with(&inst.id) && !moving {
                 let task = Task::new("duplicate");
                 task.stage(format!("Duplicating {}", wd.name), 0);
                 let world = wd.clone();
@@ -145,6 +156,10 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if w::button(ui, "saves folder").clicked() {
                 super::open_path(&inst.saves_dir());
+            }
+            if !inst.world_set.is_empty() {
+                ui.add(egui::Label::new(RichText::new(format!("\u{f0ac} world set “{}”", inst.world_set)).color(t.muted)).truncate())
+                    .on_hover_text("these worlds are shared with the other instances in the set");
             }
         });
     });
@@ -191,6 +206,11 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
             sub.push(w::ago(wd.last_played));
             if wd.folder != wd.name {
                 sub.push(wd.folder.clone());
+            }
+            if let Some((id, name)) = &wd.played_in
+                && *id != inst.id
+            {
+                sub.push(format!("last played in {name}"));
             }
             let lead = match &wd.icon {
                 Some(p) => w::Lead::Image(egui::ImageSource::Uri(format!("file://{}", p.display()).into())),

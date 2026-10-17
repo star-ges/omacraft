@@ -22,6 +22,8 @@ pub struct World {
     pub hardcore: bool,
     pub version: Option<String>,
     pub icon: Option<PathBuf>,
+    /// (instance id, name) it was last played in, from Omacraft's record, if read.
+    pub played_in: Option<(String, String)>,
 }
 
 #[derive(Deserialize)]
@@ -83,7 +85,7 @@ pub fn list_worlds(saves: &Path) -> Vec<World> {
             ),
             None => (folder.clone(), None, "unknown", false, None),
         };
-        out.push(World { folder, dir, name, last_played, mode, hardcore, version, icon });
+        out.push(World { folder, dir, name, last_played, mode, hardcore, version, icon, played_in: None });
     }
     out.sort_by(|a, b| b.last_played.cmp(&a.last_played).then_with(|| a.name.cmp(&b.name)));
     out
