@@ -116,14 +116,22 @@ pub fn show(app: &mut App, ui: &mut Ui) {
 /// The share sets and world sets with their members.
 fn shared(app: &mut App, ui: &mut Ui) {
     let t = app.t.clone();
-    let indent = egui::Margin { left: (t.body_size() * 9.0 + 8.0) as i8, ..Default::default() };
     w::section(ui, &t, "shared folders");
     let busy = app.sharing.is_some();
     for kind in Kind::ALL {
+        let (title, glyph, what) = match kind {
+            Kind::Packs => ("share sets", "\u{f0c1}", "resource packs, shader packs and schematics"),
+            Kind::Worlds => ("world sets", "\u{f0ac}", "worlds; one minecraft version and loader per set"),
+        };
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).color(t.fg));
+            ui.add(egui::Label::new(RichText::new(format!("·  {what}")).color(t.muted)).truncate());
+        });
+        ui.add_space(2.0);
         let sets = app.all_sets(kind);
-        if kind == Kind::Worlds && !sets.is_empty() {
-            ui.add_space(6.0);
-            ui.label(RichText::new("world sets").color(t.muted).size(t.body_size() - 1.0));
+        if sets.is_empty() {
+            ui.label(RichText::new("none yet: edit an instance to pick one").color(t.muted));
         }
         for set in &sets {
             // Instances that left on paper but still link in (a leave that failed) count too.
@@ -131,8 +139,11 @@ fn shared(app: &mut App, ui: &mut Ui) {
                 .map(|(i, leaving)| if leaving { format!("{} (leaving)", i.name) } else { i.name.clone() })
                 .collect();
             ui.horizontal(|ui| {
-                w::field_label(ui, &t, set);
+                // Buttons first, right to left, so the folder button keeps its place.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if w::button(ui, "folder").clicked() {
+                        super::open_path(&shares::set_dir(kind, set));
+                    }
                     if members.is_empty() && ui.add_enabled(!busy, egui::Button::new(RichText::new("delete…").color(t.red))).clicked() {
                         let what = match kind {
                             Kind::Packs => "the packs and schematics",
@@ -145,26 +156,22 @@ fn shared(app: &mut App, ui: &mut Ui) {
                             action: super::ConfirmAction::DeleteSet(kind, set.clone()),
                         }));
                     }
-                    if w::button(ui, "folder").clicked() {
-                        super::open_path(&shares::set_dir(kind, set));
-                    }
-                    let who = if members.is_empty() { "no instances".to_string() } else { members.join(", ") };
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add(egui::Label::new(RichText::new(who).color(if members.is_empty() { t.muted } else { t.fg })).truncate());
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.add(egui::Label::new(RichText::new(format!("{glyph}  {set}")).color(t.fg_light)).truncate());
+                        let who = if members.is_empty() { "no instances".to_string() } else { members.join("  ·  ") };
+                        ui.add(egui::Label::new(RichText::new(who).color(t.muted)).truncate());
                     });
                 });
             });
+            ui.add_space(4.0);
         }
     }
-    egui::Frame::new().inner_margin(indent).show(ui, |ui| {
-        w::para(
-            ui,
-            RichText::new(
-                "Instances in the same share set (edit an instance to pick one) use one folder of resource packs, shader packs and schematics. Instances in the same world set share their worlds, and must play the same Minecraft version and loader. Joining moves the instance's files in, keeping both on a name clash; leaving gives it its own copy.",
-            )
+    ui.add_space(4.0);
+    w::para(
+        ui,
+        RichText::new("Edit an instance to pick its sets. Joining moves the instance's files in, keeping both on a name clash; leaving gives it its own copy.")
             .color(t.muted),
-        );
-    });
+    );
 }
 
 /// Rebinding: click a key to replace it, + to add one, right-click to remove.
