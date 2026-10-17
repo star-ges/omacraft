@@ -502,6 +502,7 @@ impl App {
                 }
                 Err(e) => self.toast(ToastKind::Error, format!("Shared folders: {e:#}")),
             }
+            version::after_sharing(self);
             self.refresh_shares();
             self.shots.invalidate();
             self.content.invalidate();

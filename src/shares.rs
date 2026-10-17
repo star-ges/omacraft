@@ -158,6 +158,25 @@ pub fn sets_in_use(kind: Kind) -> BTreeMap<String, Vec<String>> {
     out
 }
 
+/// The world set `inst`'s saves link into now, if they do. Lags `world_set` while a
+/// change is unfinished (say, a leave that failed).
+pub fn linked_world_set(inst: &Instance) -> Option<String> {
+    linked_set(&inst.saves_dir())
+}
+
+/// Fails if `inst`'s saves still link into a world set it isn't in (a leave or move
+/// that didn't finish): launching would play that set's worlds, maybe with another
+/// Minecraft version or loader than its members.
+pub fn check_world_link(inst: &Instance) -> anyhow::Result<()> {
+    match linked_world_set(inst) {
+        Some(set) if set != inst.world_set => bail!(
+            "{}'s saves still link into world set “{set}”, which it isn't in; it couldn't get its own copy of the worlds. Free some space or fix what the error says, then try again",
+            inst.name
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// The share set `link` points into, if it's a link to one.
 fn linked_set(link: &Path) -> Option<String> {
     link_set(link.file_name()?.to_str()?, &std::fs::read_link(link).ok()?)
@@ -597,6 +616,33 @@ mod tests {
         assert!(!sets_in_use(Kind::Packs).contains_key(&set));
         delete_set(Kind::Packs, &set).unwrap();
         std::fs::remove_dir_all(a.dir()).unwrap();
+    }
+
+    #[test]
+    fn a_failed_world_set_leave_blocks_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        let set = set_name();
+        let mut a = instance("a", "", &[("saves/W/level.dat", "w"), ("saves/W/region/r.0.0.mca", "r")]);
+        a.world_set = set.clone();
+        apply(&a).unwrap();
+        check_world_link(&a).unwrap();
+        // Leaving, the copy of a world fails, as on a full disk.
+        let region = set_dir(Kind::Worlds, &set).join("saves/W/region/r.0.0.mca");
+        std::fs::set_permissions(&region, std::fs::Permissions::from_mode(0o000)).unwrap();
+        a.world_set.clear();
+        assert!(apply(&a).is_err());
+        assert_eq!(linked_world_set(&a), Some(set.clone()));
+        assert!(check_world_link(&a).is_err(), "would launch on the set's worlds");
+        // Back in the set, it's fine; once the leave goes through, too.
+        a.world_set = set.clone();
+        check_world_link(&a).unwrap();
+        std::fs::set_permissions(&region, std::fs::Permissions::from_mode(0o644)).unwrap();
+        a.world_set.clear();
+        apply(&a).unwrap();
+        assert_eq!(linked_world_set(&a), None);
+        check_world_link(&a).unwrap();
+        std::fs::remove_dir_all(a.dir()).unwrap();
+        delete_set(Kind::Worlds, &set).unwrap();
     }
 
     #[test]

@@ -16,6 +16,16 @@ use crate::world_sets;
 pub struct VersionState {
     /// Open picker, for this instance id.
     picker: Option<(String, VersionPicker)>,
+    /// A member leaving its world set to change version, waiting on its own copy of the worlds.
+    leaving: Option<Leave>,
+}
+
+/// The version change [`after_sharing`] saves once the leave is done.
+struct Leave {
+    id: String,
+    set: String,
+    mc: String,
+    loader: Loader,
 }
 
 impl VersionState {
@@ -150,6 +160,29 @@ fn set_version(app: &mut App, ids: &[String], mc: &str, loader: &Loader) {
     }
 }
 
+/// Once shared folders have moved: save the version change of a member that left its
+/// world set, if it really left.
+pub fn after_sharing(app: &mut App) {
+    let Some(l) = app.version.leaving.take() else { return };
+    let Some(i) = app.instances.iter_mut().find(|i| i.id == l.id) else { return };
+    if leave_done(i, &l.set) {
+        set_version(app, std::slice::from_ref(&l.id), &l.mc, &l.loader);
+    } else {
+        let name = i.name.clone();
+        app.toast(ToastKind::Error, format!("{name} couldn't get its own copy of “{}”'s worlds, so it stays in the set on its old version", l.set));
+    }
+}
+
+/// Whether `inst` has left world set `set` on disk: its saves no longer link into a
+/// world set. If not, it's put back in `set`.
+fn leave_done(inst: &mut Instance, set: &str) -> bool {
+    if crate::shares::linked_world_set(inst).is_none() {
+        return true;
+    }
+    inst.world_set = set.to_string();
+    false
+}
+
 /// A world set member's version change, waiting on what to do with the rest of the set.
 pub struct SetVersion {
     id: String,
@@ -199,9 +232,11 @@ pub fn set_version_dialog(app: &mut App, s: &SetVersion, ui: &mut Ui) -> bool {
             if let Some(why) = app.instance_busy(&s.id).map(String::from).or_else(|| app.set_busy(Kind::Worlds, &s.set, &s.id)) {
                 app.toast(ToastKind::Error, format!("Can't leave “{}” while {why}", s.set));
             } else if let Some(i) = app.instances.iter_mut().find(|i| i.id == s.id) {
+                // Nothing is saved until the copy is made: a failed leave keeps it in the
+                // set on its old version, never the new version on the set's worlds.
                 i.world_set.clear();
                 let i = i.clone();
-                set_version(app, std::slice::from_ref(&s.id), &s.mc, &s.loader);
+                app.version.leaving = Some(Leave { id: s.id.clone(), set: s.set.clone(), mc: s.mc.clone(), loader: s.loader.clone() });
                 app.start_sharing(ui.ctx(), vec![i]);
             }
             done = true;
@@ -211,5 +246,30 @@ pub fn set_version_dialog(app: &mut App, s: &SetVersion, ui: &mut Ui) -> bool {
         }
     });
     done
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_leave_keeps_the_member_in_its_set() {
+        let set = format!("set {}", uuid::Uuid::new_v4().simple());
+        let mut a = Instance::new("leaver", "1.21.1", Loader::Vanilla);
+        a.world_set = set.clone();
+        a.assign_id().unwrap();
+        crate::shares::apply(&a).unwrap();
+        // The leave's copy didn't happen: saves still link into the set.
+        a.world_set.clear();
+        assert!(!leave_done(&mut a, &set));
+        assert_eq!(a.world_set, set, "put back in the set it couldn't leave");
+        // Once it has its own saves, the leave counts and the version can change.
+        a.world_set.clear();
+        crate::shares::apply(&a).unwrap();
+        assert!(leave_done(&mut a, &set));
+        assert!(a.world_set.is_empty());
+        std::fs::remove_dir_all(a.dir()).unwrap();
+        crate::shares::delete_set(Kind::Worlds, &set).unwrap();
+    }
 }
 

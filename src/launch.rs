@@ -573,6 +573,13 @@ async fn start(
     // changed while this one was running. A failure here shouldn't stop the game.
     let i = inst.clone();
     let shared = tokio::task::spawn_blocking(move || crate::shares::apply(&i)).await?;
+    // Other shared folders may lag, but never play a world set's worlds from outside it.
+    if let Err(e) = crate::shares::check_world_link(inst) {
+        return Err(match &shared {
+            Err(why) => anyhow::anyhow!("{e:#} (shared folders: {why:#})"),
+            Ok(_) => e,
+        });
+    }
     // A restore or mod rollback a crash cut short is finished first, so no world or
     // mods folder is missing when the game starts.
     let i = inst.clone();
