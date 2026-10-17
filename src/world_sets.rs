@@ -2,7 +2,8 @@
 //!
 //! - Every instance in a world set plays the same Minecraft version with the same
 //!   loader ([`same_game`]); the UI asks before one changes on its own.
-//! - When the game exits, each world it played gets an `omacraft.toml` ([`Record`]):
+//! - When the game exits, each world it played gets an `omacraft.toml` ([`Record`]) of
+//!   what it was started with ([`Loadout`]):
 //!   the instance, Minecraft version, loader and mods (id → version, read from the jars;
 //!   Fabric and Quilt worlds don't list their mods anywhere else).
 //! - Before launch, every world is checked against the instance's mods ([`check`]):
@@ -11,7 +12,7 @@
 //!   nothing blocks the launch: content mods can't be told from client-side ones.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -172,27 +173,56 @@ pub fn read_record(world: &Path) -> Option<Record> {
     toml::from_str(&String::from_utf8_lossy(&bytes)).ok()
 }
 
-/// Note in each world that `inst` just played it.
-pub fn write_records(inst: &Instance, worlds: &[PathBuf]) -> Vec<String> {
-    if worlds.is_empty() {
-        return Vec::new();
+/// What a game was started with, taken as it starts and kept for the records written
+/// when it exits: by then the mods folder may hold something else.
+#[derive(Debug, Clone)]
+pub struct Loadout {
+    instance: String,
+    instance_name: String,
+    mc_version: String,
+    loader: Loader,
+    mods: BTreeMap<String, String>,
+}
+
+impl Loadout {
+    /// Reads every enabled jar: run it off the UI thread.
+    pub fn of(inst: &Instance) -> Self {
+        Self { instance: inst.id.clone(), instance_name: inst.name.clone(), mc_version: inst.mc_version.clone(), loader: inst.loader.clone(), mods: mods(inst) }
     }
-    let rec = Record {
-        instance: inst.id.clone(),
-        instance_name: inst.name.clone(),
-        mc_version: inst.mc_version.clone(),
-        played: Utc::now(),
-        loader: inst.loader.clone(),
-        mods: mods(inst),
-    };
-    let text = match toml::to_string_pretty(&rec) {
-        Ok(t) => t,
-        Err(e) => return vec![format!("couldn't record what the worlds were played with: {e}")],
-    };
-    worlds
-        .iter()
-        .filter_map(|w| fsutil::write_atomic(&w.join(RECORD), text.as_bytes(), 0o644).err().map(|e| format!("couldn't write {}: {e}", w.join(RECORD).display())))
-        .collect()
+}
+
+/// Note in each world that `inst`, with its mods as they are now, just played it.
+#[cfg(test)]
+pub fn write_records(inst: &Instance, worlds: &[PathBuf]) -> Vec<String> {
+    let now = Utc::now();
+    record_plays(&Loadout::of(inst), &worlds.iter().map(|w| (w.clone(), now)).collect::<Vec<_>>())
+}
+
+/// Note in each world that a game started with `loadout` played it, as of the time
+/// given (the last sign of that play, not the game's exit). A record of a later play,
+/// by another game, is kept. Returns what went wrong or was kept, for the log.
+pub fn record_plays(loadout: &Loadout, plays: &[(PathBuf, DateTime<Utc>)]) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (w, played) in plays {
+        if let Some(had) = read_record(w).filter(|r| r.played > *played) {
+            let name = w.file_name().unwrap_or_default().to_string_lossy();
+            notes.push(format!("kept the record of “{name}” from {}, played later in {}", had.played.format("%Y-%m-%d %H:%M:%S"), had.instance_name));
+            continue;
+        }
+        let rec = Record {
+            instance: loadout.instance.clone(),
+            instance_name: loadout.instance_name.clone(),
+            mc_version: loadout.mc_version.clone(),
+            played: *played,
+            loader: loadout.loader.clone(),
+            mods: loadout.mods.clone(),
+        };
+        let written = toml::to_string_pretty(&rec).map_err(anyhow::Error::from).and_then(|t| Ok(fsutil::write_atomic(&w.join(RECORD), t.as_bytes(), 0o644)?));
+        if let Err(e) = written {
+            notes.push(format!("couldn't write {}: {e:#}", w.join(RECORD).display()));
+        }
+    }
+    notes
 }
 
 /// Who holds the world's `session.lock` (Minecraft locks it while the world is open):
@@ -209,37 +239,56 @@ pub fn lock_holder(world: &Path) -> Option<i32> {
     (fl.l_type != libc::F_UNLCK as libc::c_short).then_some(fl.l_pid)
 }
 
-/// Works out which worlds a game played, for [`write_records`]. Watch it while it
-/// runs: a world whose lock this game held is its own. Others in a shared `saves`
-/// may be open in another game at the same time, so a world only counts on its
-/// `level.dat` changing if no other game was seen holding it.
+/// Works out which worlds a game played, and when, for [`record_plays`]. Watch it
+/// while it runs: a world whose lock this game held is its own, until another game is
+/// seen holding it (that game played it last). Others in a shared `saves` may be open
+/// in another game at the same time, so a world only counts on its `level.dat`
+/// changing if no other game was seen holding it.
 pub struct PlayWatch {
     saves: PathBuf,
     pid: i32,
     started: SystemTime,
-    mine: HashSet<PathBuf>,
+    /// World → when this game was last seen holding it, with no other game since.
+    mine: HashMap<PathBuf, SystemTime>,
     others: HashSet<PathBuf>,
 }
 
 impl PlayWatch {
     pub fn new(saves: PathBuf, pid: u32) -> Self {
-        Self { saves, pid: pid as i32, started: SystemTime::now(), mine: HashSet::new(), others: HashSet::new() }
+        Self { saves, pid: pid as i32, started: SystemTime::now(), mine: HashMap::new(), others: HashSet::new() }
     }
 
     pub fn look(&mut self) {
+        let now = SystemTime::now();
         for w in world_dirs(&self.saves) {
             match lock_holder(&w) {
-                Some(p) if p == self.pid => self.mine.insert(w),
-                Some(_) => self.others.insert(w),
-                None => false,
-            };
+                Some(p) if p == self.pid => {
+                    self.mine.insert(w, now);
+                }
+                Some(_) => {
+                    self.mine.remove(&w);
+                    self.others.insert(w);
+                }
+                None => {}
+            }
         }
     }
 
-    /// The worlds played, once the game has exited.
-    pub fn played(self) -> Vec<PathBuf> {
-        let changed = |w: &PathBuf| std::fs::metadata(w.join("level.dat")).and_then(|m| m.modified()).is_ok_and(|t| t >= self.started);
-        let mut out: Vec<PathBuf> = world_dirs(&self.saves).into_iter().filter(|w| self.mine.contains(w) || (!self.others.contains(w) && changed(w))).collect();
+    /// The worlds played, once the game has exited, each with the last sign of play:
+    /// when this game was last seen holding it, or when its `level.dat` changed.
+    pub fn played(self) -> Vec<(PathBuf, DateTime<Utc>)> {
+        let changed = |w: &PathBuf| std::fs::metadata(w.join("level.dat")).and_then(|m| m.modified()).ok().filter(|t| *t >= self.started);
+        let mut out: Vec<(PathBuf, DateTime<Utc>)> = world_dirs(&self.saves)
+            .into_iter()
+            .filter_map(|w| {
+                let when = match self.mine.get(&w) {
+                    Some(t) => *t,
+                    None if !self.others.contains(&w) => changed(&w)?,
+                    None => return None,
+                };
+                Some((w, when.into()))
+            })
+            .collect();
         out.sort();
         out
     }
@@ -619,9 +668,69 @@ mod tests {
         std::fs::write(mine.join("level.dat"), "x").unwrap();
         std::fs::write(theirs.join("level.dat"), "x").unwrap();
         let fresh = world(&saves, "Fresh");
-        assert_eq!(watch.played(), [fresh, mine]);
+        let played: Vec<PathBuf> = watch.played().into_iter().map(|(w, _)| w).collect();
+        assert_eq!(played, [fresh, mine]);
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn a_world_another_game_played_after_this_one_is_not_this_ones() {
+        let root = crate::paths::test_root().join(format!("later-{}", uuid::Uuid::new_v4().simple()));
+        let saves = root.join("saves");
+        let w = world(&saves, "Shared");
+
+        // Game A plays the world and goes back to the title screen…
+        let a = Holder::lock(&w);
+        let mut watch = PlayWatch::new(saves.clone(), a.pid() as u32);
+        watch.look();
+        drop(a);
+        // …then game B opens the shared world, and A is still running when it's seen.
+        let b = Holder::lock(&w);
+        watch.look();
+        drop(b);
+        std::fs::write(w.join("level.dat"), "x").unwrap();
+        assert!(watch.played().is_empty(), "B played it last, so A's exit records nothing for it");
+
+        // A record can't be replaced by one of an earlier play, whoever writes last.
+        let mut inst = Instance::new("later", "1.21.1", Loader::Fabric("0.16.5".into()));
+        inst.assign_id().unwrap();
+        fabric_jar(&inst, "create.jar", "create", "2.0");
+        let newer = Loadout::of(&inst);
+        fabric_jar(&inst, "create.jar", "create", "1.0");
+        let older = Loadout::of(&inst);
+        let t = Utc::now();
+        assert!(record_plays(&newer, &[(w.clone(), t)]).is_empty());
+        let notes = record_plays(&older, &[(w.clone(), t - chrono::Duration::seconds(30))]);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(read_record(&w).unwrap().mods["create"], "2.0");
+        assert_eq!(read_record(&w).unwrap().played, t);
+        // A later play does replace it.
+        assert!(record_plays(&older, &[(w.clone(), t + chrono::Duration::seconds(30))]).is_empty());
+        assert_eq!(read_record(&w).unwrap().mods["create"], "1.0");
+
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn records_name_the_mods_the_game_started_with() {
+        let mut inst = Instance::new("loadout", "1.21.1", Loader::Fabric("0.16.5".into()));
+        inst.assign_id().unwrap();
+        fabric_jar(&inst, "create.jar", "create", "6.0.0");
+        fabric_jar(&inst, "sodium.jar", "sodium", "0.6.0");
+        let w = world(&inst.saves_dir(), "Base");
+        // Taken as the game starts; the content mod is disabled while it plays.
+        let loadout = Loadout::of(&inst);
+        let dir = inst.game_dir().join("mods");
+        std::fs::rename(dir.join("create.jar"), dir.join("create.jar.disabled")).unwrap();
+        assert!(record_plays(&loadout, &[(w.clone(), Utc::now())]).is_empty());
+        let rec = read_record(&w).unwrap();
+        assert_eq!(rec.mods.keys().collect::<Vec<_>>(), ["create", "sodium"]);
+        // So the next launch, without it, is warned.
+        assert_eq!(drift(&rec, &inst.mc_version, &mods(&inst)).missing, ["create"]);
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+    }
+
 
     /// A child process holding a POSIX write lock on a world's session.lock until dropped:
     /// this test binary again, running [`hold_lock_helper`].

@@ -653,6 +653,12 @@ pub async fn launch(
     log.lock().unwrap().pid = child.id();
     task.finish(&Ok(()));
     let started = Instant::now();
+    // The mods the game loads, read as it starts: the records written when it exits
+    // describe these, not whatever the mods folder holds by then.
+    let loadout = {
+        let i = inst.clone();
+        tokio::task::spawn_blocking(move || crate::world_sets::Loadout::of(&i))
+    };
 
     let pump = |r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, stderr: bool, log: SharedLog| {
         tokio::spawn(async move {
@@ -681,9 +687,11 @@ pub async fn launch(
     };
     let _ = tokio::join!(a, b);
     let (i, keep) = (inst.clone(), cfg.backups_keep);
+    let loadout = loadout.await.ok();
     let (played, failed) = tokio::task::spawn_blocking(move || {
-        let played = watch.played();
-        let mut failed = crate::world_sets::write_records(&i, &played);
+        let plays = watch.played();
+        let mut failed = crate::world_sets::record_plays(&loadout.unwrap_or_else(|| crate::world_sets::Loadout::of(&i)), &plays);
+        let played: Vec<std::path::PathBuf> = plays.into_iter().map(|(w, _)| w).collect();
         for w in &played {
             failed.extend(crate::backups::after_play(w, crate::backups::Owner::of(&i), &i.name, keep));
         }
