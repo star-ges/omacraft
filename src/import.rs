@@ -596,7 +596,7 @@ async fn import_mrpack(task: &Task, zip_path: PathBuf) -> anyhow::Result<(Instan
         for d in &mut downloads {
             d.path = game.join(&d.path);
         }
-        net::download_all(&task, "Downloading pack files", downloads, 8).await?;
+        net::fetch_all(&task, "Downloading pack files", downloads, 8, async |d| crate::store::fetch(&d).await).await?;
         let t = task.clone();
         tokio::task::spawn_blocking(move || {
             let mut zip = zip::ZipArchive::new(std::fs::File::open(&zip_path)?)?;

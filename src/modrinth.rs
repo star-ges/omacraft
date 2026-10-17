@@ -9,6 +9,7 @@ use serde::Deserialize;
 use crate::content_meta;
 use crate::instance::{ContentKind, Instance};
 use crate::net::{self, Download};
+use crate::store;
 
 const API: &str = "https://api.modrinth.com/v2";
 
@@ -277,7 +278,7 @@ pub async fn install(kind: ContentKind, project: &str, inst: &Instance) -> anyho
     for v in &plan {
         let file = v.files.iter().find(|f| f.primary).or(v.files.first()).context("version has no files")?;
         if !existing.contains(&file.filename) {
-            net::download(&Download {
+            store::fetch(&Download {
                 url: file.url.clone(),
                 path: dir.join(&file.filename),
                 sha1: Some(file.hashes.sha1.clone()),

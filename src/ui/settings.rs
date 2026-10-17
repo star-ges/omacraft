@@ -87,6 +87,19 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 if w::button(ui, "open data folder").clicked() {
                     super::open_path(&paths::data_dir());
                 }
+                let running = app.reclaim.is_some();
+                if ui.add_enabled(!running, egui::Button::new(if running { "reclaiming…" } else { "reclaim disk space" })).clicked() {
+                    app.start_reclaim(ui.ctx());
+                }
+            });
+            egui::Frame::new().inner_margin(egui::Margin { left: (t.body_size() * 9.0 + 8.0) as i8, ..Default::default() }).show(ui, |ui| {
+                w::para(
+                    ui,
+                    RichText::new(
+                        "Mods and packs are downloaded once and shared between instances on btrfs or xfs. Reclaim merges identical files that came in another way (imports, jars added by hand) and clears cached downloads no instance uses.",
+                    )
+                    .color(t.muted),
+                );
             });
 
             if changed && let Err(e) = app.cfg.save() {

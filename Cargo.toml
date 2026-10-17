@@ -18,6 +18,7 @@ flate2 = "1.1.10"
 futures = "0.3.34"
 hex = "0.4.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+libc = "0.2.190"
 md-5 = "0.11.0"
 percent-encoding = "2.3.2"
 reflink-copy = "0.1.30"

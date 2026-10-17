@@ -153,6 +153,8 @@ pub struct App {
     imports: Vec<(Task, Promise<crate::import::Imported>)>,
     /// (task, result, instance id)
     exports: Vec<(Task, Promise<crate::export::Exported>, String)>,
+    /// Settings → reclaim disk space, while it runs.
+    pub reclaim: Option<(Task, Promise<crate::store::Reclaimed>)>,
     /// "new group" text in the instance context menu.
     pub group_buf: String,
     pub toasts: Vec<Toast>,
@@ -205,6 +207,7 @@ impl App {
             acct: Default::default(),
             imports: Vec::new(),
             exports: Vec::new(),
+            reclaim: None,
             group_buf: String::new(),
             toasts: Vec::new(),
         };
@@ -437,6 +440,15 @@ impl App {
             }
         }
 
+        if let Some((task, p)) = self.reclaim.take_if(|(_, p)| p.ready()) {
+            let r = p.take().unwrap();
+            task.finish(&r.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
+            match r {
+                Ok(done) => self.toast(ToastKind::Info, done.summary()),
+                Err(e) => self.toast(ToastKind::Error, format!("Couldn't reclaim space: {e:#}")),
+            }
+        }
+
         let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.worlds.dups).into_iter().partition(|(_, p, _)| p.ready());
         self.worlds.dups = running;
         for (task, p, id) in done {
@@ -461,6 +473,14 @@ impl App {
         let id = req.inst.id.clone();
         let p = Promise::spawn(&self.rt, ctx, crate::export::export(task.clone(), req));
         self.exports.push((task, p, id));
+    }
+
+    pub fn start_reclaim(&mut self, ctx: &egui::Context) {
+        if self.reclaim.is_none() {
+            let task = Task::new("reclaim");
+            let p = Promise::spawn(&self.rt, ctx, crate::store::reclaim(task.clone()));
+            self.reclaim = Some((task, p));
+        }
     }
 
     pub fn start_import(&mut self, ctx: &egui::Context, req: crate::import::Request) {
@@ -548,6 +568,7 @@ impl App {
                             .chain(self.imports.iter().map(|(t, _)| t))
                             .chain(self.exports.iter().map(|(t, ..)| t))
                             .chain(self.worlds.tasks())
+                            .chain(self.reclaim.iter().map(|(t, _)| t))
                             .find(|t| t.status() == TaskStatus::Running)
                             .cloned();
                         if let Some(task) = task {

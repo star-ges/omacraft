@@ -2821,6 +2821,7 @@ dependencies = [
  "futures",
  "hex",
  "image",
+ "libc",
  "md-5",
  "percent-encoding",
  "reflink-copy",

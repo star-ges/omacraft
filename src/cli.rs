@@ -5,6 +5,7 @@
 //!   omacraft mod add <instance> <modrinth-slug>
 //!   omacraft import <zip|mrpack|folder|url>
 //!   omacraft export <instance> <file.zip|file.mrpack>
+//!   omacraft reclaim
 //!   omacraft theme
 
 use std::io::IsTerminal;
@@ -21,7 +22,7 @@ use crate::loaders::{self, Loader, LoaderKind};
 use crate::task::{Task, TaskStatus};
 use crate::theme::Theme;
 
-const USAGE: &str = "usage: omacraft [list | launch <instance> | create <name> <version> [fabric|quilt|forge|neoforge] | mod add <instance> <slug> | import <file|folder|url> | export <instance> <file.zip|file.mrpack> | theme]";
+const USAGE: &str = "usage: omacraft [list | launch <instance> | create <name> <version> [fabric|quilt|forge|neoforge] | mod add <instance> <slug> | import <file|folder|url> | export <instance> <file.zip|file.mrpack> | reclaim | theme]";
 
 pub async fn run(args: Vec<String>) -> i32 {
     let r = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
@@ -32,6 +33,7 @@ pub async fn run(args: Vec<String>) -> i32 {
         ["mod", "add", id, slug] => add_mod(id, slug).await,
         ["import", source] => import(source).await,
         ["export", id, dest] => export(id, dest).await,
+        ["reclaim"] => reclaim().await,
         ["theme"] => {
             println!("{:#?}", Theme::load());
             Ok(())
@@ -170,6 +172,23 @@ async fn import(source: &str) -> anyhow::Result<()> {
         eprintln!("warning: {w}");
     }
     println!("imported {} ({}, {}) as {}", inst.name, inst.mc_version, inst.loader.display(), inst.id);
+    Ok(())
+}
+
+/// Merge identical mods and packs across instances, and clear unused cached downloads.
+async fn reclaim() -> anyhow::Result<()> {
+    let task = Task::new("reclaim");
+    let fut = tokio::spawn(crate::store::reclaim(task.clone()));
+    let mut last = String::new();
+    while !fut.is_finished() {
+        let stage = task.stage_text();
+        if stage != last {
+            eprintln!("{stage}");
+            last = stage;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    println!("{}", fut.await??.summary());
     Ok(())
 }
 

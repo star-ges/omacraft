@@ -18,6 +18,7 @@ mod net;
 mod paths;
 mod saves;
 mod skins;
+mod store;
 mod task;
 mod theme;
 mod ui;

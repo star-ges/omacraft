@@ -52,6 +52,9 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
 - **Import**: Prism, PolyMC and MultiMC instances (found automatically, or from a `.zip` or folder)
   and Modrinth packs (a `.mrpack` or a modrinth.com modpack link). Drop a file on the window to import
   it. On btrfs, even huge instances import instantly.
+- **Disk dedup**: each mod and pack is downloaded once. On btrfs or xfs, every instance gets its own
+  copy, but the bytes are stored only once. **settings → reclaim disk space** merges identical files that
+  came in another way (imports, jars added by hand) and clears cached downloads no instance uses.
 - **Export**: a Modrinth pack (`.mrpack`) or an instance zip that Prism, PolyMC and MultiMC open.
   You choose which folders go in.
 - **Per-instance tabs**: version and loader, live game log, mods, resource packs, shader packs, notes,
@@ -77,6 +80,7 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
   omacraft mod add <instance> <modrinth-slug>
   omacraft import <zip|mrpack|folder|url>
   omacraft export <instance> <file.zip|file.mrpack>
+  omacraft reclaim              # merge duplicate mods/packs across instances
   omacraft theme
   ```
 

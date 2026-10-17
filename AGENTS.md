@@ -15,7 +15,7 @@ install -Dm755 target/release/omacraft ~/.local/bin/omacraft    # check `pgrep o
 cargo test                                                      # unit tests
 OMACRAFT_FIXTURE=<copy of a .minecraft> cargo test              # + NBT round-trips on real saves
 cargo test -- --ignored                                         # + network tests (Modrinth)
-omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | theme   # CLI, handy for checks
+omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim | theme   # CLI, handy for checks
 ```
 
 - **Style:** don't run `cargo fmt`; the code uses longer lines than rustfmt's defaults. Match the
@@ -41,6 +41,7 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | theme   
 | `export.rs` | Instance zip (MultiMC format) or `.mrpack` (Modrinth-hosted files via `content_meta::hosted`, rest in `overrides/`) |
 | `saves.rs` | `level.dat` and `servers.dat` via fastnbt `Value` (round-trips unknown fields) |
 | `keymap.rs` | Every action, default chords, scopes, parse/label, conflict detection |
+| `store.rs` | Content store: Modrinth installs and `.mrpack` files go through `cache/content/<sha1>` and are reflinked into instances; `reclaim` merges duplicates (`FIDEDUPERANGE`) and prunes the store |
 | `icons.rs`, `fsutil.rs`, `net.rs`, `task.rs` | Instance icons, reflink copy, HTTP + downloads, background `Task`/`Promise` |
 | `ui/mod.rs` | `App`, top/status bars, modals, key routing, launching, imports |
 | `ui/nav.rs` | Focus zones, `Nav`, hints bar and `?` help, both built from the keymap |
@@ -107,6 +108,10 @@ test (and a rule here) with any fix that sets a new one.
   `.mrpack` and imports both back offline. Files (incl. empty folders) must match, minus personal ones. The zip
   must keep everything `instance.cfg` carries (not the Java path) plus the custom icon; the mrpack keeps name,
   version, loader and notes (as `summary`). Add new portable metadata to that test.
+- **Content store:** instances never link to `cache/content`: they get reflinked copies (or the download is
+  moved in on filesystems without reflinks), so every instance file is independent. `reclaim` merges only
+  through the kernel's dedupe ioctl, which compares the bytes first, and deletes only store entries no instance
+  file matches. Tests: `store::tests` (run with `TMPDIR` on btrfs to cover the reflink path, since `/tmp` is tmpfs).
 - **Saving:** write config/state files with `fsutil::write_atomic` (unique temp + rename; accounts at 0600).
 
 ## Testing the GUI safely

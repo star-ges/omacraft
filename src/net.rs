@@ -179,6 +179,11 @@ fn dedupe(items: Vec<Download>) -> anyhow::Result<Vec<Download>> {
 
 /// Download everything missing, `parallel` at a time, ticking the task.
 pub async fn download_all(task: &Task, label: &str, items: Vec<Download>, parallel: usize) -> anyhow::Result<()> {
+    fetch_all(task, label, items, parallel, async |d| download(&d).await).await
+}
+
+/// `download_all` with another way to fetch each file (e.g. `store::fetch`).
+pub async fn fetch_all(task: &Task, label: &str, items: Vec<Download>, parallel: usize, fetch: impl AsyncFn(Download) -> anyhow::Result<()>) -> anyhow::Result<()> {
     let items = dedupe(items)?;
     let missing: Vec<Download> = tokio::task::spawn_blocking(move || {
         items.into_iter().filter(|d| !d.is_satisfied()).collect()
@@ -189,8 +194,8 @@ pub async fn download_all(task: &Task, label: &str, items: Vec<Download>, parall
     }
     task.stage(format!("{label} ({})", missing.len()), missing.len() as u64);
     let results: Vec<anyhow::Result<()>> = futures::stream::iter(missing)
-        .map(|d| async move {
-            let r = download(&d).await;
+        .map(|d| async {
+            let r = fetch(d).await;
             task.inc(1);
             r
         })
