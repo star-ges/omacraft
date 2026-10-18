@@ -808,6 +808,11 @@ impl App {
             self.capture_key(ctx, target);
             return;
         }
+        if self.config.capture.is_some() {
+            config::capture(self, ctx);
+            ctx.request_repaint();
+            return;
+        }
         let km = self.keymap.clone();
         if km.take(ctx, &[Quit]).is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -828,7 +833,7 @@ impl App {
         let mut cands = vec![Help, TabInstances, TabAccounts, TabSettings, Play, New, Import, Export, Groups];
         match self.tab {
             Tab::Instances => {
-                cands.extend([FocusLeft, FocusRight, PrevTab, NextTab, Back, ModsTab, LoaderType, Update, UpdateOne, RollBack, Why, ModSets, FindBreaking, SaveConfig, RawConfig]);
+                cands.extend([FocusLeft, FocusRight, PrevTab, NextTab, Back, ModsTab, ChangeIcon, LoaderType, Update, UpdateOne, RollBack, Why, ModSets, FindBreaking, SaveConfig, RawConfig, ConfigArea]);
                 cands.extend(nav::PANE_ACTIONS);
             }
             Tab::Accounts => cands.extend([Microsoft, Down, Up, Top, Bottom, Activate, Delete, Add, TurnLeft, TurnRight, UploadSkin, Toggle, Cycle, Back]),
@@ -870,6 +875,11 @@ impl App {
             Action::PrevTab => self.inst_tab = self.inst_tab.step(-1),
             Action::NextTab => self.inst_tab = self.inst_tab.step(1),
             Action::ModsTab => self.inst_tab = InstTab::Mods,
+            Action::ChangeIcon => {
+                if let Some(id) = self.selected.clone() {
+                    self.modal = Some(Modal::IconPicker(Box::new(icon_picker::IconPicker::new(id))));
+                }
+            }
             Action::LoaderType => {
                 if self.inst_tab == InstTab::Version {
                     self.version.cycle_loader();
@@ -890,7 +900,7 @@ impl App {
                     mod_sets::key(self, &id);
                 }
             }
-            Action::SaveConfig | Action::RawConfig => {
+            Action::SaveConfig | Action::RawConfig | Action::ConfigArea => {
                 if self.inst_tab == InstTab::Config {
                     self.config.key = Some(a);
                 }
@@ -946,7 +956,6 @@ impl App {
             Nav::Folder => open_path(&inst.game_dir()),
             Nav::Delete => self.confirm_delete_instance(&inst.id),
             Nav::Search => self.focus_filter = true,
-            Nav::Cycle => self.modal = Some(Modal::IconPicker(Box::new(icon_picker::IconPicker::new(inst.id.clone())))),
             _ => {}
         }
     }

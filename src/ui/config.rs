@@ -1,9 +1,10 @@
-//! The config tab: an instance's mod configs, grouped by the mod they belong to, edited
-//! as fields (TOML, JSON, JSON5) or as text. Saving writes back only what changed
-//! (see `mod_config`), and never over a file the game rewrote meanwhile without asking.
+//! The configs tab, in three parts: Minecraft's own settings (`options.txt`), the mods'
+//! configs (grouped by the mod they belong to, TOML/JSON/JSON5 as fields, the rest as text)
+//! and shader packs' options. Saving writes back only what changed (see `mod_config`), and
+//! never over a file the game rewrote meanwhile without asking.
 
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,7 @@ use super::{App, Confirm, ConfirmAction, Modal, Tab, ToastKind};
 use crate::instance::Instance;
 use crate::keymap::Action;
 use crate::mod_config::{self as mc, Doc, Field, Format, Group, ModInfo, Scalar, Value};
+use crate::{fsutil, paths, shader_config};
 use crate::task::Promise;
 use crate::theme::{self, Theme};
 
@@ -32,13 +34,16 @@ const HIGHLIGHT_MAX: usize = 200_000;
 struct Listing {
     inst_id: String,
     groups: Vec<Group>,
+    packs: Vec<shader_config::Pack>,
+    /// Which shader mod picks the pack in use, if any.
+    switch: Option<shader_config::Switch>,
     at: Instant,
 }
 
 #[derive(Default)]
 pub struct ConfigState {
     listing: Option<Listing>,
-    listing_p: Option<(String, Promise<Vec<Group>>)>,
+    listing_p: Option<(String, Promise<(Vec<Group>, Vec<shader_config::Pack>, Option<shader_config::Switch>)>)>,
     /// Jars already read for their names, kept between listings.
     mods: Arc<Mutex<HashMap<String, ModInfo>>>,
     /// Relative to `config/`.
@@ -50,18 +55,183 @@ pub struct ConfigState {
     field_sel: Option<String>,
     scroll_field: bool,
     pub open: Option<Open>,
-    loading: Option<(String, PathBuf, Promise<mc::Loaded>)>,
-    load_error: Option<(PathBuf, String)>,
+    loading: Option<(String, Area, PathBuf, Promise<mc::Loaded>)>,
+    load_error: Option<(Area, PathBuf, String)>,
     /// Save or text/fields, routed here by the app (save also works while typing).
     pub key: Option<Action>,
     checked: Option<Instant>,
     /// Long lists the user unfolded, by [`field_id`].
     unfolded: HashSet<String>,
+    /// File groups and settings headers that are open (all start folded), as left last time: see [`fold_key`].
+    folds: Option<BTreeSet<String>>,
+    /// Where the keyboard is in the file list: a group's heading or a file.
+    cursor: Option<Item>,
+    /// Which part of the tab is showing.
+    pub area: Area,
+    /// The shader packs, read with the file list.
+    packs: Vec<shader_config::Pack>,
+    /// A key binding waiting for its key (by [`field_id`]); the app sends key presses here meanwhile.
+    pub capture: Option<String>,
+    /// Modifiers held when the capture began, so a newly pressed shift, ctrl or alt can be told apart.
+    capture_mods: Option<egui::Modifiers>,
+    /// A captured binding, to apply: (field, `key.keyboard.…`).
+    captured: Option<(String, String)>,
+    /// When the last capture ended: the click that ended it mustn't start another.
+    capture_ended: Option<Instant>,
+}
+
+/// The configs tab's three parts.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum Area {
+    #[default]
+    Minecraft,
+    Mods,
+    Shaders,
+}
+
+impl Area {
+    const ALL: [(Area, &'static str); 3] = [(Area::Minecraft, "minecraft"), (Area::Mods, "mods"), (Area::Shaders, "shaders")];
+
+    fn key(self) -> &'static str {
+        match self {
+            Area::Minecraft => "minecraft",
+            Area::Mods => "mods",
+            Area::Shaders => "shaders",
+        }
+    }
+
+    fn next(self) -> Area {
+        match self {
+            Area::Minecraft => Area::Mods,
+            Area::Mods => Area::Shaders,
+            Area::Shaders => Area::Minecraft,
+        }
+    }
+}
+
+/// Minecraft's own settings file, in the game folder.
+const OPTIONS: &str = "options.txt";
+
+/// A line of the file list.
+#[derive(Clone, PartialEq)]
+enum Item {
+    Group(String),
+    File(PathBuf),
+}
+
+/// Open file groups and settings headers, kept between runs.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Folds {
+    #[serde(default)]
+    open: BTreeSet<String>,
+}
+
+fn folds_path() -> PathBuf {
+    paths::data_dir().join("config-view.toml")
+}
+
+/// The key a fold is remembered by: the instance, then the group's name or the file and its header.
+fn fold_key(inst_id: &str, parts: &[&str]) -> String {
+    std::iter::once(inst_id).chain(parts.iter().copied()).collect::<Vec<_>>().join("\u{1f}")
+}
+
+impl ConfigState {
+    fn folds(&mut self) -> &mut BTreeSet<String> {
+        self.folds.get_or_insert_with(|| std::fs::read_to_string(folds_path()).ok().and_then(|t| toml::from_str::<Folds>(&t).ok()).unwrap_or_default().open)
+    }
+
+    fn is_open(&mut self, key: &str) -> bool {
+        self.folds().contains(key)
+    }
+
+    /// Open or fold `key`, and remember it.
+    fn set_open(&mut self, key: String, open: bool) {
+        let f = self.folds();
+        let changed = if open { f.insert(key) } else { f.remove(&key) };
+        if changed && let Ok(text) = toml::to_string(&Folds { open: f.clone() }) {
+            let _ = fsutil::write_atomic(&folds_path(), text.as_bytes(), 0o644);
+        }
+    }
+
+    /// Read `inst`'s config files in the background, now and then, while a tab needs them.
+    fn refresh(&mut self, inst: &Instance, rt: &tokio::runtime::Handle, ctx: &egui::Context) {
+        if self.listing.as_ref().is_some_and(|l| l.inst_id != inst.id) {
+            self.listing = None;
+            self.selected = None;
+            self.cursor = None;
+            self.file_filter.clear();
+            self.field_filter.clear();
+            self.field_sel = None;
+        }
+        if let Some((id, p)) = &self.listing_p
+            && let Some(r) = p.take()
+        {
+            if *id == inst.id {
+                let (groups, packs, switch) = r.unwrap_or_default();
+                self.packs = packs.clone();
+                self.listing = Some(Listing { inst_id: id.clone(), groups, packs, switch, at: Instant::now() });
+                // A file that couldn't be opened gets another try with each fresh listing.
+                self.load_error = None;
+            }
+            self.listing_p = None;
+        }
+        let stale = self.listing.as_ref().is_none_or(|l| l.at.elapsed() > RELIST);
+        if stale && self.listing_p.as_ref().is_none_or(|(id, _)| *id != inst.id) {
+            let (i, cache) = (inst.clone(), self.mods.clone());
+            let p = Promise::spawn(rt, ctx, async move {
+                Ok(tokio::task::spawn_blocking(move || {
+                    let files = mc::list(&i);
+                    let mods = mc::known_mods(&i, &mut cache.lock().unwrap());
+                    (mc::group(&files, &mods), shader_config::packs(&i), shader_config::switch(&i))
+                })
+                .await?)
+            });
+            self.listing_p = Some((inst.id.clone(), p));
+            ctx.request_repaint_after(RELIST);
+        }
+    }
+
+    /// `inst`'s shader packs' names, once listed.
+    pub fn pack_names(&mut self, inst: &Instance, rt: &tokio::runtime::Handle, ctx: &egui::Context) -> Vec<String> {
+        self.refresh(inst, rt, ctx);
+        self.listing.as_ref().map(|l| l.packs.iter().map(|p| p.name.clone()).collect()).unwrap_or_default()
+    }
+
+    /// `inst`'s mods' config groups, as (the mod ids each answers to, its name), once its files are listed.
+    pub fn mod_groups(&mut self, inst: &Instance, rt: &tokio::runtime::Handle, ctx: &egui::Context) -> Vec<(Vec<String>, String)> {
+        self.refresh(inst, rt, ctx);
+        let Some(l) = &self.listing else { return Vec::new() };
+        l.groups.iter().filter(|g| g.name != mc::OTHER).map(|g| (g.ids.clone(), g.name.clone())).collect()
+    }
+}
+
+
+/// Show shader pack `name`'s options.
+pub fn open_pack(app: &mut App, name: &str) {
+    app.inst_tab = InstTab::Config;
+    app.focus = Zone::Main;
+    app.config.cursor = Some(Item::File(PathBuf::from(name)));
+    app.config.scroll_file = true;
+    pick(app, Area::Shaders, PathBuf::from(name));
+}
+
+/// Show the config files of `inst`'s mod group `name`: the group open and its first file selected.
+pub fn open_group(app: &mut App, inst: &Instance, name: &str) {
+    let Some(first) = app.config.listing.as_ref().and_then(|l| l.groups.iter().find(|g| g.name == name)).and_then(|g| g.files.first()).map(|f| f.rel.clone()) else { return };
+    app.config.set_open(fold_key(&inst.id, &["group", name]), true);
+    app.inst_tab = InstTab::Config;
+    app.config.area = Area::Mods;
+    app.focus = Zone::Main;
+    app.config.cursor = Some(Item::File(first.clone()));
+    app.config.scroll_file = true;
+    pick(app, Area::Mods, first);
 }
 
 /// The file being edited.
 pub struct Open {
     pub inst_id: String,
+    pub area: Area,
+    /// Relative to `config/` for mods; the pack's name for shaders; `options.txt` for Minecraft.
     pub rel: PathBuf,
     path: PathBuf,
     format: Format,
@@ -77,6 +247,8 @@ pub struct Open {
     conflict: Option<String>,
     /// A quiet word about what just happened (reloaded, saved).
     note: Option<(String, Instant)>,
+    /// A shader pack's options, which its settings file's values are laid over.
+    base: Option<Arc<Doc>>,
 }
 
 fn field_id(f: &Field) -> String {
@@ -88,13 +260,14 @@ fn values(doc: &Result<Doc, mc::ParseError>) -> HashMap<String, Value> {
 }
 
 impl Open {
-    fn new(inst_id: String, rel: PathBuf, loaded: mc::Loaded) -> Self {
-        let format = Format::of(&rel).unwrap_or(Format::Text);
-        let doc = mc::parse(format, &loaded.text);
+    fn new(inst_id: String, area: Area, rel: PathBuf, loaded: mc::Loaded) -> Self {
+        let format = loaded.format;
+        let doc = mc::parse_with(format, loaded.base.as_deref(), &loaded.text);
         // Fields where there are some to show; text otherwise.
         let raw = !format.structured() || doc.as_ref().map_or(true, |d| d.fields.is_empty());
         Open {
             inst_id,
+            area,
             rel,
             path: loaded.path,
             format,
@@ -106,6 +279,7 @@ impl Open {
             raw,
             conflict: None,
             note: None,
+            base: loaded.base,
         }
     }
 
@@ -125,7 +299,7 @@ impl Open {
 
     fn set_text(&mut self, text: String) {
         self.text = text;
-        self.doc = mc::parse(self.format, &self.text);
+        self.doc = mc::parse_with(self.format, self.base.as_deref(), &self.text);
     }
 
     /// Take the file as it is on disk now.
@@ -144,7 +318,7 @@ impl Open {
 
 /// Somewhere to go once unsaved changes are dealt with.
 pub enum Away {
-    File(PathBuf),
+    File(Area, PathBuf),
     View { tab: Tab, inst_tab: InstTab, selected: Option<String> },
     Quit,
 }
@@ -159,6 +333,8 @@ fn glyph(format: Format) -> &'static str {
         Format::Toml => "\u{e6b2}",
         Format::Json | Format::Json5 => "\u{e60b}",
         Format::Text => "\u{f0f6}",
+        Format::Options => "\u{f013}",
+        Format::ShaderSettings => "\u{f05a8}",
     }
 }
 
@@ -187,10 +363,19 @@ fn shown_fields<'a>(doc: &'a Doc, filter: &str) -> Vec<(usize, &'a Field)> {
 
 /// Ask before leaving a file with unsaved changes; otherwise go straight there.
 fn pick_file(app: &mut App, rel: PathBuf) {
+    pick(app, app.config.area, rel);
+}
+
+/// Show `rel` in `area`, asking first if the open file has unsaved changes.
+fn pick(app: &mut App, area: Area, rel: PathBuf) {
     let s = &mut app.config;
-    if s.open.as_ref().is_some_and(|o| o.dirty() && o.rel != rel) {
-        app.modal = Some(Modal::ConfigLeave(Box::new(Leave { away: Away::File(rel) })));
+    if s.open.as_ref().is_some_and(|o| o.dirty() && (o.rel != rel || o.area != area)) {
+        app.modal = Some(Modal::ConfigLeave(Box::new(Leave { away: Away::File(area, rel) })));
         return;
+    }
+    if s.area != area {
+        s.area = area;
+        s.selected = None;
     }
     if s.selected.as_ref() != Some(&rel) {
         s.selected = Some(rel);
@@ -203,6 +388,14 @@ fn pick_file(app: &mut App, rel: PathBuf) {
 #[derive(Default)]
 struct Out {
     pick: Option<PathBuf>,
+    /// Open or fold this group or header ([`fold_key`]).
+    fold: Option<String>,
+    /// Wait for a key for this binding.
+    capture: Option<String>,
+    /// Put every setting with a known default back to it.
+    defaults: bool,
+    /// Switch shaders to this pack, or off.
+    use_pack: Option<Option<String>>,
     scroll_file: bool,
     edit: Option<(usize, Value)>,
     save: bool,
@@ -211,6 +404,19 @@ struct Out {
     take_disk: bool,
     keep_mine: bool,
     focus: Option<Zone>,
+}
+
+/// Read `rel` of `area` for editing.
+fn load_for(area: Area, inst: &Instance, rel: &std::path::Path) -> anyhow::Result<mc::Loaded> {
+    match area {
+        Area::Mods => mc::load(inst, rel),
+        Area::Shaders => shader_config::load(inst, &rel.to_string_lossy()),
+        Area::Minecraft => {
+            let path = inst.game_dir().join(OPTIONS);
+            let text = mc::read_text(&path)?;
+            Ok(mc::Loaded { stamp: mc::Stamp::of(&path), format: Format::Options, base: None, path, text })
+        }
+    }
 }
 
 pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
@@ -222,44 +428,39 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
     let focus = app.focus;
     let key = app.config.key.take();
     let rt = app.rt.clone();
+    let icons = if app.config.area == Area::Shaders { app.content.icons(inst, crate::instance::ContentKind::ShaderPacks, &rt, &ctx) } else { HashMap::new() };
     let s = &mut app.config;
 
     // Another instance's file with nothing unsaved: let it go (unsaved ones wait in `guard`).
     if s.open.as_ref().is_some_and(|o| o.inst_id != inst.id && !o.dirty()) {
         s.open = None;
     }
-    if s.listing.as_ref().is_some_and(|l| l.inst_id != inst.id) {
-        s.listing = None;
-        s.selected = None;
-        s.file_filter.clear();
-        s.field_filter.clear();
-        s.field_sel = None;
-    }
+    s.refresh(inst, &rt, &ctx);
+    s.folds();
+    let mut out = Out::default();
 
-    // The file list, read in the background now and then.
-    if let Some((id, p)) = &s.listing_p
-        && let Some(r) = p.take()
-    {
-        if *id == inst.id {
-            s.listing = Some(Listing { inst_id: id.clone(), groups: r.unwrap_or_default(), at: Instant::now() });
-            // A file that couldn't be opened gets another try with each fresh listing.
-            s.load_error = None;
-        }
-        s.listing_p = None;
+    // The three parts. Switching shows the file left open there, if any.
+    let mut area = s.area;
+    ui.horizontal(|ui| {
+        w::segmented(ui, &t, &mut area, &Area::ALL);
+        ui.add_space(12.0);
+        let what = match area {
+            Area::Minecraft => "the game's own settings: options.txt",
+            Area::Mods => "each mod's files in config/",
+            Area::Shaders => "each shader pack's options",
+        };
+        ui.add(egui::Label::new(RichText::new(what).color(t.muted)).truncate());
+    });
+    ui.add_space(10.0);
+    if key == Some(Action::ConfigArea) {
+        area = s.area.next();
     }
-    let stale = s.listing.as_ref().is_none_or(|l| l.at.elapsed() > RELIST);
-    if stale && s.listing_p.is_none() {
-        let (i, cache) = (inst.clone(), s.mods.clone());
-        let p = Promise::spawn(&rt, &ctx, async move {
-            Ok(tokio::task::spawn_blocking(move || {
-                let files = mc::list(&i);
-                let mods = mc::known_mods(&i, &mut cache.lock().unwrap());
-                mc::group(&files, &mods)
-            })
-            .await?)
-        });
-        s.listing_p = Some((inst.id.clone(), p));
-        ctx.request_repaint_after(RELIST);
+    if area != s.area {
+        s.area = area;
+        s.selected = s.open.as_ref().filter(|o| o.area == area && o.inst_id == inst.id).map(|o| o.rel.clone());
+        s.field_sel = None;
+        s.field_filter.clear();
+        s.cursor = None;
     }
     let Some(listing) = &s.listing else {
         ui.add_space(20.0);
@@ -270,63 +471,115 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
         return;
     };
     let groups = listing.groups.clone();
-    if groups.is_empty() {
-        w::empty_state(ui, &t, "\u{f107b}", "no config files yet", "Mods write their settings into config/ the first time the game starts with them. Play once, then come back here.");
-        return;
+    let packs = listing.packs.clone();
+    let switch = listing.switch;
+
+    // What to list on the left, and what the editor's keys are.
+    let mut edit_nav = edit_nav;
+    let mut editor_focused = focus == Zone::Side;
+    let mut items: Vec<Item> = Vec::new();
+    match s.area {
+        Area::Minecraft => {
+            if !inst.game_dir().join(OPTIONS).is_file() {
+                w::empty_state(ui, &t, "\u{f013}", "no options yet", "Minecraft writes options.txt the first time it starts. Play once, then come back here.");
+                return;
+            }
+            s.selected = Some(PathBuf::from(OPTIONS));
+            // One file, no list: the editor has the keyboard.
+            edit_nav = list_nav.or(edit_nav);
+            editor_focused = matches!(focus, Zone::Main | Zone::Side);
+        }
+        Area::Mods => {
+            if groups.is_empty() {
+                w::empty_state(ui, &t, "\u{f107b}", "no config files yet", "Mods write their settings into config/ the first time the game starts with them. Play once, then come back here.");
+                return;
+            }
+            let shown = visible(&groups, &s.file_filter);
+            let all: Vec<&PathBuf> = groups.iter().flat_map(|g| g.files.iter().map(|f| &f.rel)).collect();
+            // A file that's gone (and not being edited) drops its selection.
+            if s.selected.as_ref().is_some_and(|sel| !all.contains(&sel) && s.open.as_ref().is_none_or(|o| o.rel != *sel || !o.dirty())) {
+                s.selected = None;
+            }
+            // A mod with one file is that file; others are a heading, and their files when open (always while
+            // filtering, so what matches shows).
+            let filtering = !s.file_filter.trim().is_empty();
+            for (n, files) in &shown {
+                let g = &groups[*n];
+                if g.files.len() == 1 {
+                    items.push(Item::File(g.files[0].rel.clone()));
+                    continue;
+                }
+                items.push(Item::Group(g.name.clone()));
+                if filtering || s.is_open(&fold_key(&inst.id, &["group", &g.name])) {
+                    items.extend(files.iter().cloned().map(Item::File));
+                }
+            }
+        }
+        Area::Shaders => {
+            if packs.is_empty() {
+                w::empty_state(ui, &t, "\u{f0eb}", "no shader packs", "Add packs in the shader packs tab; their options show up here.");
+                return;
+            }
+            if s.selected.as_ref().is_some_and(|sel| !packs.iter().any(|p| *sel == PathBuf::from(&p.name))) {
+                s.selected = None;
+            }
+            items = packs.iter().map(|p| Item::File(PathBuf::from(&p.name))).collect();
+        }
+    }
+    if s.cursor.as_ref().is_none_or(|c| !items.contains(c)) {
+        s.cursor = s.selected.clone().map(Item::File).filter(|c| items.contains(c)).or_else(|| items.first().cloned());
     }
 
-    let shown = visible(&groups, &s.file_filter);
-    let flat: Vec<PathBuf> = shown.iter().flat_map(|(_, f)| f.iter().cloned()).collect();
-    let all: Vec<&PathBuf> = groups.iter().flat_map(|g| g.files.iter().map(|f| &f.rel)).collect();
-    // A file that's gone (and not being edited) drops its selection.
-    if s.selected.as_ref().is_some_and(|sel| !all.contains(&sel) && s.open.as_ref().is_none_or(|o| o.rel != *sel || !o.dirty())) {
-        s.selected = None;
-    }
-    if s.selected.is_none() {
-        s.selected = flat.first().cloned();
-    }
-    let mut out = Out::default();
-
-    // Keyboard on the file list.
-    if let Some(n) = list_nav {
-        let pos = s.selected.as_ref().and_then(|sel| flat.iter().position(|f| f == sel));
-        match n {
-            n if n.is_move() => {
-                if let Some(p) = n.step(flat.len(), pos) {
-                    out.pick = Some(flat[p].clone());
+    // Keyboard on the list: moving onto a file opens it; enter or space on a heading folds it.
+    if s.area != Area::Minecraft
+        && let Some(n) = list_nav
+    {
+        let pos = s.cursor.as_ref().and_then(|c| items.iter().position(|i| i == c));
+        let here = pos.and_then(|p| items.get(p)).cloned();
+        match (n, here) {
+            (n, _) if n.is_move() => {
+                if let Some(p) = n.step(items.len(), pos) {
+                    s.cursor = Some(items[p].clone());
+                    if let Item::File(rel) = &items[p] {
+                        out.pick = Some(rel.clone());
+                    }
                     out.scroll_file = true;
                 }
             }
-            Nav::Activate | Nav::Edit => out.focus = Some(Zone::Side),
-            Nav::Folder => super::open_path(&mc::config_dir(inst)),
+            (Nav::Activate | Nav::Toggle, Some(Item::Group(name))) => out.fold = Some(fold_key(&inst.id, &["group", &name])),
+            (Nav::Activate | Nav::Edit, Some(Item::File(_))) => out.focus = Some(Zone::Side),
+            (Nav::Folder, _) => super::open_path(&if s.area == Area::Shaders { shader_config::dir(inst) } else { mc::config_dir(inst) }),
             _ => {}
         }
     }
 
     // Load the selected file (in the background) unless it's the one open.
-    if let Some((id, rel, p)) = &s.loading
+    if let Some((id, area, rel, p)) = &s.loading
         && let Some(r) = p.take()
     {
-        let (id, rel) = (id.clone(), rel.clone());
+        let (id, area, rel) = (id.clone(), *area, rel.clone());
         s.loading = None;
-        if id == inst.id && s.selected.as_ref() == Some(&rel) {
+        if id == inst.id && area == s.area && s.selected.as_ref() == Some(&rel) {
             match r {
                 Ok(loaded) => {
-                    s.open = Some(Open::new(id, rel, loaded));
+                    s.open = Some(Open::new(id, area, rel, loaded));
                     s.load_error = None;
                 }
-                Err(e) => s.load_error = Some((rel, format!("{e:#}"))),
+                Err(e) => s.load_error = Some((area, rel, format!("{e:#}"))),
             }
         }
     }
+    let area = s.area;
     if let Some(sel) = s.selected.clone() {
-        let have = s.open.as_ref().is_some_and(|o| o.rel == sel && o.inst_id == inst.id);
-        let pending = s.loading.as_ref().is_some_and(|(id, r, _)| *r == sel && *id == inst.id);
-        let failed = s.load_error.as_ref().is_some_and(|(r, _)| *r == sel);
-        if !have && !pending && !failed {
+        let have = s.open.as_ref().is_some_and(|o| o.rel == sel && o.area == area && o.inst_id == inst.id);
+        let pending = s.loading.as_ref().is_some_and(|(id, a, r, _)| *r == sel && *a == area && *id == inst.id);
+        let failed = s.load_error.as_ref().is_some_and(|(a, r, _)| *r == sel && *a == area);
+        // An unsaved file elsewhere stays open (leaving the tab asks about it); anything else is replaced.
+        let blocked = s.open.as_ref().is_some_and(|o| o.dirty() && !(o.rel == sel && o.area == area));
+        if !have && !pending && !failed && !blocked {
             let (i, r) = (inst.clone(), sel.clone());
-            let p = Promise::spawn(&rt, &ctx, async move { tokio::task::spawn_blocking(move || mc::load(&i, &r)).await? });
-            s.loading = Some((inst.id.clone(), sel, p));
+            let p = Promise::spawn(&rt, &ctx, async move { tokio::task::spawn_blocking(move || load_for(area, &i, &r)).await? });
+            s.loading = Some((inst.id.clone(), area, sel, p));
         }
     }
 
@@ -339,17 +592,27 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
         let now = mc::Stamp::of(&o.path);
         if now != o.stamp {
             o.stamp = now;
-            if let Ok(disk) = mc::read_text(&o.path)
+            let disk = if o.path.exists() { mc::read_text(&o.path).ok() } else { Some(String::new()) };
+            if let Some(disk) = disk
                 && disk != o.saved
             {
                 if o.dirty() {
                     o.conflict = Some(disk);
                 } else {
                     o.reload(disk);
-                    o.note = Some(("reloaded: it changed on disk".into(), Instant::now()));
+                    o.note = Some(("reloaded: the file changed on disk".into(), Instant::now()));
                 }
             }
         }
+    }
+
+    // A binding's captured key.
+    if let Some((id, v)) = s.captured.take()
+        && let Some(o) = &s.open
+        && let Ok(doc) = &o.doc
+        && let Some(n) = doc.fields.iter().position(|f| field_id(f) == id)
+    {
+        out.edit = Some((n, Value::Scalar(Scalar::Str(v))));
     }
 
     // Keys routed from the app.
@@ -359,35 +622,175 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
         _ => {}
     }
 
-    let pane_w = (ui.available_width() * 0.3).clamp(220.0, 300.0);
-    egui::Panel::left("config-files")
-        .exact_size(pane_w)
-        .resizable(false)
-        .frame(egui::Frame::new().inner_margin(egui::Margin { right: 14, ..Default::default() }))
-        .show(ui, |ui| files_pane(ui, &t, s, &groups, &shown, list_nav == Some(Nav::Search), focus == Zone::Main, &mut out));
+    if area != Area::Minecraft {
+        // Narrow windows give the list less, so the editor keeps room to work.
+        let avail = ui.available_width();
+        let pane_w = if avail < 720.0 { (avail * 0.36).max(150.0) } else { (avail * 0.3).clamp(220.0, 300.0) };
+        egui::Panel::left("config-files").exact_size(pane_w).resizable(false).frame(egui::Frame::new().inner_margin(egui::Margin { right: 14, ..Default::default() })).show(ui, |ui| {
+            if area == Area::Shaders {
+                packs_pane(ui, &t, s, &packs, &icons, focus == Zone::Main, &mut out);
+            } else {
+                files_pane(ui, &t, s, &inst.id, &groups, &items, list_nav == Some(Nav::Search), focus == Zone::Main, &mut out);
+            }
+        });
+    }
 
-    let focused = focus == Zone::Side;
+    // The pack in use, switched here as the game's shader menu would (Iris's or OptiFine's own file).
+    let pack = (area == Area::Shaders).then(|| {
+        let sel = s.selected.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let why = match (switch, running) {
+            (None, _) => Some("no shader mod (Iris or OptiFine) in this instance"),
+            (_, true) => Some("close the game first: it saves its own choice when it quits"),
+            _ => None,
+        };
+        PackSwitch { active: packs.iter().any(|p| p.name == sel && p.active), why, optifine: switch == Some(shader_config::Switch::OptiFine), name: sel }
+    });
     match (&mut s.open, &s.load_error) {
-        (Some(o), _) if s.selected.as_ref() == Some(&o.rel) && o.inst_id == inst.id => {
-            let st = EditorState { field_filter: &mut s.field_filter, field_sel: &mut s.field_sel, scroll_field: &mut s.scroll_field, unfolded: &mut s.unfolded };
-            editor(ui, &t, o, st, running, edit_nav, focused, &mut out);
+        (Some(o), _) if s.selected.as_ref() == Some(&o.rel) && o.area == area && o.inst_id == inst.id => {
+            let folds = s.folds.get_or_insert_with(Default::default);
+            let cooling = s.capture_ended.is_some_and(|e| e.elapsed() < Duration::from_millis(400));
+            let st = EditorState { pack: pack.as_ref(), folds, field_filter: &mut s.field_filter, field_sel: &mut s.field_sel, scroll_field: &mut s.scroll_field, unfolded: &mut s.unfolded, capture: s.capture.as_deref(), cooling };
+            editor(ui, &t, o, st, running, edit_nav, editor_focused, &mut out);
         }
-        (_, Some((rel, e))) if s.selected.as_ref() == Some(rel) => {
-            w::empty_state(ui, &t, "\u{f05d6}", "can't open this file", e);
+        (_, Some((a, rel, e))) if *a == area && s.selected.as_ref() == Some(rel) => {
+            let what = if area == Area::Shaders { "can't read this pack's options" } else { "can't open this file" };
+            w::empty_state(ui, &t, "\u{f05d6}", what, e);
         }
+        (Some(o), _) if o.dirty() && s.selected.is_some() => {
+            let name = o.rel.display().to_string();
+            w::empty_state(ui, &t, "\u{f0193}", "unsaved changes elsewhere", &format!("{name} has unsaved changes. Save or discard them there first."));
+        }
+        _ if s.selected.is_none() => match area {
+            Area::Shaders => w::empty_state(ui, &t, "\u{f0eb}", "pick a shader pack", "Its options show here, named and grouped as in the game's shader menu."),
+            _ => w::empty_state(ui, &t, "\u{f107b}", "pick a config file", "Mods are listed on the left. Open one to see its config files, then pick a file to edit its settings."),
+        },
         _ => {
             ui.add_space(20.0);
-            ui.spinner();
+            ui.horizontal(|ui| {
+                ui.spinner();
+                if area == Area::Shaders {
+                    ui.label(RichText::new("reading the pack's options…").color(t.muted));
+                }
+            });
         }
     }
 
     apply(app, out);
 }
 
+/// A shader pack: its icon (as the shader packs tab shows it), its name on up to three lines with "in use" under it
+/// for the pack switched on, and a note on the right.
+fn pack_row(ui: &mut Ui, t: &Theme, selected: bool, active: bool, icon: Option<&std::path::Path>, name: &str, right: &str) -> egui::Response {
+    let size = t.body_size();
+    let width = ui.available_width();
+    let p = ui.painter();
+    let note = (!right.is_empty()).then(|| p.layout_no_wrap(right.to_string(), FontId::monospace(size - 1.0), t.accent));
+    let note_w = note.as_ref().map_or(0.0, |g| g.size().x + 12.0);
+    let icon_size = size * 2.0;
+    let text_x = 10.0 + icon_size + 10.0;
+    let mut job = LayoutJob::single_section(name.to_string(), TextFormat::simple(FontId::monospace(size), if selected { t.menu_selected_text } else { t.fg }));
+    job.wrap = egui::text::TextWrapping { max_width: (width - text_x - note_w - 10.0).max(40.0), max_rows: 3, break_anywhere: false, overflow_character: Some('…') };
+    let g = p.layout_job(job);
+    let tag = active.then(|| p.layout_no_wrap("● in use".to_string(), FontId::monospace(size - 2.0), t.green));
+    let tag_h = tag.as_ref().map_or(0.0, |g| g.size().y + 2.0);
+    let h = (g.size().y + tag_h + 16.0).max(icon_size + 14.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, h), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        if selected {
+            p.rect(rect, CornerRadius::ZERO, t.fg_a(t.menu_selected_bg_alpha), Stroke::new(1.0, t.fg_a(t.menu_selected_border_alpha)), StrokeKind::Inside);
+        } else if resp.hovered() {
+            p.rect_filled(rect, CornerRadius::ZERO, t.fg_a(t.hover_fill_alpha));
+        }
+        let ir = Rect::from_center_size(egui::pos2(rect.left() + 10.0 + icon_size / 2.0, rect.center().y), vec2(icon_size, icon_size));
+        match icon {
+            Some(path) => {
+                egui::Image::new(egui::ImageSource::Uri(format!("file://{}", path.display()).into())).corner_radius(3.0).paint_at(ui, ir);
+            }
+            // Unzipped packs and packs Modrinth doesn't know: the shader packs tab's own glyph.
+            None => w::glyph_centered(p, ir.center(), "\u{f05a8}", FontId::monospace(size + 2.0), t.muted),
+        }
+        let top = rect.center().y - (g.size().y + tag_h) / 2.0;
+        let gh = g.size().y;
+        p.galley(egui::pos2(rect.left() + text_x, top), g, t.fg);
+        if let Some(tag) = tag {
+            p.galley(egui::pos2(rect.left() + text_x, top + gh + 2.0), tag, t.green);
+        }
+        if let Some(n) = note {
+            let (nw, nh) = (n.size().x, n.size().y);
+            p.galley(egui::pos2(rect.right() - 10.0 - nw, rect.center().y - nh / 2.0), n, t.accent);
+        }
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The shader packs, the one in use marked.
+fn packs_pane(ui: &mut Ui, t: &Theme, s: &mut ConfigState, packs: &[shader_config::Pack], icons: &HashMap<String, PathBuf>, focused: bool, out: &mut Out) {
+    let r = ui.max_rect();
+    ui.painter().vline(r.right() + 7.0, r.y_range(), Stroke::new(1.0, t.fg_a(0.12)));
+    let open_dirty = s.open.as_ref().filter(|o| o.dirty() && o.area == Area::Shaders).map(|o| o.rel.clone());
+    let scroll = std::mem::take(&mut s.scroll_file);
+    egui::ScrollArea::vertical().id_salt("shader-packs").auto_shrink(false).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        for p in packs {
+            let rel = PathBuf::from(&p.name);
+            let item = Item::File(rel.clone());
+            let on = s.selected.as_ref() == Some(&rel);
+            let at = s.cursor.as_ref() == Some(&item);
+            // Pack names are long and alike ("ComplementaryReimagined_r5.8.1 + EuphoriaPatches_1.9.3"): up to two
+            // lines, broken between words.
+            let shown = p.name.strip_suffix(".zip").or_else(|| p.name.strip_suffix(".ZIP")).unwrap_or(&p.name).replace('_', " ");
+            let dot = if open_dirty.as_ref() == Some(&rel) { "●" } else { "" };
+            let hover = if p.active { format!("{}\nin use", p.name) } else { p.name.clone() };
+            let r = pack_row(ui, t, on, p.active, icons.get(&p.name).map(|p| p.as_path()), &shown, dot).on_hover_text(hover);
+            if at && focused {
+                w::focus_mark(ui, t, r.rect);
+            }
+            if at && scroll {
+                r.scroll_to_me(None);
+            }
+            if r.clicked() {
+                s.cursor = Some(item);
+                out.pick = Some(rel);
+                out.focus = Some(Zone::Main);
+            }
+            if r.double_clicked() {
+                out.focus = Some(Zone::Side);
+            }
+        }
+    });
+}
+
 /// Carry out what the frame asked for.
 fn apply(app: &mut App, out: Out) {
     if let Some(z) = out.focus {
         app.focus = z;
+    }
+    if let Some(k) = out.fold {
+        let open = !app.config.is_open(&k);
+        app.config.set_open(k, open);
+    }
+    if let Some(pack) = out.use_pack
+        && let Some(inst) = app.selected_instance().cloned()
+    {
+        match shader_config::use_pack(&inst, pack.as_deref()) {
+            Ok(()) => {
+                // Shown at once; the next listing reads it back from the file.
+                for l in app.config.listing.iter_mut().flat_map(|l| l.packs.iter_mut()) {
+                    l.active = pack.as_deref() == Some(l.name.as_str());
+                }
+                let what = match &pack {
+                    Some(p) => format!("Shaders now use {}", p.trim_end_matches(".zip")),
+                    None => "Shaders turned off".to_string(),
+                };
+                app.toast(ToastKind::Info, what);
+            }
+            Err(e) => app.toast(ToastKind::Error, format!("{e:#}")),
+        }
+    }
+    if let Some(id) = out.capture {
+        app.config.capture = Some(id);
+        app.config.capture_mods = None;
     }
     if let Some(rel) = out.pick {
         pick_file(app, rel);
@@ -403,6 +806,21 @@ fn apply(app: &mut App, out: Out) {
                 Ok(text) => o.set_text(text),
                 Err(e) => app.toasts.push(super::Toast::error(format!("{e:#}"))),
             }
+        }
+        if out.defaults {
+            // One at a time: each edit moves the others' places in the text.
+            for _ in 0..=o.doc.as_ref().map_or(0, |d| d.fields.len()) {
+                let Ok(doc) = &o.doc else { break };
+                let Some((f, d)) = doc.fields.iter().find_map(|f| default_value(f).filter(|d| Value::Scalar(d.clone()) != f.value).map(|d| (f.clone(), d))) else { break };
+                match mc::set(o.format, &o.text, &f, &Value::Scalar(d)) {
+                    Ok(text) => o.set_text(text),
+                    Err(e) => {
+                        app.toasts.push(super::Toast::error(format!("{e:#}")));
+                        break;
+                    }
+                }
+            }
+            o.note = Some(("defaults restored; save to keep them".into(), Instant::now()));
         }
         if let Some(raw) = out.raw {
             if !raw && o.doc.is_err() {
@@ -422,7 +840,7 @@ fn apply(app: &mut App, out: Out) {
         {
             // What's on disk now is what saving will replace.
             o.saved = disk;
-            o.saved_values = values(&mc::parse(o.format, &o.saved));
+            o.saved_values = values(&mc::parse_with(o.format, o.base.as_deref(), &o.saved));
             o.stamp = mc::Stamp::of(&o.path);
         }
     }
@@ -482,7 +900,7 @@ fn save(app: &mut App, force: bool) -> bool {
 // -- the file list ----------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn files_pane(ui: &mut Ui, t: &Theme, s: &mut ConfigState, groups: &[Group], shown: &[(usize, Vec<PathBuf>)], focus_filter: bool, focused: bool, out: &mut Out) {
+fn files_pane(ui: &mut Ui, t: &Theme, s: &mut ConfigState, inst_id: &str, groups: &[Group], items: &[Item], focus_filter: bool, focused: bool, out: &mut Out) {
     let r = ui.max_rect();
     ui.painter().vline(r.right() + 7.0, r.y_range(), Stroke::new(1.0, t.fg_a(0.12)));
     let resp = w::text_input(ui, &mut s.file_filter, "/ filter files or mods", ui.available_width(), focus_filter);
@@ -493,84 +911,131 @@ fn files_pane(ui: &mut Ui, t: &Theme, s: &mut ConfigState, groups: &[Group], sho
     ui.add_space(6.0);
     let open_dirty = s.open.as_ref().filter(|o| o.dirty()).map(|o| o.rel.clone());
     let scroll = std::mem::take(&mut s.scroll_file);
+    let filtering = !s.file_filter.trim().is_empty();
     egui::ScrollArea::vertical().id_salt("config-files").auto_shrink(false).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 1.0;
-        if shown.is_empty() {
+        if items.is_empty() {
             ui.add_space(8.0);
             ui.label(RichText::new("nothing matches").color(t.muted));
         }
-        for (n, files) in shown {
-            let g = &groups[*n];
-            group_header(ui, t, &g.name, g.icon.as_deref(), files.len());
-            for rel in files {
-                let on = s.selected.as_ref() == Some(rel);
-                // Under its mod's heading the file's own name is enough; the path is on hover.
-                let label = rel.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                let right = if open_dirty.as_ref() == Some(rel) { "●" } else { "" };
-                let fmt = Format::of(rel).unwrap_or(Format::Text);
-                let r = w::lead_row(ui, t, on, Lead::Glyph(glyph(fmt)), &label, right, None).on_hover_text(rel.to_string_lossy());
-                if on && focused {
-                    w::focus_mark(ui, t, r.rect);
+        for item in items {
+            let at = s.cursor.as_ref() == Some(item);
+            let r = match item {
+                Item::Group(name) => {
+                    let Some(g) = groups.iter().find(|g| g.name == *name) else { continue };
+                    let open = filtering || s.is_open(&fold_key(inst_id, &["group", name]));
+                    let r = group_header(ui, t, g, open, at).on_hover_text(format!("{} config files", g.files.len()));
+                    if r.clicked() {
+                        s.cursor = Some(item.clone());
+                        out.fold = Some(fold_key(inst_id, &["group", name]));
+                        out.focus = Some(Zone::Main);
+                    }
+                    r
                 }
-                if on && scroll {
-                    r.scroll_to_me(None);
+                Item::File(rel) => {
+                    let on = s.selected.as_ref() == Some(rel);
+                    let file = rel.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    let dot = if open_dirty.as_ref() == Some(rel) { "●  " } else { "" };
+                    // A mod with one file: the mod's own row (the file's path is on hover).
+                    let single = groups.iter().find(|g| g.files.len() == 1 && g.files[0].rel == *rel);
+                    let r = match single {
+                        Some(g) => {
+                            let lead = match &g.icon {
+                                Some(p) => Lead::Image(egui::ImageSource::Uri(format!("file://{}", p.display()).into())),
+                                None => Lead::Glyph(if g.name == mc::OTHER { "\u{f0224}" } else { "\u{f107b}" }),
+                            };
+                            w::lead_row(ui, t, on, lead, &g.name, dot.trim(), None)
+                        }
+                        // Under its mod's heading, indented; the file's name is enough (the path is on hover).
+                        None => {
+                            let fmt = Format::of(rel).unwrap_or(Format::Text);
+                            egui::Frame::new().inner_margin(egui::Margin { left: 18, ..Default::default() }).show(ui, |ui| w::lead_row(ui, t, on, Lead::Glyph(glyph(fmt)), &file, dot.trim(), None)).inner
+                        }
+                    }
+                    .on_hover_text(rel.to_string_lossy());
+                    if r.clicked() {
+                        s.cursor = Some(item.clone());
+                        out.pick = Some(rel.clone());
+                        out.focus = Some(Zone::Main);
+                    }
+                    if r.double_clicked() {
+                        out.focus = Some(Zone::Side);
+                    }
+                    r
                 }
-                if r.clicked() {
-                    out.pick = Some(rel.clone());
-                    out.focus = Some(Zone::Main);
-                }
-                if r.double_clicked() {
-                    out.focus = Some(Zone::Side);
-                }
+            };
+            if at && focused {
+                w::focus_mark(ui, t, r.rect);
             }
-            ui.add_space(6.0);
+            if at && scroll {
+                r.scroll_to_me(None);
+            }
         }
     });
 }
 
-/// A mod's name over its files: icon, name, count and a hairline.
-fn group_header(ui: &mut Ui, t: &Theme, name: &str, icon: Option<&Path>, count: usize) {
-    let size = t.body_size() - 1.0;
-    let h = size + 14.0;
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-    let mut x = rect.left() + 6.0;
-    let icon_size = size + 2.0;
-    match icon {
-        Some(p) => {
-            let r = Rect::from_center_size(egui::pos2(x + icon_size / 2.0, rect.center().y), vec2(icon_size, icon_size));
-            egui::Image::new(egui::ImageSource::Uri(format!("file://{}", p.display()).into())).corner_radius(2.0).paint_at(ui, r);
-            x += icon_size + 8.0;
+/// A mod with several config files: a fold arrow, its icon and name, and how many files.
+fn group_header(ui: &mut Ui, t: &Theme, g: &Group, open: bool, at: bool) -> egui::Response {
+    let size = t.body_size();
+    let h = size + 18.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+    if ui.is_rect_visible(rect) {
+        if at {
+            ui.painter().rect_filled(rect, 0.0, t.fg_a(t.menu_selected_bg_alpha));
+        } else if resp.hovered() {
+            ui.painter().rect_filled(rect, 0.0, t.fg_a(t.hover_fill_alpha));
         }
-        None => {
-            let g = if name == mc::OTHER { "\u{f0224}" } else { "\u{f107b}" };
-            ui.painter().text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, g, FontId::monospace(size), t.muted);
-            x += icon_size + 8.0;
+        let cy = rect.center().y;
+        let mut x = rect.left() + 8.0;
+        let arrow = if open { "\u{f0140}" } else { "\u{f0142}" };
+        ui.painter().text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, arrow, FontId::monospace(size), t.muted);
+        x += size + 6.0;
+        let icon_size = size + 4.0;
+        match &g.icon {
+            Some(p) => {
+                let r = Rect::from_center_size(egui::pos2(x + icon_size / 2.0, cy), vec2(icon_size, icon_size));
+                egui::Image::new(egui::ImageSource::Uri(format!("file://{}", p.display()).into())).corner_radius(2.0).paint_at(ui, r);
+            }
+            None => {
+                let glyph = if g.name == mc::OTHER { "\u{f0224}" } else { "\u{f107b}" };
+                ui.painter().text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, glyph, FontId::monospace(size), t.muted);
+            }
         }
+        x += icon_size + 8.0;
+        let p = ui.painter();
+        // Just the number: the mod's name needs the room.
+        let c = p.layout_no_wrap(g.files.len().to_string(), FontId::monospace(size - 1.0), t.muted);
+        let cw = c.size().x;
+        p.galley(egui::pos2(rect.right() - 10.0 - cw, cy - c.size().y / 2.0), c, t.muted);
+        let clip = Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(rect.right() - 20.0 - cw, rect.bottom()));
+        p.with_clip_rect(clip).text(egui::pos2(x, cy), egui::Align2::LEFT_CENTER, &g.name, FontId::monospace(size), if at { t.menu_selected_text } else { t.fg });
     }
-    let p = ui.painter();
-    let c = p.layout_no_wrap(count.to_string(), FontId::monospace(size), t.muted);
-    let cw = c.size().x;
-    p.galley(egui::pos2(rect.right() - 10.0 - cw, rect.center().y - c.size().y / 2.0), c, t.muted);
-    let clip = Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(rect.right() - 20.0 - cw, rect.bottom()));
-    let g = p.layout_no_wrap(name.to_string(), FontId::monospace(size), t.fg);
-    let tw = g.size().x;
-    p.with_clip_rect(clip).galley(egui::pos2(x, rect.center().y - g.size().y / 2.0), g, t.fg);
-    let (l, r) = (x + tw + 8.0, rect.right() - 18.0 - cw);
-    if r > l {
-        p.hline(l..=r, rect.center().y, Stroke::new(1.0, t.fg_a(0.10)));
-    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 // -- the editor -------------------------------------------------------------------
 
+/// The shader pack open in the editor: whether it's the one in use, and why it can't be switched to if it can't.
+struct PackSwitch {
+    name: String,
+    active: bool,
+    why: Option<&'static str>,
+    optifine: bool,
+}
+
 struct EditorState<'a> {
+    /// For a shader pack: switching to it, on the status line.
+    pack: Option<&'a PackSwitch>,
+    /// Open settings headers ([`fold_key`]).
+    folds: &'a BTreeSet<String>,
     field_filter: &'a mut String,
     field_sel: &'a mut Option<String>,
     scroll_field: &'a mut bool,
     unfolded: &'a mut HashSet<String>,
+    /// The key binding waiting for a key, if any.
+    capture: Option<&'a str>,
+    /// A capture just ended (its click mustn't start another).
+    cooling: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -589,38 +1054,88 @@ fn editor(ui: &mut Ui, t: &Theme, o: &mut Open, st: EditorState, running: bool, 
         job.append(&o.name(), 0.0, TextFormat::simple(theme::bold(t.body_size()), t.fg_light));
         ui.add(egui::Label::new(job).truncate());
     };
-    // Narrow: the name gets a line of its own over the buttons.
-    let stacked = ui.available_width() < 560.0;
-    if stacked {
-        ui.horizontal(title);
-        ui.add_space(4.0);
-    }
-    // Title and buttons; buttons first so a long name can't run under them.
-    ui.horizontal(|ui| {
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.add_enabled_ui(dirty, |ui| w::primary_button(ui, t, "  save  ")).inner.on_hover_text("ctrl+s").clicked() {
-                out.save = true;
-            }
-            if ui.add_enabled(dirty, egui::Button::new("revert")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() || (key(Nav::Delete) && dirty && o.raw_mode()) {
-                out.revert = true;
-            }
-            if structured {
-                let mut raw = o.raw;
-                ui.add_space(4.0);
-                // Laid out right to left here: listed backwards, it reads "fields  text".
-                if w::segmented(ui, t, &mut raw, &[(true, "text"), (false, "fields")]) {
-                    out.raw = Some(raw);
+    // Buttons first, so a long name can't run under them. Read left to right: folder, restore defaults, fields/text,
+    // revert, save.
+    let labels = ["  save  ", "revert", "fields", "text", "restore defaults", "folder"];
+    let need = w::buttons_width(ui, &labels) + 14.0;
+    let mut actions = |ui: &mut Ui, ltr: bool| {
+        let mut steps = [0, 1, 2, 3, 4];
+        if ltr {
+            steps.reverse();
+        }
+        for step in steps {
+            // Wrapping can't see a group's width ahead (fields/text is two buttons): break the line first.
+            if ltr {
+                let width = match step {
+                    0 => w::buttons_width(ui, &["  save  "]),
+                    1 => w::buttons_width(ui, &["revert"]),
+                    2 if structured => w::buttons_width(ui, &["fields", "text"]),
+                    3 => w::buttons_width(ui, &["restore defaults"]),
+                    4 => w::buttons_width(ui, &["folder"]),
+                    _ => 0.0,
+                };
+                if width > 0.0 && ui.available_size_before_wrap().x < width && ui.cursor().min.x > ui.max_rect().min.x + 1.0 {
+                    ui.end_row();
                 }
             }
-            if w::button(ui, "folder").clicked() || key(Nav::Folder) {
-                super::open_path(o.path.parent().unwrap_or(&o.path));
+            match step {
+                0 => {
+                    if ui.add_enabled_ui(dirty, |ui| w::primary_button(ui, t, "  save  ")).inner.on_hover_text("ctrl+s").clicked() {
+                        out.save = true;
+                    }
+                }
+                1 => {
+                    if ui.add_enabled(dirty, egui::Button::new("revert")).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() || (key(Nav::Delete) && dirty && o.raw_mode()) {
+                        out.revert = true;
+                    }
+                }
+                2 if structured => {
+                    let mut raw = o.raw;
+                    // Right to left, listed backwards; either way it reads "fields  text".
+                    let opts = if ltr { [(false, "fields"), (true, "text")] } else { [(true, "text"), (false, "fields")] };
+                    if w::segmented(ui, t, &mut raw, &opts) {
+                        out.raw = Some(raw);
+                    }
+                }
+                3 => {
+                    // Everything with a known default back to it (nothing is written until save).
+                    let differ = o.doc.as_ref().map_or(0, |d| d.fields.iter().filter(|f| default_value(f).is_some_and(|d| Value::Scalar(d) != f.value)).count());
+                    let known = o.doc.as_ref().is_ok_and(|d| d.fields.iter().any(|f| default_value(f).is_some()));
+                    let hover = if !known { "this file doesn't say what its defaults are".to_string() } else if differ == 0 { "everything is at its default".to_string() } else { format!("put {differ} settings back to their defaults; save to keep it") };
+                    let r = ui.add_enabled(differ > 0 && !o.raw_mode(), egui::Button::new("restore defaults")).on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if r.on_hover_text(&hover).on_disabled_hover_text(&hover).clicked() {
+                        out.defaults = true;
+                    }
+                }
+                4 => {
+                    if w::button(ui, "folder").clicked() || key(Nav::Folder) {
+                        super::open_path(o.path.parent().unwrap_or(&o.path));
+                    }
+                }
+                _ => {}
             }
-            if !stacked {
+        }
+    };
+    let room = ui.available_width();
+    if room - need >= 280.0 {
+        // Wide: the name beside the buttons.
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                actions(ui, false);
                 ui.add_space(10.0);
                 ui.with_layout(Layout::left_to_right(Align::Center), title);
-            }
+            });
         });
-    });
+    } else {
+        // Narrow: the name on its own line, the buttons under it, wrapping when even they don't fit.
+        ui.horizontal(title);
+        ui.add_space(4.0);
+        if room >= need {
+            ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| actions(ui, false)));
+        } else {
+            ui.horizontal_wrapped(|ui| actions(ui, true));
+        }
+    }
 
     // One quiet status line: unsaved, saved, reloaded…
     ui.horizontal(|ui| {
@@ -639,6 +1154,23 @@ fn editor(ui: &mut Ui, t: &Theme, o: &mut Open, st: EditorState, running: bool, 
             ui.label(RichText::new(format!("·  {n}")).color(t.muted).size(size));
         }
         ui.label(RichText::new(format!("·  {}", o.format.label())).color(t.muted).size(size));
+        if let Some(p) = st.pack {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if p.active {
+                    let r = ui.add_enabled(p.why.is_none(), egui::Button::new("turn shaders off")).on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if r.on_disabled_hover_text(p.why.unwrap_or_default()).clicked() {
+                        out.use_pack = Some(None);
+                    }
+                    ui.label(RichText::new("● in use").color(t.green).size(size));
+                } else {
+                    let hover = if p.optifine { "make it OptiFine's shader pack" } else { "make it Iris's shader pack" };
+                    let r = ui.add_enabled(p.why.is_none(), egui::Button::new("use this pack")).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hover);
+                    if r.on_disabled_hover_text(p.why.unwrap_or_default()).clicked() {
+                        out.use_pack = Some(Some(p.name.clone()));
+                    }
+                }
+            });
+        }
         if note.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(500));
         }
@@ -687,22 +1219,50 @@ fn editor(ui: &mut Ui, t: &Theme, o: &mut Open, st: EditorState, running: bool, 
     // The filter, and how many settings it shows.
     let shown = shown_fields(doc, st.field_filter);
     ui.horizontal(|ui| {
-        let r = w::text_input(ui, st.field_filter, "/ filter settings", (ui.available_width() * 0.5).clamp(160.0, 320.0), key(Nav::Search));
-        if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            st.field_filter.clear();
-            r.surrender_focus();
-        }
+        // The count first (right), then the filter in what's left, at most 320.
+        let n = shown.len();
+        let total = doc.fields.len();
+        let text = if n == total { format!("{total} settings") } else { format!("{n} of {total} settings") };
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let n = shown.len();
-            let total = doc.fields.len();
-            let text = if n == total { format!("{total} settings") } else { format!("{n} of {total} settings") };
             ui.label(RichText::new(text).color(t.muted));
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                let width = (ui.available_width() - 16.0).clamp(60.0, 320.0);
+                let r = w::text_input(ui, st.field_filter, "/ filter settings", width, key(Nav::Search));
+                if r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    st.field_filter.clear();
+                    r.surrender_focus();
+                }
+            });
         });
     });
     ui.add_space(6.0);
 
-    // Keyboard: move between fields, and act on the selected one.
-    let ids: Vec<String> = shown.iter().map(|(_, f)| field_id(f)).collect();
+    // The lines: settings outside any header first, then each header, folded unless opened (all open while filtering).
+    let filtering = !st.field_filter.trim().is_empty();
+    let fold_of = |section: &[String]| fold_key(&o.inst_id, &["section", o.area.key(), &o.rel.to_string_lossy(), &section.join("\u{1e}")]);
+    enum Line<'d> {
+        Header(&'d [String], usize, String),
+        Field(usize, &'d Field, String),
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    let mut last: Option<&[String]> = None;
+    for (n, f) in &shown {
+        let sec = f.section.as_slice();
+        if !sec.is_empty() && last != Some(sec) {
+            let count = shown.iter().filter(|(_, x)| x.section.as_slice() == sec).count();
+            lines.push(Line::Header(sec, count, format!("§{}", sec.join("\u{1e}"))));
+        }
+        last = Some(sec);
+        if sec.is_empty() || filtering || st.folds.contains(&fold_of(sec)) {
+            lines.push(Line::Field(*n, f, field_id(f)));
+        }
+    }
+    let id_of = |l: &Line| match l {
+        Line::Header(_, _, id) | Line::Field(_, _, id) => id.clone(),
+    };
+
+    // Keyboard: move between headers and fields; enter or space on a header folds it.
+    let ids: Vec<String> = lines.iter().map(id_of).collect();
     let mut pos = st.field_sel.as_ref().and_then(|id| ids.iter().position(|x| x == id));
     if pos.is_none() && !ids.is_empty() {
         pos = Some(0);
@@ -715,47 +1275,117 @@ fn editor(ui: &mut Ui, t: &Theme, o: &mut Open, st: EditorState, running: bool, 
         pos = Some(p);
         *st.scroll_field = true;
     }
-    let focus_widget = key(Nav::Activate) || key(Nav::Edit);
+    if let Some(Line::Header(sec, _, _)) = pos.and_then(|p| lines.get(p))
+        && (key(Nav::Activate) || key(Nav::Toggle))
+    {
+        out.fold = Some(fold_of(sec));
+    }
+    let on_field = pos.is_some_and(|p| matches!(lines.get(p), Some(Line::Field(..))));
+    // Key bindings that share a key, by key: each one's row says what else is on it.
+    let mut clashes: HashMap<&str, Vec<String>> = HashMap::new();
+    for f in &doc.fields {
+        if let Some(v) = binding_of(f).filter(|v| !v.ends_with(".unknown")) {
+            clashes.entry(v).or_default().push(f.label.clone().unwrap_or_else(|| f.key.clone()));
+        }
+    }
+    let focus_widget = on_field && (key(Nav::Activate) || key(Nav::Edit));
     let wide = ui.available_width() >= 560.0;
     let key_w = (ui.available_width() * 0.5).clamp(180.0, 440.0);
     let scroll = std::mem::take(st.scroll_field);
 
     {
         egui::ScrollArea::vertical().id_salt(("config-fields", &o.rel)).auto_shrink(false).show(ui, |ui| {
-            let mut section: Option<&[String]> = None;
-            for (row, (n, f)) in shown.iter().enumerate() {
-                if section != Some(f.section.as_slice()) {
-                    section = Some(&f.section);
-                    if !f.section.is_empty() {
-                        ui.add_space(if row == 0 { 0.0 } else { 10.0 });
-                        w::section(ui, t, &f.section.join("  ›  "));
-                        if let Some(d) = doc.section_doc(&f.section) {
-                            egui::Frame::new().inner_margin(egui::Margin { left: 2, bottom: 4, ..Default::default() }).show(ui, |ui| {
+            for (row, line) in lines.iter().enumerate() {
+                let selected = pos == Some(row);
+                match line {
+                    Line::Header(sec, count, id) => {
+                        let open = filtering || st.folds.contains(&fold_of(sec));
+                        ui.add_space(if row == 0 { 0.0 } else { 6.0 });
+                        let r = section_header(ui, t, sec, *count, open, selected);
+                        if selected && focused {
+                            w::focus_mark(ui, t, r.rect);
+                        }
+                        if r.clicked() {
+                            *st.field_sel = Some(id.clone());
+                            out.fold = Some(fold_of(sec));
+                            out.focus = Some(Zone::Side);
+                        }
+                        if selected && scroll {
+                            ui.scroll_to_rect(r.rect, Some(Align::Center));
+                        }
+                        if open && let Some(d) = doc.section_doc(sec) {
+                            egui::Frame::new().inner_margin(egui::Margin { left: 26, bottom: 4, top: 2, ..Default::default() }).show(ui, |ui| {
                                 w::para(ui, RichText::new(d).color(t.muted).size(t.body_size() - 1.0));
                             });
                         }
                     }
-                }
-                let id = &ids[row];
-                let selected = pos == Some(row);
-                let changed = o.saved_values.get(id) != Some(&f.value);
-                let ctx = Row { t, id, selected, focused: selected && focused, changed, wide, key_w };
-                let kb_here = if selected { kb } else { None };
-                let (rect, clicked, edit) = field_row(ui, &ctx, f, kb_here, selected && focus_widget, st.unfolded, out);
-                if let Some(v) = edit {
-                    out.edit = Some((*n, v));
-                }
-                if clicked {
-                    *st.field_sel = Some(id.clone());
-                    out.focus = Some(Zone::Side);
-                }
-                if selected && scroll {
-                    ui.scroll_to_rect(rect, Some(Align::Center));
+                    Line::Field(n, f, id) => {
+                        let changed = o.saved_values.get(id) != Some(&f.value);
+                        let capturing = st.capture == Some(id.as_str());
+                        let clash = binding_of(f).and_then(|v| clashes.get(v)).map(|names| names.iter().filter(|n| **n != f.label.as_deref().unwrap_or(&f.key)).cloned().collect()).unwrap_or_default();
+                        let ctx = Row { t, id, selected, focused: selected && focused, changed, wide, key_w, capturing, clash, cooling: st.cooling };
+                        let kb_here = if selected { kb } else { None };
+                        // Settings under a header sit in from it.
+                        let indent = if f.section.is_empty() { 0 } else { 18 };
+                        let (rect, clicked, edit) = egui::Frame::new()
+                            .inner_margin(egui::Margin { left: indent, ..Default::default() })
+                            .show(ui, |ui| field_row(ui, &ctx, f, kb_here, selected && focus_widget, st.unfolded, out))
+                            .inner;
+                        if let Some(v) = edit {
+                            out.edit = Some((*n, v));
+                        }
+                        if clicked {
+                            *st.field_sel = Some(id.clone());
+                            out.focus = Some(Zone::Side);
+                        }
+                        if selected && scroll {
+                            ui.scroll_to_rect(rect, Some(Align::Center));
+                        }
+                    }
                 }
             }
             ui.add_space(12.0);
         });
     }
+}
+
+/// A settings header: a fold arrow, the header's path and how many settings it holds, over a hairline.
+fn section_header(ui: &mut Ui, t: &Theme, path: &[String], count: usize, open: bool, at: bool) -> egui::Response {
+    let size = t.body_size();
+    let h = size + 16.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        if at {
+            p.rect_filled(rect, 0.0, t.fg_a(t.menu_selected_bg_alpha));
+        } else if resp.hovered() {
+            p.rect_filled(rect, 0.0, t.fg_a(t.hover_fill_alpha));
+        }
+        let cy = rect.center().y;
+        let arrow = if open { "\u{f0140}" } else { "\u{f0142}" };
+        p.text(egui::pos2(rect.left() + 6.0, cy), egui::Align2::LEFT_CENTER, arrow, FontId::monospace(size), t.muted);
+        let x = rect.left() + 6.0 + size + 6.0;
+        let c = p.layout_no_wrap(if count == 1 { "1 setting".into() } else { format!("{count} settings") }, FontId::monospace(size - 1.0), t.muted);
+        let cw = c.size().x;
+        p.galley(egui::pos2(rect.right() - 8.0 - cw, cy - c.size().y / 2.0), c, t.muted);
+        // The screens it's inside, quietly; its own name in bold.
+        let mut job = LayoutJob::default();
+        if let Some((last, parents)) = path.split_last() {
+            for s in parents {
+                job.append(&format!("{s}  ›  "), 0.0, TextFormat::simple(FontId::monospace(size), t.muted));
+            }
+            job.append(last, 0.0, TextFormat::simple(theme::bold(size), if at { t.menu_selected_text } else { t.fg_light }));
+        }
+        let g = p.layout_job(job);
+        let tw = g.size().x;
+        let clip = Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(rect.right() - 18.0 - cw, rect.bottom()));
+        p.with_clip_rect(clip).galley(egui::pos2(x, cy - g.size().y / 2.0), g, t.fg_light);
+        let (l, r) = (x + tw + 10.0, rect.right() - 18.0 - cw);
+        if r > l {
+            p.hline(l..=r, cy, Stroke::new(1.0, t.fg_a(0.10)));
+        }
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// A bordered note with a coloured glyph, and room for buttons under the text.
@@ -780,6 +1410,11 @@ struct Row<'a> {
     changed: bool,
     wide: bool,
     key_w: f32,
+    /// Key bindings: waiting for this one's key, the other bindings on the same key, and whether a capture just
+    /// ended.
+    capturing: bool,
+    clash: Vec<String>,
+    cooling: bool,
 }
 
 /// One setting: its key and description on the left, its value on the right (or under
@@ -797,7 +1432,8 @@ fn field_row(ui: &mut Ui, r: &Row, f: &Field, kb: Option<Nav>, focus_widget: boo
                     ui.label(RichText::new("●").color(t.accent).size(t.body_size() - 3.0)).on_hover_text("changed, not saved yet");
                 }
                 let color = if r.selected { t.fg_light } else { t.fg };
-                ui.add(egui::Label::new(RichText::new(&f.key).font(theme::bold(t.body_size())).color(color)).truncate()).on_hover_text(&f.key);
+                let name = f.label.as_deref().unwrap_or(&f.key);
+                ui.add(egui::Label::new(RichText::new(name).font(theme::bold(t.body_size())).color(color)).truncate()).on_hover_text(&f.key);
             });
             if !f.doc.is_empty() {
                 w::para(ui, RichText::new(&f.doc).color(t.muted).size(t.body_size() - 1.0));
@@ -810,12 +1446,12 @@ fn field_row(ui: &mut Ui, r: &Row, f: &Field, kb: Option<Nav>, focus_widget: boo
                     key_part(ui);
                 });
                 ui.add_space(18.0);
-                ui.vertical(|ui| edit = value_part(ui, t, f, r.id, kb, focus_widget, unfolded, out));
+                ui.vertical(|ui| edit = value_part(ui, t, f, r, kb, focus_widget, unfolded, out));
             });
         } else {
             key_part(ui);
             ui.add_space(4.0);
-            edit = value_part(ui, t, f, r.id, kb, focus_widget, unfolded, out);
+            edit = value_part(ui, t, f, r, kb, focus_widget, unfolded, out);
         }
     });
     let rect = inner.response.rect;
@@ -833,6 +1469,92 @@ fn field_row(ui: &mut Ui, r: &Row, f: &Field, kb: Option<Nav>, focus_widget: boo
         w::focus_mark(ui, t, rect);
     }
     (rect, clicked, edit)
+}
+
+/// A key binding's key, as written (`key.keyboard.w`).
+fn binding_of(f: &Field) -> Option<&str> {
+    match &f.value {
+        Value::Scalar(Scalar::Str(v)) if f.hint.binding => Some(v),
+        _ => None,
+    }
+}
+
+/// Minecraft's name for a key (GLFW's, as `options.txt` writes it).
+fn mc_key(k: egui::Key) -> Option<String> {
+    use egui::Key::*;
+    let name = match k {
+        Space => "space",
+        Enter => "enter",
+        Tab => "tab",
+        Backspace => "backspace",
+        Insert => "insert",
+        Delete => "delete",
+        Home => "home",
+        End => "end",
+        PageUp => "page.up",
+        PageDown => "page.down",
+        ArrowUp => "up",
+        ArrowDown => "down",
+        ArrowLeft => "left",
+        ArrowRight => "right",
+        Minus => "minus",
+        Equals | Plus => "equal",
+        Comma => "comma",
+        Period => "period",
+        Slash => "slash",
+        Backslash => "backslash",
+        Semicolon | Colon => "semicolon",
+        Quote => "apostrophe",
+        OpenBracket => "left.bracket",
+        CloseBracket => "right.bracket",
+        Backtick => "grave.accent",
+        _ => {
+            let n = k.name();
+            // Letters, digits ("1" or "Num1") and F-keys.
+            let n = n.strip_prefix("Num").unwrap_or(n);
+            return (n.len() == 1 && n.chars().all(|c| c.is_ascii_alphanumeric()) || (n.starts_with('F') && n[1..].parse::<u8>().is_ok())).then(|| format!("key.keyboard.{}", n.to_ascii_lowercase()));
+        }
+    };
+    Some(format!("key.keyboard.{name}"))
+}
+
+/// While a binding waits for its key: take the next key, mouse button or newly held shift/ctrl/alt.
+pub fn capture(app: &mut App, ctx: &egui::Context) {
+    let Some(id) = app.config.capture.clone() else { return };
+    let Some(before) = app.config.capture_mods else {
+        app.config.capture_mods = Some(ctx.input(|i| i.modifiers));
+        return;
+    };
+    let (event, mods) = ctx.input_mut(|i| {
+        let n = i.events.iter().position(|e| matches!(e, egui::Event::Key { pressed: true, .. } | egui::Event::PointerButton { pressed: true, .. }));
+        (n.map(|n| i.events.remove(n)), i.modifiers)
+    });
+    let value = match event {
+        Some(egui::Event::Key { key: egui::Key::Escape, .. }) => None,
+        Some(egui::Event::Key { key, .. }) => mc_key(key),
+        Some(egui::Event::PointerButton { button, .. }) => Some(
+            match button {
+                egui::PointerButton::Primary => "key.mouse.left",
+                egui::PointerButton::Secondary => "key.mouse.right",
+                egui::PointerButton::Middle => "key.mouse.middle",
+                egui::PointerButton::Extra1 => "key.mouse.4",
+                egui::PointerButton::Extra2 => "key.mouse.5",
+            }
+            .to_string(),
+        ),
+        _ => match () {
+            _ if mods.shift && !before.shift => Some("key.keyboard.left.shift".into()),
+            _ if mods.ctrl && !before.ctrl => Some("key.keyboard.left.control".into()),
+            _ if mods.alt && !before.alt => Some("key.keyboard.left.alt".into()),
+            _ => return,
+        },
+    };
+    app.config.capture = None;
+    app.config.capture_ended = Some(Instant::now());
+    // esc (or a key Minecraft has no name for) leaves the binding as it was.
+    if let Some(v) = value {
+        app.config.captured = Some((id, v));
+    }
 }
 
 /// "1 – 64", "at least 0"…; nothing for the type's own limits (Forge writes
@@ -862,11 +1584,36 @@ fn default_value(f: &Field) -> Option<Scalar> {
 
 /// The value's widget and, under it, what the comment says about it.
 #[allow(clippy::too_many_arguments)]
-fn value_part(ui: &mut Ui, t: &Theme, f: &Field, id: &str, kb: Option<Nav>, focus: bool, unfolded: &mut HashSet<String>, out: &mut Out) -> Option<Value> {
+fn value_part(ui: &mut Ui, t: &Theme, f: &Field, r: &Row, kb: Option<Nav>, focus: bool, unfolded: &mut HashSet<String>, out: &mut Out) -> Option<Value> {
+    let id = r.id;
     let key = |n: Nav| kb == Some(n);
     let wid = egui::Id::new(("config-field", id));
     let mut edit = None;
     match &f.value {
+        // A key binding: click (or enter), then press the key; right-click unbinds. Like Omacraft's own keys.
+        Value::Scalar(Scalar::Str(v)) if f.hint.binding => {
+            let shown = crate::vanilla_options::binding_value(v).unwrap_or_else(|| v.clone());
+            let text = if r.capturing { "press a key…".to_string() } else { shown };
+            let color = if r.capturing { t.accent } else if !r.clash.is_empty() { t.yellow } else { t.fg };
+            let mut b = egui::Button::new(RichText::new(text).color(color)).min_size(vec2(160.0, 0.0));
+            if r.capturing {
+                b = b.stroke(Stroke::new(1.0, t.accent));
+            }
+            let hover = if r.capturing {
+                "press a key or mouse button · esc cancels".to_string()
+            } else if r.clash.is_empty() {
+                "click to change, right-click to unbind".to_string()
+            } else {
+                format!("also bound to: {}", r.clash.join(", "))
+            };
+            let resp = ui.add(b).on_hover_text(hover).on_hover_cursor(egui::CursorIcon::PointingHand);
+            if ((resp.clicked() && !r.cooling) || focus) && !r.capturing {
+                out.capture = Some(id.to_string());
+            }
+            if resp.secondary_clicked() {
+                edit = Some(Value::Scalar(Scalar::Str("key.keyboard.unknown".into())));
+            }
+        }
         Value::Scalar(s) => {
             if let Some(v) = scalar_widget(ui, t, s, &f.hint, wid, kb, focus, ui.available_width()) {
                 edit = Some(Value::Scalar(v));
@@ -897,6 +1644,9 @@ fn value_part(ui: &mut Ui, t: &Theme, f: &Field, id: &str, kb: Option<Nav>, focu
     let default = default_value(f);
     let current = if let Value::Scalar(s) = &f.value { Some(s) } else { None };
     let at_default = default.as_ref().is_some_and(|d| Some(d) == current);
+    if f.hint.allowed.len() == 1 {
+        return edit;
+    }
     if range.is_some() || default.is_some() {
         ui.horizontal(|ui| {
             let size = t.body_size() - 1.0;
@@ -908,7 +1658,12 @@ fn value_part(ui: &mut Ui, t: &Theme, f: &Field, id: &str, kb: Option<Nav>, focu
                 if range.is_some() {
                     ui.label(RichText::new("·").color(t.muted).size(size));
                 }
-                let text = format!("default {}", d.display());
+                let shown = match d {
+                    Scalar::Bool(b) if f.hint.on_off => (if *b { "on" } else { "off" }).to_string(),
+                    Scalar::Str(v) if f.hint.binding => crate::vanilla_options::binding_value(v).unwrap_or_else(|| v.clone()),
+                    _ => f.hint.name_of(&d.display()).to_string(),
+                };
+                let text = format!("default {shown}");
                 if at_default {
                     ui.label(RichText::new(text).color(t.muted).size(size));
                 } else {
@@ -956,7 +1711,13 @@ fn scalar_widget(ui: &mut Ui, t: &Theme, s: &Scalar, hint: &mc::Hint, wid: egui:
             let mut out = None;
             ui.horizontal(|ui| {
                 let r = switch(ui, t, *b);
-                let label = ui.add(egui::Label::new(RichText::new(if *b { "true" } else { "false" }).color(if *b { t.fg } else { t.muted })).sense(Sense::click()));
+                let word = match (hint.on_off, *b) {
+                    (true, true) => "on",
+                    (true, false) => "off",
+                    (false, true) => "true",
+                    (false, false) => "false",
+                };
+                let label = ui.add(egui::Label::new(RichText::new(word).color(if *b { t.fg } else { t.muted })).sense(Sense::click()));
                 if r.clicked() || label.clicked() || key(Nav::Toggle) || focus {
                     out = Some(Scalar::Bool(!b));
                 }
@@ -993,6 +1754,30 @@ fn scalar_widget(ui: &mut Ui, t: &Theme, s: &Scalar, hint: &mc::Hint, wid: egui:
             }
             (r.changed() && x != *v).then_some(Scalar::Float(x))
         }
+        // A pack's information "button": one value, nothing to choose. Its name and text are the point.
+        Scalar::Str(_) if hint.allowed.len() == 1 => None,
+        // Values along a scale (a shader's sliders): a slider over the steps, showing the step's name.
+        Scalar::Str(v) if hint.steps && hint.allowed.len() > 1 => {
+            let steps = &hint.allowed;
+            let at = steps.iter().position(|x| x == v);
+            let mut i = at.unwrap_or(0);
+            let mut pick = None;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().slider_width = (ui.available_width() - 110.0).clamp(80.0, 240.0);
+                let r = ui.add(egui::Slider::new(&mut i, 0..=steps.len() - 1).show_value(false));
+                if focus {
+                    r.request_focus();
+                }
+                if r.changed() && Some(i) != at {
+                    pick = Some(steps[i].clone());
+                }
+                ui.label(RichText::new(hint.name_of(v)).color(t.fg));
+            });
+            if key(Nav::Toggle) {
+                pick = Some(steps[(at.map_or(0, |a| a + 1)) % steps.len()].clone());
+            }
+            pick.map(Scalar::Str)
+        }
         Scalar::Str(v) if !hint.allowed.is_empty() => {
             let mut options = hint.allowed.clone();
             if !options.contains(v) {
@@ -1000,10 +1785,10 @@ fn scalar_widget(ui: &mut Ui, t: &Theme, s: &Scalar, hint: &mc::Hint, wid: egui:
             }
             let mut pick = None;
             // Few short choices read best side by side; more go in a menu.
-            let short = options.len() <= 4 && options.iter().map(|o| o.chars().count() + 3).sum::<usize>() as f32 * t.body_size() * 0.62 < ui.available_width();
+            let short = options.len() <= 4 && options.iter().map(|o| hint.name_of(o).chars().count() + 3).sum::<usize>() as f32 * t.body_size() * 0.62 < ui.available_width();
             if short {
                 let mut cur = v.clone();
-                let opts: Vec<(String, &str)> = options.iter().map(|o| (o.clone(), o.as_str())).collect();
+                let opts: Vec<(String, &str)> = options.iter().map(|o| (o.clone(), hint.name_of(o))).collect();
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     for (val, label) in &opts {
@@ -1021,9 +1806,9 @@ fn scalar_widget(ui: &mut Ui, t: &Theme, s: &Scalar, hint: &mc::Hint, wid: egui:
                 });
             } else {
                 let width = (max_w - 8.0).clamp(120.0, 280.0);
-                egui::ComboBox::from_id_salt(wid).selected_text(v.as_str()).width(width).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt(wid).selected_text(hint.name_of(v)).width(width).show_ui(ui, |ui| {
                     for o in &options {
-                        if ui.selectable_label(o == v, o.as_str()).clicked() && o != v {
+                        if ui.selectable_label(o == v, hint.name_of(o)).clicked() && o != v {
                             pick = Some(o.clone());
                         }
                     }
@@ -1237,14 +2022,14 @@ fn highlight(t: &Theme, format: Format, text: &str, size: f32) -> LayoutJob {
             }
             push(plain..b.len(), t.fg_a(0.7));
         }
-        Format::Toml | Format::Text => {
+        Format::Toml | Format::Text | Format::Options | Format::ShaderSettings => {
             let mut start = 0;
             for line in text.split_inclusive('\n') {
                 let end = start + line.len();
                 let trimmed = line.trim_start();
                 let lead = start + (line.len() - trimmed.len());
                 push(start..lead, t.fg);
-                let comment_start = |c: u8| c == b'#' || (format == Format::Text && (c == b';' || c == b'!'));
+                let comment_start = |c: u8| c == b'#' || (format != Format::Toml && (c == b';' || c == b'!'));
                 if trimmed.bytes().next().is_some_and(comment_start) || trimmed.starts_with("//") {
                     push(lead..end, t.muted);
                 } else if trimmed.starts_with('[') {
@@ -1325,7 +2110,8 @@ pub fn guard(app: &mut App, ctx: &egui::Context) {
 /// Go where the user was heading.
 fn go(app: &mut App, away: &Away, ctx: &egui::Context) {
     match away {
-        Away::File(rel) => {
+        Away::File(area, rel) => {
+            app.config.area = *area;
             app.config.selected = Some(rel.clone());
             app.config.field_sel = None;
             app.config.field_filter.clear();
@@ -1406,7 +2192,7 @@ mod tests {
     #[test]
     fn files_filter_by_path_or_mod() {
         let f = |p: &str| mc::ConfigFile { rel: p.into(), size: 1, modified: None };
-        let groups = vec![Group { name: "Sodium".into(), icon: None, files: vec![f("sodium-options.json"), f("sodium-mixins.properties")] }, Group { name: "other".into(), icon: None, files: vec![f("mixins.json")] }];
+        let groups = vec![Group { name: "Sodium".into(), icon: None, ids: vec!["sodium".into()], files: vec![f("sodium-options.json"), f("sodium-mixins.properties")] }, Group { name: "other".into(), icon: None, ids: Vec::new(), files: vec![f("mixins.json")] }];
         let all: Vec<PathBuf> = visible(&groups, "").into_iter().flat_map(|(_, f)| f).collect();
         assert_eq!(all.len(), 3);
         let sodium: Vec<PathBuf> = visible(&groups, "sodium").into_iter().flat_map(|(_, f)| f).collect();

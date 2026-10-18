@@ -48,7 +48,8 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim 
 | `ui/mod.rs` | `App`, top/status bars, modals, key routing, launching, imports |
 | `ui/nav.rs` | Focus zones, `Nav`, hints bar and `?` help, both built from the keymap |
 | `ui/instances.rs` | Sidebar (groups, drag-and-drop, context menu) + instance header + tab dispatch |
-| `mod_config.rs`, `ui/config.rs` | Config tab: `config/` files grouped by mod; TOML (`toml_edit` spans) and JSON/JSON5 (own parser) as fields with comment hints (range, allowed values, default); edits splice only the value's bytes; conflict-checked saves |
+| `vanilla_options.rs`, `shader_config.rs` | The configs tab's other parts: `options.txt` as named, sectioned fields (`KNOWN` table; unknown keys under "other"); shader pack options read from the pack (`#define`s, `const`s with `// [values]`, `shaders.properties` screens and sliders, `lang/en_us.lang` names), saved to `shaderpacks/<pack>.txt` |
+| `mod_config.rs`, `ui/config.rs` | Configs tab (minecraft · mods · shaders): `config/` files grouped by mod (folding, kept in `<data>/config-view.toml`); TOML (`toml_edit` spans) and JSON/JSON5 (own parser) as fields with comment hints (range, allowed values, default); edits splice only the value's bytes; conflict-checked saves |
 | `mod_sets.rs`, `bisect.rs`, `ui/mod_sets.rs` | Mod sets (`mod_sets.toml`: named on/off arrangements keyed by jar mod id, else versionless file name); the search for the breaking mod (`bisect.toml`: dependency-closed halving, a confirming step, exact restore); the mods tab's set line, sets dialog, search dialogs and banner |
 | `crash.rs` | Crash analysis: suspects from crash reports and logs (loader errors, unmet dependencies, mixins, entrypoints, Suspected Mods, stack frames matched to jars by package), non-mod causes; jar facts cached by path/size/mtime |
 | `ui/{version,content,worlds,servers,screenshots,logs}.rs` | Per-instance tabs (content also has mod updates and the rollback dialogs; worlds has the backups pane; log history has the crash analysis panel) |
@@ -213,6 +214,20 @@ test (and a rule here) with any fix that sets a new one.
   loaded (the game rewrites configs), unless the user chooses to keep their changes. Only files that resolve inside
   `config/` open (`mod_config::resolve`), up to `MAX_OPEN` (1 MiB). Leaving a file, tab, instance or the app with
   unsaved changes asks first (`config::guard`), and play refuses while the instance has unsaved config changes.
+  File groups and settings headers start folded and are remembered open (`config-view.toml`, UI state only: never
+  inside an instance). Forge's lone `#.` comment lines aren't descriptions (`forge_spacer_dots_are_not_descriptions`).
+  `options.txt` keeps each value as written (quoted stays quoted, a choice like graphics `1` stays a number).
+  Shader packs are only read, zipped or not (entries with `..` skipped, size-capped); the one file written is the
+  pack's settings file, which holds only options changed from the pack's defaults (Iris's own rule), and a switch
+  counts as an option only if the code tests it (`#ifdef`/`defined`). A profile is one more field (`<profile>`):
+  choosing it sets only the options it names (following `profile.OTHER`), and it reads "custom" when the options
+  match no profile, as in the game. "restore defaults" puts every field with a known default back (vanilla defaults
+  are in `KNOWN`/`BINDINGS`), as an unsaved edit. Key bindings are set by pressing the key (`config::capture` takes
+  the next key, mouse button or newly held modifier; esc cancels), written in GLFW's names (`key.keyboard.w`).
+  "use this pack" / "turn shaders off" change only `shaderPack`/`enableShaders` in Iris's `config/iris.properties`
+  (Java-escaped, as Iris writes it) or `shaderPack` in OptiFine's `optionsshaders.txt`, and not while the game runs
+  (it saves its own choice on quit). Tests: `vanilla_options::tests`, `shader_config::tests` (incl.
+  `profiles_set_their_options_and_are_recognised`, `using_a_pack_changes_only_its_lines`).
   Widgets must not change a value just by drawing it: sliders use `SliderClamping::Edits`, `DragValue` uses
   `clamp_existing_to_range(false)`, and nothing rounds. Tests: `mod_config::tests` (incl.
   `toml_edits_round_trip_byte_for_byte`, `json5_edits_round_trip_byte_for_byte`, `only_files_inside_config_open`,
@@ -221,15 +236,15 @@ test (and a rule here) with any fix that sets a new one.
   `mod_sets::key`: the jar's own id, else `file:` and the file name without its version, so updates keep membership.
   Switching only renames (`.disabled`), runs as a mod job, and is refused while the game starts or runs, mods install
   or update, or a search has them. A mod switched on that the active set hasn't seen joins it (`ModSets::absorb`);
-  mods a set has never seen are off after a switch, and the mods tab offers to add them. Tests: `mod_sets::tests`
+  mods a set has never seen are off after a switch, and the mods tab offers to add them. The sets dialog edits a set's mods as a checklist without touching the mods folder (`ModSets::set_mods`); ticking a mod ticks what it requires (`mod_sets::with_needs`), and an unticked mod a ticked one requires is flagged. Tests: `mod_sets::tests`
   (incl. `switching_sets_is_exact`, `membership_survives_an_update_rename`,
-  `new_mods_join_the_active_set_and_stay_off_elsewhere`).
+  `new_mods_join_the_active_set_and_stay_off_elsewhere`, `sets_are_edited_without_touching_the_mods`).
 - **Finding the breaking mod:** `bisect.toml` keeps the exact original on/off state, and every end (stop, keep, turn it
   off) restores it before anything else. Each step's mods are closed over required dependencies (`Bisect::closure`),
   so no mod runs without what it needs; "turn it off" also disables whatever needs the culprit. A single suspect is
   only "found" after a step with everything but it on. While a search exists, the mods tab doesn't toggle, remove,
   install, update, roll back or switch sets, and says so once (the banner). A crash analysis starts a search with its
-  suspects first (`mod_sets::open_bisect`). Tests: `bisect::tests`.
+  suspects first (`mod_sets::open_bisect`). Answers are only sent from the question dialog, where a click selects and "answer" sends, so a slip can be corrected. Tests: `bisect::tests`.
 - **Crash analysis:** `crash::analyze_with` only says "certain" for what a loader or Minecraft states outright; stack
   frames and Suspected Mods are "likely" at best, frames below the top 8 "possible", and with nothing likely the
   headline says no single mod stands out. Frames from Minecraft, loaders, Java and common libraries (`LIBRARIES`,

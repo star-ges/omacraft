@@ -306,6 +306,13 @@ impl ContentState {
         Some((entries, titles))
     }
 
+    /// Icons of `inst`'s `kind` files by file name, as their tab shows them (looked up in the background).
+    pub fn icons(&mut self, inst: &Instance, kind: ContentKind, rt: &tokio::runtime::Handle, ctx: &egui::Context) -> HashMap<String, PathBuf> {
+        let files = self.kinds.entry(kind).or_default().files(inst, kind);
+        self.meta.ensure(&files, kind, rt, ctx);
+        files.iter().filter_map(|f| Some((f.name.clone(), self.meta.get(f)?.icon?))).collect()
+    }
+
     /// A mod's name from its metadata, if read yet.
     pub fn title(&self, f: &ModFile) -> Option<String> {
         self.meta.get(f).and_then(|m| m.name)
@@ -472,9 +479,30 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
         }),
         _ => None,
     };
+    // Each mod that has config files → its group in the config tab.
+    let mut configs: HashMap<PathBuf, String> = HashMap::new();
+    if kind == ContentKind::Mods {
+        let groups = app.config.mod_groups(inst, &rt, &ctx);
+        for f in &files {
+            let Some(info) = meta.get(f) else { continue };
+            let title = info.name.clone().unwrap_or_else(|| f.display_name().to_string());
+            if let Some((_, name)) = groups.iter().find(|(ids, name)| info.mod_id.as_ref().is_some_and(|id| ids.contains(id)) || *name == title) {
+                configs.insert(f.path.clone(), name.clone());
+            }
+        }
+    }
+    // Each shader pack → its options, the same way.
+    if kind == ContentKind::ShaderPacks {
+        let packs = app.config.pack_names(inst, &rt, &ctx);
+        for f in &files {
+            if packs.contains(&f.name) {
+                configs.insert(f.path.clone(), f.name.clone());
+            }
+        }
+    }
     let s = app.content.kinds.entry(kind).or_default();
     ui.columns(2, |cols| {
-        installed(&mut cols[0], &t, s, &meta, inst, kind, main_nav, zone == Zone::Main, ups.as_ref(), &mut out);
+        installed(&mut cols[0], &t, s, &meta, inst, kind, main_nav, zone == Zone::Main, ups.as_ref(), &configs, &mut out);
         browse(&mut cols[1], &t, s, &meta, &remote, inst, kind, &rt, &ctx, focus, side_nav, zone == Zone::Side, blocked, &mut out);
     });
     if out.check {
@@ -486,6 +514,14 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
     }
     if out.roll_back {
         open_roll_back(app, inst);
+    }
+    if let Some(name) = out.config {
+        if kind == ContentKind::ShaderPacks {
+            super::config::open_pack(app, &name);
+        } else {
+            super::config::open_group(app, inst, &name);
+        }
+        return;
     }
     if focus || out.to_results {
         app.focus = Zone::Side;
@@ -517,6 +553,8 @@ struct Out {
     check: bool,
     update: Option<Vec<Update>>,
     roll_back: bool,
+    /// Show this config group in the config tab.
+    config: Option<String>,
 }
 
 /// The mods tab's update state, for the installed pane.
@@ -760,6 +798,7 @@ fn installed(
     kb: Option<Nav>,
     focused: bool,
     ups: Option<&Updates>,
+    configs: &HashMap<PathBuf, String>,
     out: &mut Out,
 ) {
     let files = s.files(inst, kind);
@@ -797,6 +836,12 @@ fn installed(
             {
                 out.update = Some(vec![u.clone()]);
             }
+        }
+        // Configs can be looked at whatever the mods are doing.
+        if let Some(name) = sel.as_ref().and_then(|m| configs.get(&m.path))
+            && (w::button(ui, "config").on_hover_text(config_hover(kind)).clicked() || key(Nav::Cycle))
+        {
+            out.config = Some(name.clone());
         }
         if w::button(ui, "folder").clicked() || key(Nav::Folder) {
             super::open_path(&inst.game_dir().join(kind.dir()));
@@ -862,7 +907,11 @@ fn installed(
             if !m.enabled {
                 right.push("disabled".into());
             }
-            let r = w::rich_row_dim(ui, t, sel, lead, &title, &sub.join("  ·  "), &right.join("  ·  "), !m.enabled);
+            let action = configs.get(&m.path).map(|_| (CONFIG_GLYPH, config_hover(kind)));
+            let (r, config) = w::rich_row_action(ui, t, sel, lead, &title, &sub.join("  ·  "), &right.join("  ·  "), !m.enabled, action);
+            if config {
+                out.config = configs.get(&m.path).cloned();
+            }
             if sel && focused {
                 w::focus_mark(ui, t, r.rect);
             }
@@ -881,6 +930,12 @@ fn installed(
             }
         }
     });
+}
+
+const CONFIG_GLYPH: &str = "\u{f0493}";
+
+fn config_hover(kind: ContentKind) -> &'static str {
+    if kind == ContentKind::ShaderPacks { "change this pack's options" } else { "edit this mod's config files" }
 }
 
 /// How long typing has to pause before the Modrinth search goes out.

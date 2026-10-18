@@ -365,20 +365,20 @@ impl Bisect {
             (StepKind::Narrow, Answer::Skip) => {
                 self.skips += 1;
                 if self.skips > self.suspects.len() {
-                    self.done = Some(Done { culprits: Vec::new(), confirmed: false, note: "Too many steps couldn't be told apart to narrow it down.".into() });
+                    self.done = Some(Done { culprits: Vec::new(), confirmed: false, note: "Too many steps couldn't be told apart to narrow the problem down.".into() });
                 }
             }
             (StepKind::Confirm, Answer::Works) => {
-                self.done = Some(Done { culprits: culprits(self), confirmed: true, note: "With it off, the problem went away.".into() });
+                self.done = Some(Done { culprits: culprits(self), confirmed: true, note: "With this mod off, the problem went away.".into() });
             }
             (StepKind::Confirm, Answer::Skip) => {
-                self.done = Some(Done { culprits: culprits(self), confirmed: false, note: "It's the likely one, though the last check couldn't confirm it.".into() });
+                self.done = Some(Done { culprits: culprits(self), confirmed: false, note: "This is the likely mod, though the last check couldn't confirm it.".into() });
             }
             (StepKind::Confirm, Answer::Broken) => {
                 self.done = Some(Done {
                     culprits: Vec::new(),
                     confirmed: false,
-                    note: "The problem happened even with the last suspect off, so it isn't one mod alone. It may need two mods together, come from a mod you kept on, or not happen every time.".into(),
+                    note: "The problem occurred even with the last suspect off, so no single mod causes it. The problem may need two mods together, come from a mod you kept on, or not occur every time.".into(),
                 });
             }
         }
@@ -387,7 +387,7 @@ impl Bisect {
                 self.done = Some(Done {
                     culprits: Vec::new(),
                     confirmed: false,
-                    note: "Every half worked on its own, so it isn't one mod alone. It may need two mods together, or not happen every time.".into(),
+                    note: "Every half worked on its own, so no single mod causes the problem. The problem may need two mods together, or not occur every time.".into(),
                 });
             } else {
                 self.step = Some(self.plan());

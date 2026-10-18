@@ -62,13 +62,14 @@ impl Change {
         self.enable.is_empty() && self.disable.is_empty()
     }
 
-    /// "enables 3, disables 12", or "changes nothing".
+    /// "enables 3 mods and disables 1 mod", or "changes nothing".
     pub fn summary(&self) -> String {
+        let mods = |n: usize| if n == 1 { "1 mod".to_string() } else { format!("{n} mods") };
         match (self.enable.len(), self.disable.len()) {
             (0, 0) => "changes nothing".into(),
-            (e, 0) => format!("enables {e}"),
-            (0, d) => format!("disables {d}"),
-            (e, d) => format!("enables {e}, disables {d}"),
+            (e, 0) => format!("enables {}", mods(e)),
+            (0, d) => format!("disables {}", mods(d)),
+            (e, d) => format!("enables {} and disables {}", mods(e), mods(d)),
         }
     }
 }
@@ -104,6 +105,41 @@ pub fn scan(inst: &Instance) -> Vec<Entry> {
             Entry { key: key(id.as_deref(), &f.name), file: f }
         })
         .collect()
+}
+
+/// Each installed mod's key → the keys of the installed mods it requires. Reads the jars: run it off the UI thread.
+pub fn needs(entries: &[Entry]) -> BTreeMap<String, BTreeSet<String>> {
+    let links: Vec<(&Entry, BTreeSet<String>, BTreeSet<String>)> = entries
+        .iter()
+        .map(|e| {
+            let (provides, requires) = crate::bisect::jar_links(&e.file.path);
+            (e, provides, requires)
+        })
+        .collect();
+    let mut by_id: BTreeMap<&str, &str> = BTreeMap::new();
+    for (e, provides, _) in &links {
+        for id in provides {
+            by_id.insert(id, &e.key);
+        }
+    }
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (e, _, requires) in &links {
+        let keys = requires.iter().filter_map(|id| by_id.get(id.as_str())).filter(|k| **k != e.key).map(|k| k.to_string());
+        out.entry(e.key.clone()).or_default().extend(keys);
+    }
+    out
+}
+
+/// `keys` and everything they require, transitively, by `needs`.
+pub fn with_needs(keys: &[String], needs: &BTreeMap<String, BTreeSet<String>>) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    let mut todo: Vec<String> = keys.to_vec();
+    while let Some(k) = todo.pop() {
+        if out.insert(k.clone()) {
+            todo.extend(needs.get(&k).into_iter().flatten().cloned());
+        }
+    }
+    out
 }
 
 /// Keys with at least one enabled file, and keys with none.
@@ -234,6 +270,17 @@ impl ModSets {
         Ok(())
     }
 
+    /// Put `keys` on or off in set `name`, without touching the mods themselves.
+    pub fn set_mods(&mut self, name: &str, keys: &[String], on: bool) -> anyhow::Result<()> {
+        let set = self.get_mut(name).with_context(|| format!("no set called “{name}”"))?;
+        for k in keys {
+            let (to, from) = if on { (&mut set.on, &mut set.off) } else { (&mut set.off, &mut set.on) };
+            from.remove(k);
+            to.insert(k.clone());
+        }
+        Ok(())
+    }
+
     /// Note that the active set keeps these mods (which it hadn't seen) off.
     pub fn keep_off(&mut self, keys: &[String]) {
         let active = self.active.clone();
@@ -350,6 +397,34 @@ pub mod tests {
     }
 
     #[test]
+    fn sets_are_edited_without_touching_the_mods() {
+        let inst = inst("sets edit");
+        jar(&inst, "api-1.jar", Some("api"), &[]);
+        jar(&inst, "menu-1.jar", Some("menu"), &["api"]);
+        jar(&inst, "map-1.jar", Some("map"), &["menu"]);
+        jar(&inst, "plain-2.1.jar", None, &[]);
+        let entries = scan(&inst);
+        let mut sets = ModSets::default();
+        sets.add("full", &entries).unwrap();
+        sets.add("light", &entries).unwrap();
+
+        // Ticking the map on in an empty set brings what it needs, all the way down.
+        sets.set_mods("light", &entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>(), false).unwrap();
+        let needs = needs(&entries);
+        assert_eq!(needs["map"], BTreeSet::from(["menu".to_string()]));
+        let on: Vec<String> = with_needs(&["map".into()], &needs).into_iter().collect();
+        assert_eq!(on, ["api", "map", "menu"]);
+        sets.set_mods("light", &on, true).unwrap();
+        let light = sets.get("light").unwrap();
+        assert_eq!(light.on.iter().collect::<Vec<_>>(), ["api", "map", "menu"]);
+        assert_eq!(light.off.iter().collect::<Vec<_>>(), ["file:plain"]);
+        assert_eq!(sets.get("full").unwrap().on.len(), 4, "other sets are left alone");
+        assert_eq!(on_names(&inst).len(), 4, "editing a set doesn't switch mods");
+        assert_eq!(light.change(&scan(&inst)).summary(), "disables 1 mod");
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+    }
+
+    #[test]
     fn keys_ignore_versions() {
         assert_eq!(key(Some("sodium"), "whatever.jar"), "sodium");
         assert_eq!(key(None, "sodium-fabric-0.5.8+mc1.20.1.jar"), "file:sodium-fabric");
@@ -379,11 +454,11 @@ pub mod tests {
         assert_eq!(load(&inst).unwrap(), sets);
 
         let c = switch(&inst, "full").unwrap();
-        assert_eq!(c.summary(), "enables 2");
+        assert_eq!(c.summary(), "enables 2 mods");
         assert_eq!(on_names(&inst), ["create-6.0.jar", "iris-1.8.jar", "plain-2.1.jar", "sodium-0.6.jar"]);
         assert!(!load(&inst).unwrap().modified(&scan(&inst)));
         let c = switch(&inst, "perf").unwrap();
-        assert_eq!(c.summary(), "disables 2");
+        assert_eq!(c.summary(), "disables 2 mods");
         assert_eq!(on_names(&inst), ["iris-1.8.jar", "sodium-0.6.jar"]);
         assert!(switch(&inst, "perf").unwrap().is_empty(), "switching to the active set changes nothing");
         std::fs::remove_dir_all(inst.dir()).unwrap();

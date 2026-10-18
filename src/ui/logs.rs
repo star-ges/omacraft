@@ -131,19 +131,33 @@ pub fn live(app: &mut App, ui: &mut Ui, inst: &Instance) {
 /// "game crashed · likely cause: Sodium 0.5.8   [see why] [dismiss]"
 fn crash_banner(ui: &mut Ui, t: &Theme, headline: &str, see: &mut bool, dismiss: &mut bool) {
     egui::Frame::new().fill(Theme::alpha(t.red, 0.06)).stroke(Stroke::new(1.0, Theme::alpha(t.red, 0.45))).inner_margin(egui::Margin::symmetric(12, 8)).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                *dismiss |= w::button(ui, "dismiss").clicked();
-                *see |= w::button(ui, "see why").clicked();
-                ui.add_space(8.0);
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.label(RichText::new(CRASH).color(t.red));
-                    ui.label(RichText::new("game crashed").color(t.fg_light));
-                    ui.label(RichText::new("·").color(t.muted));
-                    ui.add(egui::Label::new(RichText::new(headline).color(t.fg)).truncate());
+        // Too narrow for the headline beside the buttons: it wraps on its own line, buttons below.
+        if ui.available_width() - w::buttons_width(ui, &["dismiss", "see why"]) >= 260.0 {
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    *dismiss |= w::button(ui, "dismiss").clicked();
+                    *see |= w::button(ui, "see why").clicked();
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(RichText::new(CRASH).color(t.red));
+                        ui.label(RichText::new("game crashed").color(t.fg_light));
+                        ui.label(RichText::new("·").color(t.muted));
+                        ui.add(egui::Label::new(RichText::new(headline).color(t.fg)).truncate());
+                    });
                 });
             });
-        });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(CRASH).color(t.red));
+                ui.label(RichText::new("game crashed").color(t.fg_light));
+            });
+            w::para(ui, RichText::new(headline).color(t.fg));
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                *see |= w::button(ui, "see why").clicked();
+                *dismiss |= w::button(ui, "dismiss").clicked();
+            });
+        }
     });
 }
 
@@ -387,7 +401,9 @@ pub fn history(app: &mut App, ui: &mut Ui, inst: &Instance) {
     let key = |n: Nav| list_nav == Some(n) || view_nav == Some(n);
 
     let mut clicked = false;
-    egui::Panel::left("log-files").exact_size(260.0).resizable(false).frame(egui::Frame::new().inner_margin(egui::Margin { right: 12, ..Default::default() })).show(ui, |ui| {
+    // Narrow windows give the list less, so the log keeps room to read.
+    let list_w = (ui.available_width() * 0.36).clamp(190.0, 260.0);
+    egui::Panel::left("log-files").exact_size(list_w).resizable(false).frame(egui::Frame::new().inner_margin(egui::Margin { right: 12, ..Default::default() })).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("log-files").auto_shrink(false).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
             for f in &files {
@@ -410,8 +426,15 @@ pub fn history(app: &mut App, ui: &mut Ui, inst: &Instance) {
     });
 
     let mut copy = key(Nav::Copy);
+    // Buttons first (right to left), then the filter in what's left, never wider than 220; on its own line below
+    // them when there's too little left.
+    let why_button = has_analysis && s.panel.hidden;
+    let mut labels = vec!["copy", "open", "folder"];
+    if why_button {
+        labels.push("why it crashed");
+    }
+    let filter_below = ui.available_width() - w::buttons_width(ui, &labels) < 140.0;
     ui.horizontal(|ui| {
-        w::text_input(ui, &mut s.filter, "filter", 220.0, key(Nav::Search));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             copy |= w::button(ui, "copy").clicked();
             if w::button(ui, "open").clicked() || key(Nav::Activate) {
@@ -420,11 +443,21 @@ pub fn history(app: &mut App, ui: &mut Ui, inst: &Instance) {
             if w::button(ui, "folder").clicked() || key(Nav::Folder) {
                 super::open_path(sel.parent().unwrap());
             }
-            if has_analysis && s.panel.hidden && w::button(ui, "why it crashed").clicked() {
+            if why_button && w::button(ui, "why it crashed").clicked() {
                 s.panel.hidden = false;
+            }
+            if !filter_below {
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    let width = (ui.available_width() - 16.0).min(220.0);
+                    w::text_input(ui, &mut s.filter, "filter", width, key(Nav::Search));
+                });
             }
         });
     });
+    if filter_below {
+        ui.add_space(4.0);
+        w::text_input(ui, &mut s.filter, "filter", ui.available_width() - 16.0, key(Nav::Search));
+    }
     ui.add_space(6.0);
 
     let mut out = PanelOut::default();
@@ -591,24 +624,45 @@ fn panel(ui: &mut Ui, t: &Theme, a: &Analysis, st: &mut Panel, kb: Option<Nav>, 
     let max_h = (ui.available_height() * 0.5).max(160.0);
     egui::Frame::new().fill(t.fg_a(0.025)).stroke(Stroke::new(1.0, border)).inner_margin(egui::Margin::symmetric(14, 12)).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        // Headline, with the panel's actions laid out first so it never runs under them.
-        ui.horizontal(|ui| {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if w::button(ui, "hide").clicked() {
-                    st.hidden = true;
+        // Headline, with the panel's actions laid out first so it never runs under them. When they'd leave the
+        // headline too little room, it gets a line of its own (wrapped) and the actions go underneath.
+        let labels: &[&str] = if a.crashed { &["hide", "copy summary", "find the breaking mod"] } else { &["hide", "copy summary"] };
+        // Laid out right to left beside the headline, left to right under it: either way "hide" ends up last.
+        let actions = |ui: &mut Ui, st: &mut Panel, out: &mut PanelOut, order: &mut dyn Iterator<Item = &&str>| {
+            for l in order {
+                if w::button(ui, l).clicked() {
+                    match *l {
+                        "hide" => st.hidden = true,
+                        "copy summary" => out.copy = true,
+                        _ => out.bisect = true,
+                    }
                 }
-                out.copy |= w::button(ui, "copy summary").clicked();
-                if a.crashed && w::button(ui, "find the breaking mod").clicked() {
-                    out.bisect = true;
-                }
-                ui.add_space(8.0);
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.label(RichText::new(CRASH).color(tone).size(t.body_size() + 2.0));
-                    ui.add_space(2.0);
-                    ui.add(egui::Label::new(RichText::new(a.headline()).font(crate::theme::bold(t.body_size() + 1.0)).color(t.fg_light)).truncate());
+            }
+        };
+        let headline = RichText::new(a.headline()).font(crate::theme::bold(t.body_size() + 1.0)).color(t.fg_light);
+        let glyph = RichText::new(CRASH).color(tone).size(t.body_size() + 2.0);
+        if ui.available_width() - w::buttons_width(ui, labels) >= 240.0 {
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    actions(ui, st, &mut out, &mut labels.iter());
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.label(glyph);
+                        ui.add_space(2.0);
+                        ui.add(egui::Label::new(headline).truncate());
+                    });
                 });
             });
-        });
+        } else {
+            ui.horizontal_top(|ui| {
+                ui.label(glyph);
+                ui.add_space(2.0);
+                w::para(ui, headline);
+            });
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| actions(ui, st, &mut out, &mut labels.iter().rev()));
+            ui.add_space(4.0);
+        }
         let mut sub = Vec::new();
         if let Some(d) = &a.description {
             sub.push(format!("minecraft says: {}", d.to_lowercase()));
@@ -729,17 +783,21 @@ fn suspect_row(ui: &mut Ui, t: &Theme, tag_w: f32, s: &crate::crash::Suspect, on
         let cy = rect.center().y;
         let x0 = rect.left() + 8.0;
         p.text(egui::pos2(x0, cy), egui::Align2::LEFT_CENTER, s.confidence.label(), egui::FontId::monospace(size - 1.0), confidence_color(t, s.confidence));
-        let name = p.layout_no_wrap(s.label(), crate::theme::bold(size), t.fg_light);
         let nx = x0 + tag_w;
-        let name_w = name.size().x.min(rect.width() * 0.45);
-        let clip = egui::Rect::from_min_max(egui::pos2(nx, rect.top()), egui::pos2(nx + name_w, rect.bottom()));
-        p.with_clip_rect(clip).galley(egui::pos2(nx, cy - name.size().y / 2.0), name, t.fg_light);
+        // The name gets up to 45% of the row (all that's left when it's narrow), cut with an ellipsis.
+        let mut job = egui::text::LayoutJob::single_section(s.label(), egui::TextFormat { font_id: crate::theme::bold(size), color: t.fg_light, ..Default::default() });
+        job.wrap = egui::text::TextWrapping { max_width: (rect.width() * 0.45).min(rect.right() - 8.0 - nx).max(0.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+        let name = p.layout_job(job);
+        let name_w = name.size().x;
+        p.galley(egui::pos2(nx, cy - name.size().y / 2.0), name, t.fg_light);
         let rx = nx + name_w + 14.0;
         // The reason gets what's left of the row, cut with an ellipsis.
         let mut job = egui::text::LayoutJob::single_section(s.reason.clone(), egui::TextFormat { font_id: egui::FontId::monospace(size - 1.0), color: t.fg, ..Default::default() });
         job.wrap = egui::text::TextWrapping { max_width: (rect.right() - 8.0 - rx).max(0.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-        let reason = p.layout_job(job);
-        p.galley(egui::pos2(rx, cy - reason.size().y / 2.0), reason, t.fg);
+        if rect.right() - 8.0 - rx >= 40.0 {
+            let reason = p.layout_job(job);
+            p.galley(egui::pos2(rx, cy - reason.size().y / 2.0), reason, t.fg);
+        }
     }
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }

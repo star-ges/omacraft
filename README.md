@@ -57,11 +57,16 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
   came in another way (imports, jars added by hand) and clears cached downloads no instance uses.
 - **Export**: a Modrinth pack (`.mrpack`) or an instance zip that Prism, PolyMC and MultiMC open.
   You choose which folders go in.
-- **Per-instance tabs**: version and loader, live game log, mods, mod configs, resource packs, shader packs,
+- **Per-instance tabs**: version and loader, live game log, mods, resource packs, shader packs, configs (game, mods, shaders),
   notes, worlds (open one directly on 1.20+, rename, duplicate, delete), servers (edit the list, join directly),
   screenshots (just this instance's, or every instance's at once) and past logs and crash reports.
-- **Config editor**: the config tab lists each mod's config files and edits TOML, JSON and JSON5 settings as
-  switches, sliders and choices, with the mod's own descriptions, ranges and defaults; other files edit as text.
+- **Config editor**: the configs tab has three parts. **minecraft** is the game's own `options.txt`, named and
+  grouped like its menus (video, sound, controls, chat…), key bindings set by pressing the key. **mods** lists each mod's config files (`c` or the cog on
+  a mod in the mods tab goes straight there) and edits TOML, JSON and JSON5 settings as switches, sliders and
+  choices, with the mod's own descriptions, ranges and defaults; other files edit as text. **shaders** shows each
+  shader pack's options and profiles with the pack's own names, menus and sliders, saved where Iris and OptiFine
+  read them (the cog on a pack in the shader packs tab goes there), and "use this pack" switches to it. Every file has "restore defaults". Mods and
+  headers fold, and stay as you left them.
   Saving changes only the values you touched, never overwrites a file the game rewrote meanwhile without asking,
   and nothing unsaved is lost on the way out.
 - **Mod sets**: save the mods as they are as a named set ("performance", "full pack") and switch between sets in
@@ -71,7 +76,7 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
   Java, and out-of-memory or graphics-driver crashes are explained in plain words. Disable the suspect right there,
   or copy a summary for a bug report.
 - **Find the breaking mod**: `b` in the mods tab (or the crash analysis) turns about half the mods off at a time.
-  You play and say whether the problem happened, and a few games later Omacraft names the mod, then puts
+  You play and say whether the problem occurred, and a few games later Omacraft names the mod, then puts
   everything back exactly as it was.
 - **Groups**: collapsible groups in the instance list, each with an optional colour from the theme.
   Drag instances between them, or press `g` to manage them.

@@ -178,7 +178,7 @@ pub fn hints(app: &App) -> Vec<(String, &'static str)> {
             (l(Import), "import"),
             (l(Export), "export"),
             (l(Edit), "edit"),
-            (l(Cycle), "icon"),
+            (l(ChangeIcon), "icon"),
             (l(Search), "filter"),
         ]),
         Tab::Instances => {
@@ -200,7 +200,10 @@ pub fn hints(app: &App) -> Vec<(String, &'static str)> {
                 (InstTab::Worlds, true) => vec![(p(Down, Up), "backups"), (l(Activate), "restore"), (l(Add), "back up now"), (l(Delete), "delete"), (l(Folder), "folder")],
                 (InstTab::Servers, _) => vec![(p(Down, Up), "servers"), (l(Activate), "join"), (l(Add), "add"), (l(Edit), "edit"), (p(MoveDown, MoveUp), "reorder"), (l(Delete), "remove")],
                 (InstTab::Screenshots, _) => vec![(p(Down, Up), "screenshots"), (l(Activate), "open"), (l(Copy), "copy"), (l(Delete), "delete"), (l(Folder), "folder"), (l(Toggle), "all instances")],
-                (InstTab::Config, false) => vec![(p(Down, Up), "files"), (l(FocusRight), "edit"), (l(Search), "filter"), (l(SaveConfig), "save"), (l(Folder), "folder")],
+                (InstTab::Config, false) if app.config.area != super::config::Area::Minecraft => {
+                    let what = if app.config.area == super::config::Area::Shaders { "packs" } else { "files" };
+                    vec![(l(ConfigArea), "minecraft/mods/shaders"), (p(Down, Up), what), (l(Toggle), "open/fold"), (l(FocusRight), "edit"), (l(Search), "filter"), (l(SaveConfig), "save"), (l(Folder), "folder")]
+                }
                 (InstTab::Config, true) if app.config.open.as_ref().is_some_and(|o| o.raw_mode()) => {
                     let mut v = vec![(l(Activate), "type"), ("esc".into(), "stop typing"), (l(SaveConfig), "save")];
                     if app.config.open.as_ref().is_some_and(|o| o.has_fields()) {
@@ -209,7 +212,7 @@ pub fn hints(app: &App) -> Vec<(String, &'static str)> {
                     v.push((l(Delete), "revert"));
                     v
                 }
-                (InstTab::Config, true) => vec![(p(Down, Up), "settings"), (l(Toggle), "switch"), (l(Activate), "edit"), (l(Delete), "default"), (l(SaveConfig), "save"), (l(RawConfig), "text"), (l(Search), "filter")],
+                (InstTab::Config, _) => vec![(l(ConfigArea), "minecraft/mods/shaders"), (p(Down, Up), "settings"), (l(Toggle), "switch / fold"), (l(Activate), "edit"), (l(Delete), "default"), (l(SaveConfig), "save"), (l(RawConfig), "text"), (l(Search), "filter")],
                 (InstTab::LogHistory, true) if app.logs.panel_focused() => {
                     vec![(p(Down, Up), "suspects"), (l(Activate), "show in log"), (l(Toggle), "disable/enable"), (l(Copy), "copy summary"), (l(Why), "back to the log")]
                 }
@@ -228,7 +231,8 @@ pub fn hints(app: &App) -> Vec<(String, &'static str)> {
                 (InstTab::Mods, false) if app.selected.as_ref().is_some_and(|id| app.mod_sets.seen_searching(id)) => {
                     vec![(p(Down, Up), "installed"), (l(FindBreaking), "answer the step"), (l(FocusRight), "modrinth"), (l(Search), "search")]
                 }
-                (InstTab::Mods, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(Update), "updates"), (l(RollBack), "roll back"), (l(ModSets), "sets"), (l(FindBreaking), "find breaking mod"), (l(FocusRight), "modrinth"), (l(Search), "search")],
+                (InstTab::Mods, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(Cycle), "config"), (l(Update), "updates"), (l(RollBack), "roll back"), (l(ModSets), "sets"), (l(FindBreaking), "find breaking mod"), (l(FocusRight), "modrinth"), (l(Search), "search")],
+                (InstTab::ShaderPacks, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(Cycle), "options"), (l(FocusRight), "modrinth"), (l(Search), "search")],
                 (_, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(FocusRight), "modrinth"), (l(Search), "search")],
                 (_, true) => vec![(p(Down, Up), "results"), (l(Activate), "install"), (l(Search), "search")],
             });

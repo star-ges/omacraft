@@ -2,7 +2,7 @@
 //! the mods tab, the sets dialog, the search's start dialog, the banner on the instance
 //! while a search runs, and the question after each test game.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -23,8 +23,10 @@ const SETS: &str = "\u{f0328}";
 const SEARCH: &str = "\u{f0349}";
 const FOUND: &str = "\u{f012c}";
 const NOT_FOUND: &str = "\u{f02d7}";
-const SAVE_INTO: &str = "save current mods into it";
-const SETS_MATCH: &str = "the mods match it";
+const SAVE_INTO: &str = "save currently enabled mods to set";
+const TICKED: &str = "\u{f0132}";
+const UNTICKED: &str = "\u{f0131}";
+const WARN: &str = "\u{f0026}";
 
 /// Each instance's sets and search, read from disk and read again when their files
 /// change (checked twice a second at most).
@@ -202,10 +204,10 @@ pub fn bar(app: &mut App, ui: &mut Ui, inst: &Instance, found: Option<(&[Entry],
                         open |= ui.add(egui::Label::new(name).sense(egui::Sense::click()).truncate()).on_hover_text("mod sets").on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
                         if modified {
                             ui.label(RichText::new("·").color(t.muted));
-                            ui.label(RichText::new("modified").color(t.yellow)).on_hover_text("the mods differ from the set: update it, or switch them back");
+                            ui.label(RichText::new("modified").color(t.yellow)).on_hover_text("the enabled mods differ from the set: update the set, or revert the mods");
                             if busy.is_none() {
-                                update = w::button(ui, "update set").on_hover_text(format!("save the mods as they are now into “{}”", set.name)).clicked();
-                                revert = w::button(ui, "revert").on_hover_text(format!("switch the mods back to “{}”", set.name)).clicked();
+                                update = w::button(ui, "update set").on_hover_text(format!("save the currently enabled mods to “{}”", set.name)).clicked();
+                                revert = w::button(ui, "revert").on_hover_text(format!("switch the mods back to match “{}”", set.name)).clicked();
                             }
                         }
                     }
@@ -276,7 +278,7 @@ pub fn bar(app: &mut App, ui: &mut Ui, inst: &Instance, found: Option<(&[Entry],
     } else if update && let (Some(set), Some((entries, _))) = (sets.active(), found) {
         let name = set.name.clone();
         if edit_sets(app, inst, |s| s.update(&name, entries)) {
-            app.toast(ToastKind::Info, format!("Saved the mods into “{name}”"));
+            app.toast(ToastKind::Info, format!("Saved the enabled mods to “{name}”"));
         }
     } else if revert && let Some(set) = sets.active() {
         switch(app, &ctx, inst, &set.name);
@@ -309,8 +311,10 @@ fn switch(app: &mut App, ctx: &egui::Context, inst: &Instance, name: &str) {
 pub struct SetsDialog {
     inst: Instance,
     /// The mods with their keys, read from the jars when the dialog opens.
-    scan: Option<Promise<Vec<Entry>>>,
+    scan: Option<Promise<(Vec<Entry>, Needs)>>,
     entries: Option<Vec<Entry>>,
+    /// Each mod's key → the installed mods it requires, so ticking one ticks those too.
+    needs: Needs,
     names: HashMap<String, String>,
     selected: usize,
     new_name: String,
@@ -318,18 +322,35 @@ pub struct SetsDialog {
     renaming: Option<String>,
     focus_new: bool,
     focus_rename: bool,
+    /// The keyboard is on the selected set's mods (else on the sets).
+    in_mods: bool,
+    mod_sel: usize,
+    filter: String,
+    focus_filter: bool,
+    /// What the last tick did besides itself ("also on: Fabric API, which Mod Menu needs").
+    note: Option<String>,
 }
+
+type Needs = BTreeMap<String, BTreeSet<String>>;
 
 /// Open the sets dialog for `inst`, with mod titles (by key) for its lists.
 pub fn open_sets(app: &mut App, ctx: &egui::Context, inst: &Instance, names: HashMap<String, String>) {
     let i = inst.clone();
-    let scan = Promise::spawn(&app.rt, ctx, async move { Ok(tokio::task::spawn_blocking(move || mod_sets::scan(&i)).await?) });
+    let scan = Promise::spawn(&app.rt, ctx, async move {
+        Ok(tokio::task::spawn_blocking(move || {
+            let entries = mod_sets::scan(&i);
+            let needs = mod_sets::needs(&entries);
+            (entries, needs)
+        })
+        .await?)
+    });
     let sets = app.mod_sets.sets(inst).unwrap_or_default();
     let selected = sets.sets.iter().position(|s| s.name == sets.active).unwrap_or(0);
     app.modal = Some(Modal::ModSets(Box::new(SetsDialog {
         inst: inst.clone(),
         scan: Some(scan),
         entries: None,
+        needs: Needs::new(),
         names,
         selected,
         new_name: String::new(),
@@ -337,6 +358,11 @@ pub fn open_sets(app: &mut App, ctx: &egui::Context, inst: &Instance, names: Has
         renaming: None,
         focus_new: sets.sets.is_empty(),
         focus_rename: false,
+        in_mods: false,
+        mod_sel: 0,
+        filter: String::new(),
+        focus_filter: false,
+        note: None,
     })));
 }
 
@@ -349,7 +375,9 @@ pub fn sets_dialog(app: &mut App, s: &mut SetsDialog, ui: &mut Ui) -> bool {
     if let Some(p) = &s.scan
         && let Some(r) = p.take()
     {
-        s.entries = Some(r.unwrap_or_default());
+        let (entries, needs) = r.unwrap_or_default();
+        s.entries = Some(entries);
+        s.needs = needs;
         s.scan = None;
     }
     let inst = s.inst.clone();
@@ -359,18 +387,37 @@ pub fn sets_dialog(app: &mut App, s: &mut SetsDialog, ui: &mut Ui) -> bool {
     if current.as_ref().map(|c| &c.name) != s.renaming.as_ref() {
         s.renaming = current.as_ref().map(|c| c.name.clone());
         s.rename = s.renaming.clone().unwrap_or_default();
+        s.note = None;
     }
+    // The selected set's checklist: every installed mod once (by key), the filter applied.
+    let rows: Vec<ModRow> = match (&current, &s.entries) {
+        (Some(set), Some(entries)) => mod_rows(set, entries, &s.names, &s.needs, &s.filter),
+        _ => Vec::new(),
+    };
 
     w::heading(ui, &t, "mod sets");
     ui.add_space(4.0);
-    w::para(ui, RichText::new(format!("Named arrangements of {}'s mods. Switching one turns mods on and off; nothing is removed.", inst.name)).color(t.muted));
+    w::para(ui, RichText::new(format!("Named arrangements of {}'s mods: tick a set's mods on the right. Switching to a set turns mods on and off; nothing is removed.", inst.name)).color(t.muted));
     ui.add_space(10.0);
 
     let kb = app.modal_nav();
     let key = |n: Nav| kb == Some(n);
-    if let Some(n) = kb.filter(|n| n.is_move()).and_then(|n| n.step(sets.sets.len(), Some(s.selected))) {
+    match kb {
+        Some(Nav::Right) if current.is_some() => s.in_mods = true,
+        Some(Nav::Left) => s.in_mods = false,
+        _ => {}
+    }
+    s.mod_sel = s.mod_sel.min(rows.len().saturating_sub(1));
+    let moved = kb.filter(|n| n.is_move());
+    if s.in_mods {
+        if let Some(n) = moved.and_then(|n| n.step(rows.len(), Some(s.mod_sel))) {
+            s.mod_sel = n;
+        }
+    } else if let Some(n) = moved.and_then(|n| n.step(sets.sets.len(), Some(s.selected))) {
         s.selected = n;
     }
+    let mut tick = if s.in_mods && key(Nav::Toggle) { rows.get(s.mod_sel).map(|r| (r.key.clone(), !r.on)) } else { None };
+    s.focus_filter |= key(Nav::Search) && current.is_some();
     s.focus_new |= key(Nav::Add);
     s.focus_rename |= key(Nav::Rename) && current.is_some();
     let blocked = switch_blocked(app, &inst);
@@ -394,11 +441,12 @@ pub fn sets_dialog(app: &mut App, s: &mut SetsDialog, ui: &mut Ui) -> bool {
                     right = format!("active · {right}");
                 }
                 let r = w::lead_row(ui, &t, on, Lead::Glyph(SETS), &set.name, &right, None);
-                if on {
+                if on && !s.in_mods {
                     w::focus_mark(ui, &t, r.rect);
                 }
                 if r.clicked() {
                     s.selected = n;
+                    s.in_mods = false;
                 }
                 if r.double_clicked() {
                     do_switch = true;
@@ -422,7 +470,7 @@ pub fn sets_dialog(app: &mut App, s: &mut SetsDialog, ui: &mut Ui) -> bool {
         // -- right: the selected set
         let ui = &mut cols[1];
         let Some(set) = &current else {
-            w::empty_state(ui, &t, SETS, "save your first set", "Give the mods as they are now a name, then change them and save another.");
+            w::empty_state(ui, &t, SETS, "save your first set", "Name a set below. A new set starts with the currently enabled mods; tick or untick mods to change the set.");
             return;
         };
         w::section(ui, &t, "name");
@@ -435,7 +483,27 @@ pub fn sets_dialog(app: &mut App, s: &mut SetsDialog, ui: &mut Ui) -> bool {
                 s.renaming = Some(new);
             }
         });
-        w::section(ui, &t, if set.name == sets.active { "the mods now" } else { "switching to it" });
+        let mut all: Option<bool> = None;
+        w::section(ui, &t, "mods in set");
+        ui.horizontal(|ui| {
+            if let Some(entries) = &s.entries {
+                let keys: BTreeSet<&String> = entries.iter().map(|e| &e.key).collect();
+                let on = keys.iter().filter(|k| set.on.contains(**k)).count();
+                ui.label(RichText::new(format!("{on} of {} on", keys.len())).color(t.muted).size(t.body_size() - 1.0));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if w::button(ui, "none").on_hover_text("untick the mods shown").clicked() {
+                    all = Some(false);
+                }
+                if w::button(ui, "all").on_hover_text("tick the mods shown").clicked() {
+                    all = Some(true);
+                }
+            });
+        });
+        if s.entries.as_ref().is_some_and(|e| e.len() > 8) || !s.filter.is_empty() {
+            w::text_input(ui, &mut s.filter, "filter", ui.available_width() - 16.0, std::mem::take(&mut s.focus_filter));
+            ui.add_space(4.0);
+        }
         match &s.entries {
             None => {
                 ui.horizontal(|ui| {
@@ -443,44 +511,81 @@ pub fn sets_dialog(app: &mut App, s: &mut SetsDialog, ui: &mut Ui) -> bool {
                     ui.label(RichText::new("reading the mods…").color(t.muted));
                 });
             }
-            Some(entries) => {
-                let c = set.change(entries);
-                let title_of_path = |p: &std::path::Path| {
-                    entries.iter().find(|e| e.file.path == p).map(|e| title_of(&s.names, &e.key)).unwrap_or_default()
-                };
-                if c.is_empty() {
-                    ui.label(RichText::new(SETS_MATCH).color(t.muted));
-                } else {
-                    ui.label(RichText::new(c.summary()).color(t.fg_light));
-                }
-                egui::ScrollArea::vertical().id_salt("mod-set-change").max_height(height - 150.0).auto_shrink([false, true]).show(ui, |ui| {
+            Some(_) => {
+                egui::ScrollArea::vertical().id_salt("mod-set-mods").max_height(height - 150.0).auto_shrink([false, true]).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    let mut lines: Vec<(bool, String)> = c.enable.iter().map(|p| (true, title_of_path(p))).chain(c.disable.iter().map(|p| (false, title_of_path(p)))).collect();
-                    lines.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
-                    for (on, name) in lines {
-                        ui.horizontal(|ui| {
-                            let (mark, color) = if on { ("+", t.green) } else { ("−", t.muted) };
-                            ui.label(RichText::new(mark).color(color));
-                            ui.add(egui::Label::new(RichText::new(name).color(if on { t.fg } else { t.muted })).truncate());
-                        });
+                    if rows.is_empty() {
+                        w::para(ui, RichText::new(if s.filter.is_empty() { "no mods installed" } else { "no mods match the filter" }).color(t.muted));
+                    }
+                    for (n, r) in rows.iter().enumerate() {
+                        let sel = s.in_mods && n == s.mod_sel;
+                        let (glyph, mark) = match (r.on, r.needed_by.is_empty()) {
+                            (true, _) => (TICKED, t.accent),
+                            (false, false) => (WARN, t.yellow),
+                            (false, true) => (UNTICKED, t.muted),
+                        };
+                        let (right, color) = if !r.needed_by.is_empty() {
+                            (needed_label(&r.needed_by), t.yellow)
+                        } else if r.on != r.now_on {
+                            let what = if r.on { "turns on" } else { "turns off" };
+                            (if r.seen { what.to_string() } else { format!("new · {what}") }, if r.on { t.green } else { t.muted })
+                        } else if !r.seen {
+                            ("new".to_string(), t.muted)
+                        } else {
+                            (String::new(), t.muted)
+                        };
+                        let row = w::check_row(ui, &t, sel, r.on, glyph, mark, &r.title, &right, color);
+                        if sel {
+                            w::focus_mark(ui, &t, row.rect);
+                            if moved.is_some() {
+                                row.scroll_to_me(None);
+                            }
+                        }
+                        if row.clicked() {
+                            s.in_mods = true;
+                            s.mod_sel = n;
+                            tick = Some((r.key.clone(), !r.on));
+                        }
                     }
                 });
-                if !c.unseen.is_empty() {
-                    let n = c.unseen.len();
-                    let text = format!("{} new to it {} off: {}", if n == 1 { "1 mod".to_string() } else { format!("{n} mods") }, if n == 1 { "stays" } else { "stay" }, list_titles(&s.names, &c.unseen));
-                    w::para(ui, RichText::new(text).color(t.muted));
-                }
             }
         }
-        ui.add_space(10.0);
+        if let Some(note) = &s.note {
+            ui.add_space(4.0);
+            w::para(ui, RichText::new(note).color(t.muted).size(t.body_size() - 1.0));
+        }
+        if let Some(on) = all {
+            let keys: Vec<String> = rows.iter().map(|r| r.key.clone()).collect();
+            let keys: Vec<String> = if on { mod_sets::with_needs(&keys, &s.needs).into_iter().collect() } else { keys };
+            if edit_sets(app, &inst, |x| x.set_mods(&set.name, &keys, on)) {
+                s.note = None;
+            }
+        }
+        if let Some((k, on)) = tick.take() {
+            // Ticking a mod ticks what it needs; unticking one that others need only warns (on its row).
+            let keys: Vec<String> = if on { mod_sets::with_needs(std::slice::from_ref(&k), &s.needs).into_iter().filter(|x| *x == k || !set.on.contains(x)).collect() } else { vec![k.clone()] };
+            if edit_sets(app, &inst, |x| x.set_mods(&set.name, &keys, on)) {
+                let also: Vec<String> = keys.iter().filter(|x| **x != k).cloned().collect();
+                s.note = (!also.is_empty()).then(|| format!("Also ticked {}, which {} needs.", list_titles(&s.names, &also), title_of(&s.names, &k)));
+            }
+        }
+
+        // What switching to the set (or, for the active one, applying it) would do; nothing when it matches.
+        ui.add_space(8.0);
+        let c = s.entries.as_ref().map(|e| set.change(e));
+        let active = set.name == sets.active;
+        if let Some(c) = c.as_ref().filter(|c| !c.is_empty()) {
+            w::para(ui, RichText::new(format!("set {}", c.summary())).color(t.fg_light));
+            ui.add_space(6.0);
+        }
         if let Some(why) = blocked {
             w::para(ui, RichText::new(format!("Can't switch while {why}.")).color(t.yellow));
             ui.add_space(4.0);
         }
-        let changes = s.entries.as_ref().is_some_and(|e| !set.change(e).is_empty());
-        ui.horizontal(|ui| {
+        let changes = c.as_ref().is_some_and(|c| !c.is_empty());
+        ui.horizontal_wrapped(|ui| {
             if changes {
-                do_switch |= ui.add_enabled_ui(blocked.is_none(), |ui| w::primary_button(ui, &t, "switch")).inner.clicked();
+                do_switch |= ui.add_enabled_ui(blocked.is_none(), |ui| w::primary_button(ui, &t, if active { "apply" } else { "switch" })).inner.clicked();
             }
             do_update |= ui.add_enabled_ui(s.entries.is_some() && changes, |ui| w::button(ui, SAVE_INTO)).inner.clicked();
             do_delete |= w::danger_button(ui, &t, "delete").clicked();
@@ -491,6 +596,10 @@ pub fn sets_dialog(app: &mut App, s: &mut SetsDialog, ui: &mut Ui) -> bool {
     ui.horizontal(|ui| {
         let k = |a| app.keymap.label(a);
         w::key_hint(ui, &t, &k(Action::Activate), "switch");
+        w::key_hint(ui, &t, &format!("{}/{}", k(Action::FocusLeft), k(Action::FocusRight)), "sets/mods");
+        if s.in_mods {
+            w::key_hint(ui, &t, &k(Action::Toggle), "tick");
+        }
         w::key_hint(ui, &t, &k(Action::Add), "new");
         w::key_hint(ui, &t, &k(Action::Rename), "rename");
         w::key_hint(ui, &t, &k(Action::Copy), SAVE_INTO);
@@ -511,7 +620,7 @@ pub fn sets_dialog(app: &mut App, s: &mut SetsDialog, ui: &mut Ui) -> bool {
         if let Some(why) = blocked.filter(|_| set.name == sets.active) {
             app.toast(ToastKind::Error, format!("Can't change the active set while {why}"));
         } else if edit_sets(app, &inst, |x| x.update(&set.name, entries)) {
-            app.toast(ToastKind::Info, format!("Saved the mods into “{}”", set.name));
+            app.toast(ToastKind::Info, format!("Saved the enabled mods to “{}”", set.name));
         }
     }
     if do_delete {
@@ -524,6 +633,48 @@ pub fn sets_dialog(app: &mut App, s: &mut SetsDialog, ui: &mut Ui) -> bool {
         return true;
     }
     close
+}
+
+/// One mod in the sets dialog's checklist.
+struct ModRow {
+    key: String,
+    title: String,
+    /// Ticked in the set.
+    on: bool,
+    /// Enabled in the mods folder now.
+    now_on: bool,
+    seen: bool,
+    /// Ticked mods that require this one, when it isn't ticked.
+    needed_by: Vec<String>,
+}
+
+/// "needed by Mod Menu", "needed by Mod Menu, Jade", "needed by Mod Menu + 5 more".
+fn needed_label(by: &[String]) -> String {
+    match by {
+        [a] => format!("needed by {a}"),
+        [a, b] => format!("needed by {a}, {b}"),
+        [a, rest @ ..] => format!("needed by {a} + {} more", rest.len()),
+        [] => String::new(),
+    }
+}
+
+fn mod_rows(set: &mod_sets::ModSet, entries: &[Entry], names: &HashMap<String, String>, needs: &Needs, filter: &str) -> Vec<ModRow> {
+    let mut by_key: BTreeMap<&str, bool> = BTreeMap::new();
+    for e in entries {
+        *by_key.entry(&e.key).or_default() |= e.file.enabled;
+    }
+    let filter = filter.trim().to_lowercase();
+    let mut rows: Vec<ModRow> = by_key
+        .into_iter()
+        .map(|(k, now_on)| {
+            let on = set.on.contains(k);
+            let needed_by = if on { Vec::new() } else { set.on.iter().filter(|o| needs.get(*o).is_some_and(|n| n.contains(k))).map(|o| title_of(names, o)).collect() };
+            ModRow { key: k.to_string(), title: title_of(names, k), on, now_on, seen: set.seen(k), needed_by }
+        })
+        .filter(|r| filter.is_empty() || r.title.to_lowercase().contains(&filter) || r.key.contains(&filter))
+        .collect();
+    rows.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    rows
 }
 
 /// Delete set `name` of instance `id` (confirmed already).
@@ -652,9 +803,9 @@ fn start_dialog(app: &mut App, s: &mut StartDialog, ui: &mut Ui) -> bool {
 
     w::heading(ui, &t, "find the breaking mod");
     ui.add_space(6.0);
-    w::para(ui, "Omacraft turns about half the mods off at a time. You play, then say whether the problem happened, and the suspects halve each time.");
+    w::para(ui, "Omacraft turns about half the mods off at a time. You play, then say whether the problem occurred, and the suspects halve each time.");
     ui.add_space(4.0);
-    let about = if testing == 0 { "Mark at least one mod to test.".to_string() } else { format!("{testing} mods to test: about {} games. Your mods go back exactly as they are now when it ends.", steps_for(testing)) };
+    let about = if testing == 0 { "Mark at least one mod to test.".to_string() } else { format!("{testing} mods to test: about {} games. Your mods go back exactly as they are now when the search ends.", steps_for(testing)) };
     w::para(ui, RichText::new(about).color(t.muted));
     ui.add_space(4.0);
     worlds_note(ui, &t);
@@ -690,7 +841,7 @@ fn start_dialog(app: &mut App, s: &mut StartDialog, ui: &mut Ui) -> bool {
         }
     });
     ui.add_space(4.0);
-    w::para(ui, RichText::new(format!("{} or a click on the selected mod marks it known fine (off unless needed) or keep on (on in every step).", app.keymap.label(Action::Toggle))).color(t.muted).size(t.body_size() - 1.0));
+    w::para(ui, RichText::new(format!("{} or a click on the selected mod marks the mod known fine (off unless needed) or keep on (on in every step).", app.keymap.label(Action::Toggle))).color(t.muted).size(t.body_size() - 1.0));
     ui.add_space(12.0);
     let mut go = kb == Some(Nav::Activate);
     let mut close = false;
@@ -718,9 +869,9 @@ fn start_dialog(app: &mut App, s: &mut StartDialog, ui: &mut Ui) -> bool {
 }
 
 const ANSWERS: [(Answer, &str, &str); 3] = [
-    (Answer::Broken, "it happened", "the problem showed up (or the game crashed)"),
-    (Answer::Works, "it didn't", "the game ran fine"),
-    (Answer::Skip, "can't tell", "try a different half instead"),
+    (Answer::Broken, "problem occurred", "the problem showed up, or the game crashed"),
+    (Answer::Works, "no problem occurred", "the game ran fine"),
+    (Answer::Skip, "can't tell", "try a different half of the mods instead"),
 ];
 
 fn ask_dialog(app: &mut App, a: &mut AskDialog, ui: &mut Ui) -> bool {
@@ -734,7 +885,7 @@ fn ask_dialog(app: &mut App, a: &mut AskDialog, ui: &mut Ui) -> bool {
         a.choice = n;
     }
     let step = b.step.clone();
-    w::heading(ui, &t, "did the problem happen?");
+    w::heading(ui, &t, "did the problem occur?");
     ui.add_space(6.0);
     let (n, of) = b.progress();
     let on = step.as_ref().map_or(0, |s| s.on.len());
@@ -752,16 +903,16 @@ fn ask_dialog(app: &mut App, a: &mut AskDialog, ui: &mut Ui) -> bool {
         if on {
             w::focus_mark(ui, &t, r.rect);
         }
+        // A click only selects: nothing is sent until "answer", so a slip can be corrected.
         if r.clicked() {
             a.choice = n;
-            pick = true;
         }
     }
     ui.add_space(12.0);
     let mut close = false;
     ui.horizontal(|ui| {
         pick |= w::primary_button(ui, &t, "answer").clicked();
-        close = w::button(ui, "not yet").on_hover_text("answer later from the instance").clicked();
+        close = w::button(ui, "close").on_hover_text("answer later from the banner on the instance").clicked();
     });
     if pick {
         answer(app, &ctx, &inst, ANSWERS[a.choice].0);
@@ -818,9 +969,9 @@ fn answer(app: &mut App, ctx: &egui::Context, inst: &Instance, a: Answer) {
             }
         }
         match done.culprits.as_slice() {
-            [] => ModJobDone::new(ToastKind::Info, "Couldn't pin it on one mod; see the instance for why".into()),
-            [c] => ModJobDone::new(ToastKind::Info, format!("Found it: {}", c.label())),
-            many => ModJobDone::new(ToastKind::Info, format!("Found it among {} mods that need each other", many.len())),
+            [] => ModJobDone::new(ToastKind::Info, "Couldn't narrow the problem to one mod; the mods tab says why".into()),
+            [c] => ModJobDone::new(ToastKind::Info, format!("Breaking mod found: {}", c.label())),
+            many => ModJobDone::new(ToastKind::Info, format!("The breaking mod is one of {} mods that need each other", many.len())),
         }
     });
     app.mod_sets.forget(&inst.id);
@@ -832,9 +983,9 @@ pub fn game_ended(app: &mut App, id: &str, exit: &Result<i32, String>) {
     let Some(inst) = app.instances.iter().find(|i| i.id == id).cloned() else { return };
     let Some(step) = app.mod_sets.bisect(&inst).filter(|b| b.done.is_none()).and_then(|b| b.step) else { return };
     let why = match exit {
-        _ if bisect::crashed_since(&inst, step.began) => Some("The game wrote a crash report, so it most likely happened.".to_string()),
+        _ if bisect::crashed_since(&inst, step.began) => Some("The game wrote a crash report, so the problem most likely occurred.".to_string()),
         Ok(0) => None,
-        Ok(c) => Some(format!("The game exited with code {c}, so it most likely happened.")),
+        Ok(c) => Some(format!("The game exited with code {c}, so the problem most likely occurred.")),
         Err(e) if e == "killed by signal" => None,
         Err(e) => Some(format!("The game {e}.")),
     };
@@ -887,33 +1038,26 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
                         let what = if confirm { "checking the last suspect".to_string() } else { format!("{} suspects left", b.suspects.len()) };
                         ui.add(egui::Label::new(RichText::new(format!("step {n} of ~{of}  ·  {what}  ·  {on} of {} mods on", b.original.values().filter(|o| **o).count())).color(t.muted)).truncate());
                     });
-                    let say = if running { "Playing. Close the game when you've seen whether the problem happens." } else { "Play, then say whether the problem happened. Test from the title screen or a new world: worlds opened with mods missing can lose what they added." };
+                    let say = if running { "Playing. Close the game once you've seen whether the problem occurs." } else { "Play, then say whether the problem occurred. Test from the title screen or a new world: worlds opened with mods missing can lose what those mods added." };
                     w::para(ui, RichText::new(say).color(t.fg));
-                    ui.horizontal(|ui| {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if w::button(ui, "stop and put my mods back").clicked() {
-                                act = Some(Act::Restore);
-                            }
-                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                ui.add_enabled_ui(!running && !busy, |ui| {
-                                    for (a, label, _) in ANSWERS {
-                                        if w::button(ui, label).clicked() {
-                                            act = Some(Act::Answer(a));
-                                        }
-                                    }
-                                });
-                                ui.add_space(8.0);
-                                w::key_hint(ui, &t, &app.keymap.label(Action::FindBreaking), "answer");
-                            });
-                        });
+                    // Answering goes through the dialog, where a choice can be changed before it's sent.
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled_ui(!running && !busy, |ui| w::button(ui, "answer…")).inner.clicked() {
+                            act = Some(Act::Ask);
+                        }
+                        if w::button(ui, "stop and put my mods back").clicked() {
+                            act = Some(Act::Restore);
+                        }
+                        ui.add_space(8.0);
+                        w::key_hint(ui, &t, &app.keymap.label(Action::FindBreaking), "answer");
                     });
                 }
                 Some(done) => {
                     ui.horizontal(|ui| {
                         let (glyph, title) = match done.culprits.as_slice() {
-                            [] => (NOT_FOUND, "couldn't pin it on one mod".to_string()),
-                            [c] => (FOUND, format!("found it: {}", c.label())),
-                            many => (FOUND, format!("found it: one of {}", many.iter().map(|c| c.label()).collect::<Vec<_>>().join(", "))),
+                            [] => (NOT_FOUND, "couldn't narrow the problem to one mod".to_string()),
+                            [c] => (FOUND, format!("breaking mod found: {}", c.label())),
+                            many => (FOUND, format!("breaking mod is one of: {}", many.iter().map(|c| c.label()).collect::<Vec<_>>().join(", "))),
                         };
                         ui.label(RichText::new(glyph).color(color));
                         ui.add(egui::Label::new(RichText::new(title).font(crate::theme::bold(t.body_size())).color(t.fg_light)).truncate());
@@ -930,22 +1074,23 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
                                     act = Some(Act::Restore);
                                 }
                             } else {
-                                let it = if done.culprits.len() == 1 { "it" } else { "them" };
+                                let what = if done.culprits.len() == 1 { "mod" } else { "mods" };
                                 let culprits = done.culprits.iter().map(|c| c.file.clone()).collect();
                                 let label = match b.dependents(&culprits).len() {
-                                    0 => format!("turn {it} off"),
-                                    n => format!("turn {it} off (and {n} that need {it})"),
+                                    0 => format!("disable {what}"),
+                                    1 => format!("disable {what} + 1 dependent"),
+                                    n => format!("disable {what} + {n} dependents"),
                                 };
-                                if w::button(ui, &label).on_hover_text("put the mods back as they were, with this one and whatever needs it off").clicked() {
+                                if w::button(ui, &label).on_hover_text("put the mods back as they were, but with the breaking mod and its dependents off").clicked() {
                                     act = Some(Act::Disable);
                                 }
-                                if w::button(ui, &format!("keep {it}, put my mods back")).clicked() {
+                                if w::button(ui, "put my mods back").on_hover_text("every mod back as before the search, the breaking mod included").clicked() {
                                     act = Some(Act::Restore);
                                 }
                             }
                         });
                         for c in done.culprits.iter().filter(|c| c.project.is_some()).take(1) {
-                            if w::button(ui, "open its page").clicked() {
+                            if w::button(ui, "modrinth page").clicked() {
                                 super::open_url(&format!("https://modrinth.com/project/{}", c.project.as_deref().unwrap_or_default()));
                             }
                         }
@@ -958,7 +1103,7 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
     ui.painter().rect_filled(egui::Rect::from_min_size(rect.min, vec2(3.0, rect.height())), CornerRadius::ZERO, color);
 
     match act {
-        Some(Act::Answer(a)) => answer(app, &ctx, inst, a),
+        Some(Act::Ask) => open_bisect(app, &inst.id, Vec::new()),
         Some(Act::Restore) if running => app.toast(ToastKind::Error, "Close the game first"),
         Some(Act::Restore) => job(app, &ctx, inst, "putting the mods back", |i| {
             bisect::restore(i)?;
@@ -967,8 +1112,8 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
         Some(Act::Disable) => job(app, &ctx, inst, "putting the mods back", |i| {
             let also = bisect::disable_culprits(i)?;
             Ok(match also.len() {
-                0 => "Put the mods back, with the breaking one off".into(),
-                n => format!("Put the mods back, with the breaking one off, and {n} that need it: {}", also.join(", ")),
+                0 => "Put the mods back with the breaking mod off".into(),
+                n => format!("Put the mods back with the breaking mod off, plus {n} that depend on the breaking mod: {}", also.join(", ")),
             })
         }),
         None => {}
@@ -976,7 +1121,7 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
 }
 
 enum Act {
-    Answer(Answer),
+    Ask,
     Restore,
     Disable,
 }

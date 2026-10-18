@@ -31,6 +31,11 @@ pub enum Format {
     Json5,
     /// Edited as text only: `.properties`, `.cfg`, `.ini`, `.txt` and the like.
     Text,
+    /// Minecraft's own `options.txt`: `key:value` lines (see `vanilla_options`).
+    Options,
+    /// A shader pack's settings file (`shaderpacks/<pack>.txt`): `NAME=value` lines for the options changed from
+    /// the pack's defaults, which come from the pack itself (see `shader_config`).
+    ShaderSettings,
 }
 
 impl Format {
@@ -52,6 +57,8 @@ impl Format {
             Format::Json => "json",
             Format::Json5 => "json5",
             Format::Text => "text",
+            Format::Options => "minecraft options",
+            Format::ShaderSettings => "shader settings",
         }
     }
 
@@ -147,6 +154,8 @@ pub struct Group {
     /// The mod's name, or "other".
     pub name: String,
     pub icon: Option<PathBuf>,
+    /// The mod ids its jar declares (none for "other"), so a mod in the mods tab can find its configs.
+    pub ids: Vec<String>,
     pub files: Vec<ConfigFile>,
 }
 
@@ -202,13 +211,13 @@ pub fn group(files: &[ConfigFile], mods: &[ModInfo]) -> Vec<Group> {
     for f in files {
         let word = file_word(&f.rel);
         let best = mods.iter().map(|m| (score(&word, m), m)).filter(|(s, _)| *s > 0).max_by_key(|(s, _)| *s).map(|(_, m)| m);
-        let (name, icon) = match best {
-            Some(m) => (m.name.clone(), m.icon.clone()),
-            None => (OTHER.to_string(), None),
+        let (name, icon, ids) = match best {
+            Some(m) => (m.name.clone(), m.icon.clone(), m.ids.clone()),
+            None => (OTHER.to_string(), None, Vec::new()),
         };
         match groups.iter_mut().find(|g| g.name == name) {
             Some(g) => g.files.push(f.clone()),
-            None => groups.push(Group { name, icon, files: vec![f.clone()] }),
+            None => groups.push(Group { name, icon, ids, files: vec![f.clone()] }),
         }
     }
     groups.sort_by_key(|g| (g.name == OTHER, g.name.to_lowercase()));
@@ -251,6 +260,9 @@ pub struct Loaded {
     pub path: PathBuf,
     pub text: String,
     pub stamp: Option<Stamp>,
+    pub format: Format,
+    /// For shader settings: the pack's options, which the file's values are laid over.
+    pub base: Option<std::sync::Arc<Doc>>,
 }
 
 /// A config file's text, refusing big or non-text files.
@@ -272,7 +284,7 @@ pub fn read_text(path: &Path) -> anyhow::Result<String> {
 pub fn load(inst: &Instance, rel: &Path) -> anyhow::Result<Loaded> {
     let path = resolve(inst, rel)?;
     let text = read_text(&path)?;
-    Ok(Loaded { stamp: Stamp::of(&path), path, text })
+    Ok(Loaded { stamp: Stamp::of(&path), format: Format::of(rel).unwrap_or(Format::Text), base: None, path, text })
 }
 
 #[derive(Debug)]
@@ -290,7 +302,8 @@ pub fn save(path: &Path, expected: &str, new: &str, force: bool) -> anyhow::Resu
         Err(_) if !path.exists() => None,
         Err(e) => return Err(e),
     };
-    if !force && now.as_deref() != Some(expected) {
+    // A file that isn't there yet (a shader pack's settings before any change) counts as empty.
+    if !force && now.as_deref().unwrap_or_default() != expected {
         return Ok(Saved::Changed(now.unwrap_or_default()));
     }
     use std::os::unix::fs::PermissionsExt;
@@ -337,6 +350,24 @@ pub struct Hint {
     pub max: Option<f64>,
     pub allowed: Vec<String>,
     pub default: Option<String>,
+    /// Names to show for allowed values (value → name), e.g. graphics `1` → "fancy".
+    pub labels: Vec<(String, String)>,
+    /// The allowed values are steps along a scale: a slider rather than a list of choices.
+    pub steps: bool,
+    /// Show switches as "on"/"off" rather than the file's own "true"/"false".
+    pub on_off: bool,
+    /// A Minecraft key binding (`key.keyboard.w`): set by pressing the key.
+    pub binding: bool,
+    /// Choosing a value sets other fields too (a shader pack's profiles): value → (field key, its value, its
+    /// default), the fields' values as written.
+    pub presets: Vec<(String, Vec<(String, String, Option<String>)>)>,
+}
+
+impl Hint {
+    /// What to show for value `v`.
+    pub fn name_of<'a>(&'a self, v: &'a str) -> &'a str {
+        self.labels.iter().find(|(x, _)| x == v).map_or(v, |(_, n)| n.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -344,6 +375,8 @@ pub struct Field {
     /// Tables or objects it's inside, outermost first.
     pub section: Vec<String>,
     pub key: String,
+    /// A readable name to show instead of the key, where one is known.
+    pub label: Option<String>,
     pub value: Value,
     /// Where the value sits in the text.
     pub span: Range<usize>,
@@ -396,7 +429,16 @@ pub fn parse(format: Format, text: &str) -> Result<Doc, ParseError> {
     match format {
         Format::Toml => toml_doc(text),
         Format::Json | Format::Json5 => json::doc(text),
-        Format::Text => Ok(Doc::default()),
+        Format::Options => Ok(crate::vanilla_options::doc(text)),
+        Format::Text | Format::ShaderSettings => Ok(Doc::default()),
+    }
+}
+
+/// [`parse`], with a shader pack's options (`base`) for its settings file.
+pub fn parse_with(format: Format, base: Option<&Doc>, text: &str) -> Result<Doc, ParseError> {
+    match (format, base) {
+        (Format::ShaderSettings, Some(b)) => Ok(crate::shader_config::doc(b, text)),
+        _ => parse(format, text),
     }
 }
 
@@ -410,7 +452,9 @@ fn clean_comment(raw: &str) -> String {
             let l = l.strip_prefix("/*").unwrap_or(l);
             let l = l.strip_suffix("*/").unwrap_or(l);
             let l = l.trim();
-            l.strip_prefix('*').map(str::trim).unwrap_or(l).to_string()
+            let l = l.strip_prefix('*').map(str::trim).unwrap_or(l);
+            // Forge's configs separate entries with a lone "." line.
+            if l == "." { String::new() } else { l.to_string() }
         })
         .collect();
     let start = lines.iter().position(|l| !l.is_empty()).unwrap_or(lines.len());
@@ -477,7 +521,7 @@ fn toml_table(t: &toml_edit::Table, text: &str, path: &mut Vec<String>, dotted: 
                 let comment = clean_comment(&raw_text(key.leaf_decor().prefix(), text));
                 let (doc, hint) = read_hint(&comment);
                 if let Some(span) = v.span() {
-                    out.fields.push(Field { section: path.clone(), key: name, value: toml_value(v, text), span, doc, hint });
+                    out.fields.push(Field { section: path.clone(), key: name, label: None, value: toml_value(v, text), span, doc, hint });
                 }
             }
             // `a.b = 1` inside a table: keys of this table, not a section of their own.
@@ -487,7 +531,7 @@ fn toml_table(t: &toml_edit::Table, text: &str, path: &mut Vec<String>, dotted: 
             toml_edit::Item::ArrayOfTables(a) => {
                 let comment = clean_comment(&raw_text(key.leaf_decor().prefix(), text));
                 let (doc, hint) = read_hint(&comment);
-                out.fields.push(Field { section: path.clone(), key: name, value: Value::Other(format!("{} [[tables]]", a.len())), span: 0..0, doc, hint });
+                out.fields.push(Field { section: path.clone(), key: name, label: None, value: Value::Other(format!("{} [[tables]]", a.len())), span: 0..0, doc, hint });
             }
             toml_edit::Item::None => {}
         }
@@ -587,6 +631,14 @@ pub fn scalar_text(format: Format, s: &Scalar, old: &str) -> String {
             _ => (if f.is_nan() { "NaN" } else if *f > 0.0 { "Infinity" } else { "-Infinity" }).into(),
         },
         Scalar::Float(f) => float_text(*f),
+        // options.txt quotes some strings and not others: keep each as it was.
+        Scalar::Str(v) if format == Format::Options => {
+            if old.starts_with('"') {
+                format!("\"{}\"", escape(v, true))
+            } else {
+                v.clone()
+            }
+        }
         Scalar::Str(v) => {
             let single = old.starts_with('\'') && !old.starts_with("'''") && format != Format::Json;
             if single && !v.contains(['\'', '\n', '\r']) && (format == Format::Toml || !v.contains('\\')) {
@@ -633,6 +685,9 @@ pub fn list_text(format: Format, items: &[Scalar], old: &str) -> String {
 
 /// The text with `field` set to `new`; only the value's own bytes change.
 pub fn set(format: Format, text: &str, field: &Field, new: &Value) -> anyhow::Result<String> {
+    if format == Format::ShaderSettings {
+        return crate::shader_config::set(text, field, new);
+    }
     let old = text.get(field.span.clone()).context("the file changed under the editor")?;
     let lit = match new {
         Value::Scalar(s) => scalar_text(format, s, old),
@@ -954,7 +1009,7 @@ mod json {
                     }
                 }
             };
-            out.fields.push(Field { section: path.clone(), key: m.key, value, span, doc, hint });
+            out.fields.push(Field { section: path.clone(), key: m.key, label: None, value, span, doc, hint });
         }
         // Objects inside become sections, after this one's own keys, as in TOML.
         for (key, comment, inner) in subs {
@@ -976,6 +1031,12 @@ mod tests {
 
     fn field<'a>(d: &'a Doc, key: &str) -> &'a Field {
         d.fields.iter().find(|f| f.key == key).unwrap_or_else(|| panic!("no {key} in {:?}", d.fields.iter().map(|f| &f.key).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn forge_spacer_dots_are_not_descriptions() {
+        assert_eq!(clean_comment("#.\n#The vision range\n#."), "The vision range");
+        assert_eq!(clean_comment("#."), "");
     }
 
     #[test]

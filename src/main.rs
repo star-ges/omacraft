@@ -22,12 +22,14 @@ mod mojang;
 mod net;
 mod paths;
 mod saves;
+mod shader_config;
 mod shares;
 mod skins;
 mod store;
 mod world_sets;
 mod task;
 mod theme;
+mod vanilla_options;
 mod ui;
 
 fn main() -> eframe::Result {

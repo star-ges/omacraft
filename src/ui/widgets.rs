@@ -101,6 +101,37 @@ fn lead_row_sense(ui: &mut Ui, t: &Theme, selected: bool, lead: Lead, left: &str
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// A checklist row: a tick (or any glyph) in `mark` colour, the label (dimmed when unticked) and a right label in
+/// `right_color`.
+#[allow(clippy::too_many_arguments)]
+pub fn check_row(ui: &mut Ui, t: &Theme, selected: bool, ticked: bool, glyph: &str, mark: Color32, left: &str, right: &str, right_color: Color32) -> Response {
+    let h = row_height(t);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+    if ui.is_rect_visible(rect) {
+        row_frame(ui, t, rect, &resp, selected, None);
+        let size = t.body_size();
+        let p = ui.painter();
+        let cy = rect.center().y;
+        p.text(egui::pos2(rect.left() + 12.0, cy), Align2::LEFT_CENTER, glyph, FontId::monospace(size + 2.0), mark);
+        let x = rect.left() + 12.0 + size * 2.2;
+        let right_w = if right.is_empty() {
+            0.0
+        } else {
+            // Never more than half the row, so the label stays readable.
+            let mut job = egui::text::LayoutJob::single_section(right.to_string(), egui::TextFormat { font_id: FontId::monospace(size - 1.0), color: right_color, ..Default::default() });
+            job.wrap = egui::text::TextWrapping { max_width: rect.width() * 0.5, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+            let g = p.layout_job(job);
+            let w = g.size().x;
+            p.galley(egui::pos2(rect.right() - 12.0 - w, cy - g.size().y / 2.0), g, right_color);
+            w + 16.0
+        };
+        let color = if selected { t.menu_selected_text } else if ticked { t.fg } else { t.fg_a(0.55) };
+        let clip = Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(rect.right() - 12.0 - right_w, rect.bottom()));
+        p.with_clip_rect(clip).text(egui::pos2(x, cy), Align2::LEFT_CENTER, left, FontId::monospace(size), color);
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Two-line row: a title over a muted subtitle, with an optional right label.
 pub fn rich_row(ui: &mut Ui, t: &Theme, selected: bool, lead: Lead, title: &str, subtitle: &str, right: &str) -> Response {
     rich_row_dim(ui, t, selected, lead, title, subtitle, right, false)
@@ -109,22 +140,44 @@ pub fn rich_row(ui: &mut Ui, t: &Theme, selected: bool, lead: Lead, title: &str,
 /// [`rich_row`], greyed out when `dim` (e.g. a disabled mod).
 #[allow(clippy::too_many_arguments)]
 pub fn rich_row_dim(ui: &mut Ui, t: &Theme, selected: bool, lead: Lead, title: &str, subtitle: &str, right: &str, dim: bool) -> Response {
+    rich_row_action(ui, t, selected, lead, title, subtitle, right, dim, None).0
+}
+
+/// [`rich_row_dim`] with a small glyph button at its right end (`action`: glyph and hover text). Returns the
+/// row's response and whether the button was clicked.
+#[allow(clippy::too_many_arguments)]
+pub fn rich_row_action(ui: &mut Ui, t: &Theme, selected: bool, lead: Lead, title: &str, subtitle: &str, right: &str, dim: bool, action: Option<(&str, &str)>) -> (Response, bool) {
     let size = t.body_size();
     let h = size * 2.0 + 22.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+    // The button is a widget of its own over the row, so a click on it isn't a click on the row.
+    let button = action.map(|(glyph, hover)| {
+        let side = h - 16.0;
+        let r = Rect::from_center_size(egui::pos2(rect.right() - 8.0 - side / 2.0, rect.center().y), vec2(side, side));
+        let b = ui.interact(r, resp.id.with("action"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hover);
+        (glyph, r, b)
+    });
+    let edge = button.as_ref().map_or(rect.right(), |(_, r, _)| r.left() - 4.0);
     if ui.is_rect_visible(rect) {
         row_frame(ui, t, rect, &resp, selected, None);
         let x = paint_lead(ui, t, lead, rect.left() + 10.0, rect.center().y, h - 14.0, selected, dim);
         let p = ui.painter();
+        if let Some((glyph, r, b)) = &button {
+            if b.hovered() {
+                p.rect(*r, 0.0, t.fg_a(t.hover_fill_alpha), Stroke::new(1.0, t.fg_a(0.25)), egui::StrokeKind::Inside);
+            }
+            let c = if b.hovered() { t.fg_light } else { t.muted };
+            glyph_centered(p, r.center(), glyph, FontId::monospace(size + 1.0), c);
+        }
         let right_w = if right.is_empty() {
             0.0
         } else {
             let g = p.layout_no_wrap(right.to_string(), FontId::monospace(size - 1.0), t.muted);
             let w = g.size().x;
-            p.galley(egui::pos2(rect.right() - 12.0 - w, rect.center().y - g.size().y / 2.0), g, t.muted);
+            p.galley(egui::pos2(edge - 12.0 - w, rect.center().y - g.size().y / 2.0), g, t.muted);
             w + 16.0
         };
-        let clip = Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(rect.right() - 12.0 - right_w, rect.bottom()));
+        let clip = Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(edge - 12.0 - right_w, rect.bottom()));
         let p = p.with_clip_rect(clip);
         let color = match (dim, selected) {
             (true, _) => t.muted,
@@ -135,7 +188,8 @@ pub fn rich_row_dim(ui: &mut Ui, t: &Theme, selected: bool, lead: Lead, title: &
         p.text(egui::pos2(x, rect.center().y - 2.0), Align2::LEFT_BOTTOM, title, theme::bold(size), color);
         p.text(egui::pos2(x, rect.center().y + 2.0), Align2::LEFT_TOP, subtitle, FontId::monospace(size - 1.0), sub);
     }
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+    let clicked = button.is_some_and(|(_, _, b)| b.clicked());
+    (resp.on_hover_cursor(egui::CursorIcon::PointingHand), clicked)
 }
 
 /// Accent bar on the selected row of the pane that has keyboard focus.
@@ -206,9 +260,22 @@ pub fn empty_state(ui: &mut Ui, t: &Theme, glyph: &str, title: &str, hint: &str)
         ui.add_space(6.0);
         ui.label(RichText::new(title).color(t.fg));
         if !hint.is_empty() {
-            para(ui, RichText::new(hint).color(t.muted));
+            // Centred lines, and not so wide they're hard to follow.
+            let w = ui.available_width().min(520.0);
+            ui.allocate_ui_with_layout(vec2(w, 0.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(hint).color(t.muted)).wrap().halign(egui::Align::Center));
+            });
         }
     });
+}
+
+/// Paint a single glyph with its drawn shape centred on `center` (not its advance box, which icon glyphs
+/// overhang).
+pub fn glyph_centered(p: &egui::Painter, center: egui::Pos2, glyph: &str, font: FontId, color: Color32) {
+    let g = p.layout_no_wrap(glyph.to_string(), font, color);
+    let drawn = g.rows.first().and_then(|r| r.glyphs.first().map(|x| Rect::from_min_size(r.pos + x.pos.to_vec2() + x.uv_rect.offset, x.uv_rect.size)));
+    let mid = drawn.filter(|d| d.width() > 0.0).map_or(g.size() / 2.0, |d| d.center().to_vec2());
+    p.galley(center - mid, g, color);
 }
 
 /// The one filled button on a screen.
@@ -221,6 +288,13 @@ pub fn primary_button(ui: &mut Ui, t: &Theme, label: &str) -> Response {
 
 pub fn button(ui: &mut Ui, label: &str) -> Response {
     ui.add(egui::Button::new(label)).on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The width a row of plain `button`s takes, spacing included, so a layout can tell whether they fit beside its text.
+pub fn buttons_width(ui: &Ui, labels: &[&str]) -> f32 {
+    let s = ui.spacing();
+    let text: f32 = labels.iter().map(|l| egui::WidgetText::from(*l).into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button).size().x).sum();
+    text + labels.len() as f32 * (2.0 * s.button_padding.x + s.item_spacing.x)
 }
 
 pub fn danger_button(ui: &mut Ui, t: &Theme, label: &str) -> Response {
