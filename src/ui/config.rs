@@ -60,6 +60,8 @@ pub struct ConfigState {
     /// Save or text/fields, routed here by the app (save also works while typing).
     pub key: Option<Action>,
     checked: Option<Instant>,
+    /// The open file being checked on disk in the background.
+    recheck: Option<Recheck>,
     /// Long lists the user unfolded, by [`field_id`].
     unfolded: HashSet<String>,
     /// File groups and settings headers that are open (all start folded), as left last time: see [`fold_key`].
@@ -249,6 +251,49 @@ pub struct Open {
     note: Option<(String, Instant)>,
     /// A shader pack's options, which its settings file's values are laid over.
     base: Option<Arc<Doc>>,
+    /// Changes whenever `saved` or `stamp` does (loaded, reloaded, saved), so a check of the file
+    /// made before that is dropped rather than applied over it.
+    generation: u64,
+}
+
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Which open file a check was made of: instance, area, file and [`Open::generation`].
+#[derive(Debug, Clone, PartialEq)]
+struct CheckOf {
+    inst_id: String,
+    area: Area,
+    rel: PathBuf,
+    generation: u64,
+}
+
+/// A check of the open file on disk, run off the UI thread (the file may be big, or on slow storage).
+struct Recheck {
+    of: CheckOf,
+    promise: Promise<Reread>,
+}
+
+/// What a check found: the file's stamp now and, if it changed, its text and fields.
+struct Reread {
+    stamp: Option<mc::Stamp>,
+    changed: Option<(String, Result<Doc, mc::ParseError>)>,
+}
+
+/// Read and parse `path` again if its stamp isn't `was` any more. Blocking: run it on a Promise.
+fn reread(path: &std::path::Path, was: Option<mc::Stamp>, format: Format, base: Option<&Doc>) -> Reread {
+    let stamp = mc::Stamp::of(path);
+    if stamp == was {
+        return Reread { stamp, changed: None };
+    }
+    let disk = if path.exists() { mc::read_text(path).ok() } else { Some(String::new()) };
+    let changed = disk.map(|d| {
+        let doc = mc::parse_with(format, base, &d);
+        (d, doc)
+    });
+    Reread { stamp, changed }
 }
 
 fn field_id(f: &Field) -> String {
@@ -280,7 +325,37 @@ impl Open {
             conflict: None,
             note: None,
             base: loaded.base,
+            generation: next_generation(),
         }
+    }
+
+    fn check_of(&self) -> CheckOf {
+        CheckOf { inst_id: self.inst_id.clone(), area: self.area, rel: self.rel.clone(), generation: self.generation }
+    }
+
+    /// Take what a background check found, if it was made of this very file as it is here now;
+    /// false (and nothing changed) if it wasn't.
+    fn take_reread(&mut self, of: &CheckOf, r: Reread) -> bool {
+        if *of != self.check_of() {
+            return false;
+        }
+        self.stamp = r.stamp;
+        if let Some((disk, doc)) = r.changed
+            && disk != self.saved
+        {
+            if self.dirty() {
+                self.conflict = Some(disk);
+            } else {
+                self.saved = disk.clone();
+                self.text = disk;
+                self.doc = doc;
+                self.saved_values = values(&self.doc);
+                self.conflict = None;
+                self.generation = next_generation();
+                self.note = Some(("reloaded: the file changed on disk".into(), Instant::now()));
+            }
+        }
+        true
     }
 
     pub fn dirty(&self) -> bool {
@@ -309,6 +384,7 @@ impl Open {
         self.saved_values = values(&self.doc);
         self.stamp = mc::Stamp::of(&self.path);
         self.conflict = None;
+        self.generation = next_generation();
     }
 
     fn name(&self) -> String {
@@ -583,27 +659,26 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
         }
     }
 
-    // The game (or anything else) may rewrite the open file.
-    if let Some(o) = &mut s.open
+    // The game (or anything else) may rewrite the open file. It's checked, read and parsed on a
+    // Promise; the file stays as shown until the result comes, and a result for a file that has
+    // since been reloaded, saved or closed is dropped.
+    if let Some(c) = &s.recheck
+        && let Some(r) = c.promise.take()
+    {
+        let c = s.recheck.take().unwrap();
+        if let (Ok(r), Some(o)) = (r, &mut s.open) {
+            o.take_reread(&c.of, r);
+        }
+    }
+    if s.recheck.is_none()
+        && let Some(o) = &s.open
         && s.checked.is_none_or(|c| c.elapsed() > RECHECK)
     {
         s.checked = Some(Instant::now());
         ctx.request_repaint_after(RECHECK);
-        let now = mc::Stamp::of(&o.path);
-        if now != o.stamp {
-            o.stamp = now;
-            let disk = if o.path.exists() { mc::read_text(&o.path).ok() } else { Some(String::new()) };
-            if let Some(disk) = disk
-                && disk != o.saved
-            {
-                if o.dirty() {
-                    o.conflict = Some(disk);
-                } else {
-                    o.reload(disk);
-                    o.note = Some(("reloaded: the file changed on disk".into(), Instant::now()));
-                }
-            }
-        }
+        let (path, was, format, base) = (o.path.clone(), o.stamp, o.format, o.base.clone());
+        let promise = Promise::spawn(&rt, &ctx, async move { Ok(tokio::task::spawn_blocking(move || reread(&path, was, format, base.as_deref())).await?) });
+        s.recheck = Some(Recheck { of: o.check_of(), promise });
     }
 
     // A binding's captured key.
@@ -842,6 +917,7 @@ fn apply(app: &mut App, out: Out) {
             o.saved = disk;
             o.saved_values = values(&mc::parse_with(o.format, o.base.as_deref(), &o.saved));
             o.stamp = mc::Stamp::of(&o.path);
+            o.generation = next_generation();
         }
     }
     if out.revert && app.config.open.as_ref().is_some_and(|o| o.dirty()) {
@@ -880,6 +956,7 @@ fn save(app: &mut App, force: bool) -> bool {
             o.saved_values = values(&o.doc);
             o.stamp = stamp;
             o.conflict = None;
+            o.generation = next_generation();
             // Text that doesn't parse may still be saved: it's the user's file. Say so.
             let note = if o.format.structured() && o.doc.is_err() { "saved, with an error in it: the mod may not read it" } else { "saved" };
             o.note = Some((note.into(), Instant::now()));
@@ -2187,6 +2264,54 @@ mod tests {
             let job = highlight(&t, format, text, 12.0);
             assert_eq!(job.text, text, "{format:?}");
         }
+    }
+
+    /// The check for a file rewritten on disk reads and parses it off the UI thread: the old text stays
+    /// shown until its result is taken, and a result for a file since reloaded, saved or swapped for
+    /// another is dropped.
+    #[test]
+    fn disk_checks_apply_only_to_the_file_they_were_made_of() {
+        let dir = crate::paths::test_root().join(format!("config-recheck-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.toml");
+        std::fs::write(&path, "a = 1\n").unwrap();
+        let open = |text: &str| Open::new("inst".into(), Area::Mods, "a.toml".into(), mc::Loaded { stamp: mc::Stamp::of(&path), format: Format::Toml, base: None, path: path.clone(), text: text.into() });
+        let a_is = |o: &Open| o.doc.as_ref().unwrap().fields[0].value.clone();
+        let mut o = open("a = 1\n");
+        // Nothing changed: nothing is read.
+        let r = reread(&o.path, o.stamp, o.format, None);
+        assert!(r.changed.is_none());
+        assert!(o.take_reread(&o.check_of(), r));
+        // The game rewrites it: the check finds it, but the editor shows the old file until it's taken.
+        std::fs::write(&path, "a = 22\n").unwrap();
+        let of = o.check_of();
+        let r = reread(&o.path, o.stamp, o.format, None);
+        assert_eq!(o.text, "a = 1\n");
+        assert!(o.take_reread(&of, r));
+        assert_eq!((o.text.as_str(), o.saved.as_str()), ("a = 22\n", "a = 22\n"));
+        assert_eq!(a_is(&o), Value::Scalar(Scalar::Int(22)));
+        // A check made before the file was reloaded (or saved) is stale: dropped.
+        std::fs::write(&path, "a = 333\n").unwrap();
+        let of = o.check_of();
+        let r = reread(&o.path, o.stamp, o.format, None);
+        o.reload("a = 4\n".into());
+        assert!(!o.take_reread(&of, r));
+        assert_eq!(o.text, "a = 4\n");
+        // So is one made of another instance's or area's file.
+        let r = reread(&o.path, None, o.format, None);
+        assert!(!o.take_reread(&CheckOf { inst_id: "other".into(), ..o.check_of() }, r));
+        let r = reread(&o.path, None, o.format, None);
+        assert!(!o.take_reread(&CheckOf { area: Area::Shaders, ..o.check_of() }, r));
+        assert_eq!(o.text, "a = 4\n");
+        // With unsaved changes here, a change on disk is a conflict, not a reload.
+        let mut o = open("a = 333\n");
+        o.set_text("a = 5\n".into());
+        std::fs::write(&path, "a = 6\n").unwrap();
+        let r = reread(&o.path, o.stamp, o.format, None);
+        assert!(o.take_reread(&o.check_of(), r));
+        assert_eq!(o.text, "a = 5\n");
+        assert_eq!(o.conflict.as_deref(), Some("a = 6\n"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

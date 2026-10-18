@@ -133,7 +133,10 @@ test (and a rule here) with any fix that sets a new one.
   is looked up again. Install jobs are keyed by (instance, project).
 - **Frame work:** nothing a pane draws runs subprocesses or reads files in bulk. Settings shows `app.fonts`
   (re-resolved only when the theme watcher sees fontconfig change); worlds are listed and duplicated on a
-  `Promise`/`Task`, and the old list stays up while a refresh runs.
+  `Promise`/`Task`, and the old list stays up while a refresh runs. The configs tab checks the open file for changes on
+  disk on a Promise (`config::reread`: stat, read, parse); the file stays as shown until the result comes, and a result
+  is applied only to the same instance, area, file and `Open::generation` (bumped on every load, reload and save).
+  Test: `ui::config::tests::disk_checks_apply_only_to_the_file_they_were_made_of`.
 - **Decompression caps:** compressed metadata (`instance.cfg`, `mmc-pack.json`, `modrinth.index.json`, exported
   icons, mod metadata and icons, `level.dat`) is read through `fsutil::read_capped`, which fails past
   `METADATA_LIMIT` (16 MiB). Bulk extraction (`import::extract`) has no total-bytes cap yet.
@@ -261,8 +264,8 @@ test (and a rule here) with any fix that sets a new one.
 - **Crash analysis:** `crash::analyze_with` only says "certain" for what a loader or Minecraft states outright; stack
   frames and Suspected Mods are "likely" at best. A class a JVM error names (a class for a newer Java) is "certain" only
   when exactly one jar holds that very class (`JarFacts::classes`, `ModIndex::owners_of_class`); a package match is
-  "likely", a class several jars hold "possible" for each, with the mismatch explained as a cause. Stack frames below the top 8 are
-  "possible", and with nothing likely the
+  "likely", a class several jars hold "possible" for each, with the mismatch explained as a cause.
+  Stack frames below the top 8 are "possible", and with nothing likely the
   headline says no single mod stands out. Frames from Minecraft, loaders, Java and common libraries (`LIBRARIES`,
   `NOT_MODS`) never point at a mod. Analysis runs on a Promise; a log only gets a jar index if `looks_crashed`. A
   game that exits with a new crash report or a failed exit gets a notice in its log tab, cleared on the next launch;
