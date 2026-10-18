@@ -870,8 +870,8 @@ mod json {
                 }
                 Some(q @ (b'"' | b'\'')) => {
                     let q = *q;
-                    let s = self.string(q)?;
-                    Ok(Node::Scalar(Scalar::Str(s), start..self.i))
+                    let (s, exact) = self.string(q)?;
+                    Ok(if exact { Node::Scalar(Scalar::Str(s), start..self.i) } else { Node::Raw(start..self.i) })
                 }
                 Some(_) => {
                     let word_end = self.s[self.i..].find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-' | '_'))).map_or(self.b.len(), |n| self.i + n);
@@ -909,7 +909,7 @@ mod json {
                 let key = match self.b.get(self.i) {
                     Some(q @ (b'"' | b'\'')) => {
                         let q = *q;
-                        self.string(q)?
+                        self.string(q)?.0
                     }
                     Some(c) if c.is_ascii_alphabetic() || matches!(c, b'_' | b'$') || *c >= 0x80 => {
                         let end = self.s[self.i..].find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '$'))).map_or(self.b.len(), |n| self.i + n);
@@ -951,10 +951,14 @@ mod json {
             }
         }
 
-        fn string(&mut self, q: u8) -> Result<String, ParseError> {
+        /// A string's text, and whether that is exactly what it holds: false for escapes a Rust
+        /// string can't hold (a lone `\uD800`) or that JSON5 doesn't allow (`\1`), so the value is
+        /// edited only as text rather than written back as something else.
+        fn string(&mut self, q: u8) -> Result<(String, bool), ParseError> {
             let start = self.i;
             self.i += 1;
             let mut out = String::new();
+            let mut exact = true;
             loop {
                 let Some(&c) = self.b.get(self.i) else {
                     self.i = start;
@@ -962,7 +966,7 @@ mod json {
                 };
                 if c == q {
                     self.i += 1;
-                    return Ok(out);
+                    return Ok((out, exact));
                 }
                 if c == b'\\' {
                     let Some(&e) = self.b.get(self.i + 1) else { return self.err("a string that never ends") };
@@ -974,25 +978,51 @@ mod json {
                         b'b' => out.push('\u{8}'),
                         b'f' => out.push('\u{c}'),
                         b'v' => out.push('\u{b}'),
-                        b'0' => out.push('\0'),
+                        // `\0` is NUL only when no digit follows; `\1`…`\9` aren't JSON5.
+                        b'0' if !self.b.get(self.i).is_some_and(u8::is_ascii_digit) => out.push('\0'),
+                        b'0'..=b'9' => exact = false,
+                        // A backslash before a line ending continues the string: LF, CR, CRLF.
                         b'\n' => {}
+                        b'\r' => {
+                            if self.b.get(self.i) == Some(&b'\n') {
+                                self.i += 1;
+                            }
+                        }
+                        b'x' => {
+                            let hex = self.s.get(self.i..self.i + 2).filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit())).and_then(|h| u8::from_str_radix(h, 16).ok());
+                            let Some(code) = hex else { return self.err("a bad \\x escape") };
+                            self.i += 2;
+                            out.push(char::from(code));
+                        }
                         b'u' => {
-                            let hex = self.s.get(self.i..self.i + 4).and_then(|h| u32::from_str_radix(h, 16).ok());
-                            let Some(mut code) = hex else { return self.err("a bad \\u escape") };
+                            let hex4 = |at: usize| self.s.get(at..at + 4).filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit())).and_then(|h| u32::from_str_radix(h, 16).ok());
+                            let Some(mut code) = hex4(self.i) else { return self.err("a bad \\u escape") };
                             self.i += 4;
-                            if (0xD800..0xDC00).contains(&code) && self.s.get(self.i..self.i + 2) == Some("\\u") {
-                                if let Some(lo) = self.s.get(self.i + 2..self.i + 6).and_then(|h| u32::from_str_radix(h, 16).ok()) {
-                                    code = 0x10000 + ((code - 0xD800) << 10) + (lo.wrapping_sub(0xDC00) & 0x3FF);
-                                    self.i += 6;
+                            if (0xD800..0xDC00).contains(&code)
+                                && self.s.get(self.i..self.i + 2) == Some("\\u")
+                                && let Some(lo) = hex4(self.i + 2).filter(|lo| (0xDC00..0xE000).contains(lo))
+                            {
+                                code = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
+                                self.i += 6;
+                            }
+                            // A lone surrogate has no char: shown, but edited only as text.
+                            match char::from_u32(code) {
+                                Some(ch) => out.push(ch),
+                                None => {
+                                    out.push('\u{fffd}');
+                                    exact = false;
                                 }
                             }
-                            out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
                         }
                         _ => {
-                            // \" \' \\ \/ and any other character stand for themselves.
+                            // \" \' \\ \/ and any other character stand for themselves, but a
+                            // backslash before U+2028 or U+2029 continues the string, like one
+                            // before a line ending.
                             let ch = self.s[self.i - 1..].chars().next().unwrap_or('?');
                             self.i += ch.len_utf8() - 1;
-                            out.push(ch);
+                            if !matches!(ch, '\u{2028}' | '\u{2029}') {
+                                out.push(ch);
+                            }
                         }
                     }
                     continue;
@@ -1210,6 +1240,35 @@ mod tests {
         let d = parse(Format::Toml, toml).unwrap();
         let t = set(Format::Toml, toml, field(&d, "a"), &Value::List { items: vec![Scalar::Int(16), Scalar::Int(1000), Scalar::Str("x\\y".into()), Scalar::Int(5)], editable: true }).unwrap();
         assert_eq!(t, "a = [0x10, 1_000, 'x\\y', 5]\n");
+    }
+
+    /// JSON5 strings decode to what they mean (`\x41` is `A`, a backslash before any line ending
+    /// continues the line), so an edit writes back the right text; escapes that can't be held
+    /// exactly leave the value text only.
+    #[test]
+    fn json5_strings_decode_every_escape() {
+        let text = "{hex: '\\x41', lf: 'a\\\nb', cr: 'a\\\rb', crlf: 'a\\\r\nb', ls: 'a\\\u{2028}b', ps: \"a\\\u{2029}b\", nul: '\\0', pair: '\\uD83D\\uDE00', lone: '\\uD800', octal: '\\1', list: ['\\x41', 'b']}";
+        let d = parse(Format::Json5, text).unwrap();
+        let s = |k: &str| match &field(&d, k).value {
+            Value::Scalar(Scalar::Str(s)) => s.clone(),
+            v => panic!("{k} is {v:?}"),
+        };
+        assert_eq!(s("hex"), "A");
+        for k in ["lf", "cr", "crlf", "ls", "ps"] {
+            assert_eq!(s(k), "ab", "{k}");
+        }
+        assert_eq!(s("nul"), "\0");
+        assert_eq!(s("pair"), "\u{1F600}");
+        assert!(matches!(field(&d, "lone").value, Value::Other(_)));
+        assert!(matches!(field(&d, "octal").value, Value::Other(_)));
+        // An edit keeps the decoded value: `A` plus `!`, not `x41!`.
+        let t = set(Format::Json5, text, field(&d, "hex"), &Value::Scalar(Scalar::Str(s("hex") + "!"))).unwrap();
+        assert_eq!(field(&parse(Format::Json5, &t).unwrap(), "hex").value, Value::Scalar(Scalar::Str("A!".into())));
+        let t = set(Format::Json5, text, field(&d, "crlf"), &Value::Scalar(Scalar::Str(s("crlf") + "c"))).unwrap();
+        assert_eq!(field(&parse(Format::Json5, &t).unwrap(), "crlf").value, Value::Scalar(Scalar::Str("abc".into())));
+        // Changing one item of a list of strings keeps the other's meaning.
+        let t = set(Format::Json5, text, field(&d, "list"), &Value::List { items: vec![Scalar::Str("A".into()), Scalar::Str("c".into())], editable: true }).unwrap();
+        assert_eq!(field(&parse(Format::Json5, &t).unwrap(), "list").value, Value::List { items: vec![Scalar::Str("A".into()), Scalar::Str("c".into())], editable: true });
     }
 
     #[test]
