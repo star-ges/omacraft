@@ -229,16 +229,17 @@ test (and a rule here) with any fix that sets a new one.
   inside an instance). Forge's lone `#.` comment lines aren't descriptions (`forge_spacer_dots_are_not_descriptions`).
   `options.txt` keeps each value as written (quoted stays quoted, a choice like graphics `1` stays a number).
   Shader packs are only read, zipped or not (entries with `..` skipped, size-capped); the one file written is the
-  pack's settings file, which holds only options changed from the pack's defaults (Iris's own rule), and a switch
-  counts as an option only if the code tests it (`#ifdef`/`defined`). A profile is one more field (`<profile>`):
-  choosing it sets only the options it names (following `profile.OTHER`), and it reads "custom" when the options
-  match no profile, as in the game. "restore defaults" puts every field with a known default back (vanilla defaults
+  pack's settings file, which holds only options changed from the pack's defaults (Iris's own rule), and a `#define`
+  switch counts as an option only if the code tests it (`#ifdef`/`defined`); a commented `const bool` always does. A profile is one more field (`<profile>`):
+  choosing it sets only the options it names (following `profile.OTHER`), ones no screen shows included, and it
+  reads "custom" when the options (shown or not) match no profile, as in the game. "restore defaults" puts every field with a known default back (vanilla defaults
   are in `KNOWN`/`BINDINGS`), as an unsaved edit. Key bindings are set by pressing the key (`config::capture` takes
   the next key, mouse button or newly held modifier; esc cancels), written in GLFW's names (`key.keyboard.w`).
   "use this pack" / "turn shaders off" change only `shaderPack`/`enableShaders` in Iris's `config/iris.properties`
   (Java-escaped, as Iris writes it) or `shaderPack` in OptiFine's `optionsshaders.txt`, and not while the game runs
   (it saves its own choice on quit). Tests: `vanilla_options::tests`, `shader_config::tests` (incl.
-  `profiles_set_their_options_and_are_recognised`, `using_a_pack_changes_only_its_lines`).
+  `profiles_set_their_options_and_are_recognised`, `using_a_pack_changes_only_its_lines`,
+  `profiles_include_options_no_screen_shows`, `boolean_constants_are_options_without_an_ifdef`).
   Widgets must not change a value just by drawing it: sliders use `SliderClamping::Edits`, `DragValue` uses
   `clamp_existing_to_range(false)`, and nothing rounds. Tests: `mod_config::tests` (incl.
   `toml_edits_round_trip_byte_for_byte`, `json5_edits_round_trip_byte_for_byte`, `only_files_inside_config_open`,

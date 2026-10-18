@@ -259,7 +259,10 @@ fn read_pack(path: &Path) -> anyhow::Result<BTreeMap<String, String>> {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Kind {
+    /// A valueless `#define`, on or commented out: an option only if the code tests it.
     Switch,
+    /// A `const bool` with a comment: a value the code reads, so no test is needed.
+    ConstSwitch,
     Values(Vec<String>),
 }
 
@@ -343,7 +346,7 @@ fn options(files: &BTreeMap<String, String>) -> Vec<Opt> {
                 }
                 let opt = match values {
                     Some(list) => Opt { name: name.into(), default: value.into(), kind: Kind::Values(list), comment: text },
-                    None if ty == "bool" && !comment.is_empty() && (value == "true" || value == "false") => Opt { name: name.into(), default: value.into(), kind: Kind::Switch, comment: text },
+                    None if ty == "bool" && !comment.is_empty() && (value == "true" || value == "false") => Opt { name: name.into(), default: value.into(), kind: Kind::ConstSwitch, comment: text },
                     None => continue,
                 };
                 seen.insert(opt.name.clone());
@@ -470,7 +473,7 @@ fn base(files: &BTreeMap<String, String>) -> Doc {
             let o = by_name.get(name.as_str())?;
             let mut hint = Hint { default: Some(o.default.clone()), on_off: true, ..Default::default() };
             let value = match &o.kind {
-                Kind::Switch => Value::Scalar(Scalar::Bool(o.default == "true")),
+                Kind::Switch | Kind::ConstSwitch => Value::Scalar(Scalar::Bool(o.default == "true")),
                 Kind::Values(list) => {
                     let mut allowed = list.clone();
                     if !allowed.contains(&o.default) {
@@ -491,7 +494,8 @@ fn base(files: &BTreeMap<String, String>) -> Doc {
         .collect();
 
     // Profiles: `profile.NAME = OPTION=value !SWITCH SWITCH profile.OTHER …`, offered first as one choice.
-    let defaults: HashMap<&str, (String, bool)> = fields.iter().map(|f| (f.key.as_str(), (f.hint.default.clone().unwrap_or_default(), matches!(f.value, Value::Scalar(Scalar::Bool(_)))))).collect();
+    // They may set options no screen shows: those are set and checked too, against every declared option.
+    let defaults: HashMap<&str, &str> = opts.iter().map(|o| (o.name.as_str(), o.default.as_str())).collect();
     let raw: Vec<(&str, &str)> = props_list.iter().filter_map(|(k, v)| Some((k.strip_prefix("profile.")?, v.as_str()))).filter(|(n, _)| ident(n)).collect();
     fn resolve(name: &str, raw: &[(&str, &str)], depth: usize, out: &mut Vec<(String, String)>) {
         let Some((_, list)) = raw.iter().find(|(n, _)| *n == name).filter(|_| depth < MAX_DEPTH) else { return };
@@ -515,7 +519,7 @@ fn base(files: &BTreeMap<String, String>) -> Doc {
         .map(|(name, _)| {
             let mut sets = Vec::new();
             resolve(name, &raw, 0, &mut sets);
-            let sets = sets.into_iter().filter_map(|(k, v)| defaults.get(k.as_str()).map(|(d, _)| (k, v, Some(d.clone())))).collect();
+            let sets = sets.into_iter().filter_map(|(k, v)| defaults.get(k.as_str()).map(|d| (k, v, Some(d.to_string())))).collect();
             (name.to_string(), sets)
         })
         .filter(|(_, sets): &(String, Vec<_>)| !sets.is_empty())
@@ -537,14 +541,16 @@ fn base(files: &BTreeMap<String, String>) -> Doc {
 const PROFILE: &str = "<profile>";
 const CUSTOM: &str = "<custom>";
 
-/// Which profile the options match now, if any.
-fn current_profile(d: &Doc) -> String {
+/// Which profile the options match now, if any: shown options by their fields, ones no screen shows by
+/// what `saved` holds for them, else their default.
+fn current_profile(d: &Doc, saved: &HashMap<&str, &str>) -> String {
     let Some(p) = d.fields.iter().find(|f| f.key == PROFILE) else { return CUSTOM.into() };
     let now: HashMap<&str, String> = d.fields.iter().filter_map(|f| match &f.value {
         Value::Scalar(s) => Some((f.key.as_str(), s.display())),
         _ => None,
     }).collect();
-    p.hint.presets.iter().find(|(_, sets)| sets.iter().all(|(k, v, _)| now.get(k.as_str()) == Some(v))).map_or_else(|| CUSTOM.into(), |(n, _)| n.clone())
+    let value = |k: &str, default: &Option<String>| now.get(k).cloned().or_else(|| saved.get(k).map(|v| v.to_string())).or_else(|| default.clone());
+    p.hint.presets.iter().find(|(_, sets)| sets.iter().all(|(k, v, d)| value(k, d).as_ref() == Some(v))).map_or_else(|| CUSTOM.into(), |(n, _)| n.clone())
 }
 
 /// `NAME=value` lines of a settings file.
@@ -563,7 +569,7 @@ pub fn doc(base: &Doc, text: &str) -> Doc {
             _ => Value::Scalar(Scalar::Str(v.to_string())),
         };
     }
-    let profile = current_profile(&d);
+    let profile = current_profile(&d, &saved);
     if let Some(p) = d.fields.iter_mut().find(|f| f.key == PROFILE) {
         p.value = Value::Scalar(Scalar::Str(profile));
     }
@@ -680,6 +686,38 @@ mod tests {
         assert_eq!(f(&doc(&b, &t), PROFILE).value, Value::Scalar(Scalar::Str("LOW".into())), "LOW doesn't name BLOOM");
         let t = set(&t, &f(&doc(&b, &t), "SHADOWS"), &Value::Scalar(Scalar::Bool(true))).unwrap();
         assert_eq!(f(&doc(&b, &t), PROFILE).value, Value::Scalar(Scalar::Str(CUSTOM.into())));
+    }
+
+    /// A profile may set options no screen shows: choosing it writes them, and it's recognised only
+    /// while they hold its values too.
+    #[test]
+    fn profiles_include_options_no_screen_shows() {
+        let mut m = BTreeMap::new();
+        m.insert("lib/settings.glsl".into(), "#define VISIBLE 0 // [0 1]\n#define HIDDEN 0 // [0 1 2]\n".into());
+        m.insert("shaders.properties".into(), "screen = VISIBLE\nprofile.LOW = VISIBLE=1 HIDDEN=2\n".into());
+        let b = base(&m);
+        let f = |d: &Doc, k: &str| d.fields.iter().find(|f| f.key == k).unwrap().clone();
+        assert!(!b.fields.iter().any(|f| f.key == "HIDDEN"), "still not shown");
+        let t = set("", &f(&b, PROFILE), &Value::Scalar(Scalar::Str("LOW".into()))).unwrap();
+        assert_eq!(t, "VISIBLE=1\nHIDDEN=2\n");
+        assert_eq!(f(&doc(&b, &t), PROFILE).value, Value::Scalar(Scalar::Str("LOW".into())));
+        // VISIBLE alone at LOW's value isn't LOW while HIDDEN is still at its default.
+        assert_eq!(f(&doc(&b, "VISIBLE=1\n"), PROFILE).value, Value::Scalar(Scalar::Str(CUSTOM.into())));
+    }
+
+    /// A `const bool` with a comment is an option even though no `#ifdef` tests it (it's a GLSL
+    /// value, not a macro); only valueless `#define` switches need testing.
+    #[test]
+    fn boolean_constants_are_options_without_an_ifdef() {
+        let mut m = BTreeMap::new();
+        m.insert("lib/settings.glsl".into(), "const bool shadowHardwareFiltering = true; // Filter shadows\n#define UNTESTED // a switch the code never tests\nconst bool plain = false;\n".into());
+        m.insert("shadow.fsh".into(), "float x = shadowHardwareFiltering ? 1.0 : 0.0;\n".into());
+        let b = base(&m);
+        let names: Vec<&str> = b.fields.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(names, ["shadowHardwareFiltering"]);
+        let f = &b.fields[0];
+        assert_eq!(f.value, Value::Scalar(Scalar::Bool(true)));
+        assert_eq!(set("", f, &Value::Scalar(Scalar::Bool(false))).unwrap(), "shadowHardwareFiltering=false\n");
     }
 
     #[test]
