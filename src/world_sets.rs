@@ -79,9 +79,9 @@ pub fn mods(inst: &Instance) -> BTreeMap<String, String> {
 }
 
 /// How deep [`mod_inventory`] follows jars inside jars (the file itself is depth 0).
-const NEST_DEPTH: usize = 4;
+pub(crate) const NEST_DEPTH: usize = 4;
 /// The most nested jars one file may bring in, at any depth.
-const NEST_JARS: usize = 512;
+pub(crate) const NEST_JARS: usize = 512;
 
 /// Every mod a jar declares, id → version ("" if it doesn't say): Fabric's or Quilt's
 /// one, each of Forge's and NeoForge's `[[mods]]`, each `mcmod.info` entry, and those of

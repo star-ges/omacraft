@@ -251,7 +251,9 @@ test (and a rule here) with any fix that sets a new one.
   once every original is found and as it should be: a file renamed since is found by its SHA-1 (the only unclaimed file
   with it), one that can't be found keeps the record (`unresolved`, shown in the banner with "forget the search"). Twins
   (`x.jar` and `x.jar.disabled`) are refused at the start. Every operation holds `.bisect.lock`, so a stop and an
-  answer never interleave. Each step's mods are closed over required dependencies (`Bisect::closure`),
+  answer never interleave. Each step's mods are closed over required dependencies (`Bisect::closure`; `bisect::jar_links` counts
+  the ids and requirements of nested jars, as deep as `world_sets::mod_inventory` follows them, for the outer file, and
+  the sets checklist uses the same links),
   so no mod runs without what it needs; "turn it off" also disables whatever needs the culprit. Kept mods bring
   everything they need into the fixed baseline (`keep` is their closure), which is never a suspect, so the confirming
   step never turns a kept mod off; a check that did (an older record) doesn't confirm. A single suspect is
@@ -261,7 +263,7 @@ test (and a rule here) with any fix that sets a new one.
   `a_search_is_saved_before_any_mod_is_switched`, `a_switch_cut_short_at_any_point_is_finished`,
   `an_original_renamed_by_hand_is_found_by_its_bytes`, `an_original_that_cant_be_found_keeps_the_search`,
   `twins_are_refused_at_the_start`, `a_stop_waits_for_an_answer_being_switched`,
-  `kept_mods_keep_what_they_need_through_the_confirming_step`).
+  `kept_mods_keep_what_they_need_through_the_confirming_step`, `a_nested_mods_needs_count_for_its_jar`).
 - **Crash analysis:** `crash::analyze_with` only says "certain" for what a loader or Minecraft states outright; stack
   frames and Suspected Mods are "likely" at best, frames below the top 8 "possible", and with nothing likely the
   headline says no single mod stands out. Frames from Minecraft, loaders, Java and common libraries (`LIBRARIES`,

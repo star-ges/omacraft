@@ -182,22 +182,39 @@ fn lock(inst: &Instance) -> anyhow::Result<fsutil::FileLock> {
     fsutil::lock(&inst.dir().join(".bisect.lock")).context("locking the search")
 }
 
-/// The mod ids a jar answers to, and the ones it requires. Platform ids (minecraft,
-/// the loader, java) come back too; nothing provides them, so they lead nowhere.
+/// The mod ids a jar answers to, and the ones it requires: its own and those of the jars
+/// nested in it (Fabric's and Quilt's `jars`, Forge's jarjar), as deep and as many as
+/// `world_sets::mod_inventory` follows, all counted for the file itself. Platform ids
+/// (minecraft, the loader, java) come back too; nothing provides them, so they lead nowhere.
 pub fn jar_links(jar: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
+    let (mut provides, mut requires) = (BTreeSet::new(), BTreeSet::new());
+    if let Ok(mut zip) = std::fs::File::open(jar).map_err(anyhow::Error::from).and_then(|f| Ok(zip::ZipArchive::new(f)?)) {
+        let mut budget = world_sets::NEST_JARS;
+        links(&mut zip, 0, &mut budget, &mut provides, &mut requires);
+    }
+    // What the file brings along itself isn't needed from elsewhere.
+    for id in &provides {
+        requires.remove(id);
+    }
+    (provides, requires)
+}
+
+fn links<R: std::io::Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, depth: usize, budget: &mut usize, provides: &mut BTreeSet<String>, requires: &mut BTreeSet<String>) {
     use serde_json::Value;
-    let mut provides: BTreeSet<String> = world_sets::mod_inventory(jar).into_keys().collect();
-    let mut requires = BTreeSet::new();
-    let Ok(mut zip) = std::fs::File::open(jar).map_err(anyhow::Error::from).and_then(|f| Ok(zip::ZipArchive::new(f)?)) else {
-        return (provides, requires);
-    };
-    let json = |zip: &mut zip::ZipArchive<std::fs::File>, name| content_meta::zip_bytes(zip, name).and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let json = |zip: &mut zip::ZipArchive<R>, name| content_meta::zip_bytes(zip, name).and_then(|b| serde_json::from_slice::<Value>(&b).ok());
     let strings = |v: &Value| -> Vec<String> { v.as_array().into_iter().flatten().filter_map(|x| x.as_str().or(x["id"].as_str())).map(String::from).collect() };
-    if let Some(f) = json(&mut zip, "fabric.mod.json") {
+    let id = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(String::from);
+    // A nested jar is a string (Quilt) or an object's "file" (Fabric) or "path" (jarjar).
+    let paths = |v: &Value| -> Vec<String> { v.as_array().into_iter().flatten().filter_map(|j| j.as_str().or(j["file"].as_str()).or(j["path"].as_str())).map(String::from).collect() };
+    let mut nested = Vec::new();
+    if let Some(f) = json(zip, "fabric.mod.json") {
+        provides.extend(id(&f["id"]));
         provides.extend(strings(&f["provides"]));
         requires.extend(f["depends"].as_object().into_iter().flatten().map(|(k, _)| k.clone()));
-    } else if let Some(q) = json(&mut zip, "quilt.mod.json") {
+        nested.extend(paths(&f["jars"]));
+    } else if let Some(q) = json(zip, "quilt.mod.json") {
         let l = &q["quilt_loader"];
+        provides.extend(id(&l["id"]));
         provides.extend(strings(&l["provides"]));
         for d in l["depends"].as_array().into_iter().flatten() {
             match d {
@@ -210,10 +227,14 @@ pub fn jar_links(jar: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
                 _ => {}
             }
         }
+        nested.extend(paths(&l["jars"]));
     } else if let Some(t) = ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"]
         .iter()
-        .find_map(|n| content_meta::zip_bytes(&mut zip, n).and_then(|b| toml::from_str::<toml::Value>(&String::from_utf8_lossy(&b)).ok()))
+        .find_map(|n| content_meta::zip_bytes(zip, n).and_then(|b| toml::from_str::<toml::Value>(&String::from_utf8_lossy(&b)).ok()))
     {
+        for m in t.get("mods").and_then(|m| m.as_array()).into_iter().flatten() {
+            provides.extend(m.get("modId").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(String::from));
+        }
         // [[dependencies.<modid>]]: required if `type = "required"` (NeoForge) or `mandatory = true` (Forge).
         let lists: Vec<&toml::Value> = match t.get("dependencies") {
             Some(toml::Value::Table(by_mod)) => by_mod.values().collect(),
@@ -229,16 +250,31 @@ pub fn jar_links(jar: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
                 requires.insert(id.to_string());
             }
         }
-    } else if let Some(info) = json(&mut zip, "mcmod.info") {
+    } else if let Some(info) = json(zip, "mcmod.info") {
         let list = if info.is_array() { &info } else { &info["modList"] };
         for m in list.as_array().into_iter().flatten() {
+            provides.extend(id(&m["modid"]));
             requires.extend(strings(&m["requiredMods"]).into_iter().map(|r| r.split('@').next().unwrap_or_default().to_string()));
         }
     }
-    for id in &provides {
-        requires.remove(id);
+    if let Some(j) = json(zip, "META-INF/jarjar/metadata.json") {
+        nested.extend(paths(&j["jars"]));
     }
-    (provides, requires)
+    if depth + 1 > world_sets::NEST_DEPTH {
+        return;
+    }
+    nested.sort();
+    nested.dedup();
+    for path in nested {
+        if *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        let Some(bytes) = content_meta::zip_bytes(zip, &path) else { continue };
+        if let Ok(mut inner) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) {
+            links(&mut inner, depth + 1, budget, provides, requires);
+        }
+    }
 }
 
 /// Start finding the breaking mod in `inst`: every enabled mod not kept or known good
@@ -1061,6 +1097,54 @@ mod tests {
         assert!(!b.step.as_ref().unwrap().on.contains("a-1.jar"), "the old plan took the kept mod away");
         b.answer(Answer::Works).unwrap();
         assert!(!b.done.unwrap().confirmed);
+        std::fs::remove_dir_all(i.dir()).unwrap();
+    }
+
+    /// A Fabric jar `name` with id `id`, carrying a nested jar with id `inner` that requires `needs`.
+    fn nesting_jar(i: &Instance, name: &str, id: &str, inner: &str, needs: &str) {
+        use std::io::Write;
+        let opts = zip::write::SimpleFileOptions::default();
+        let mut nested = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        nested.start_file("fabric.mod.json", opts).unwrap();
+        write!(nested, r#"{{"schemaVersion": 1, "id": "{inner}", "version": "1", "depends": {{"{needs}": "*", "{id}": "*"}}}}"#).unwrap();
+        let nested = nested.finish().unwrap().into_inner();
+        let dir = i.game_dir().join("mods");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut z = zip::ZipWriter::new(std::fs::File::create(dir.join(name)).unwrap());
+        z.start_file("fabric.mod.json", opts).unwrap();
+        write!(z, r#"{{"schemaVersion": 1, "id": "{id}", "version": "1", "depends": {{"minecraft": "*"}}, "jars": [{{"file": "META-INF/jars/{inner}.jar"}}]}}"#).unwrap();
+        z.start_file(format!("META-INF/jars/{inner}.jar"), opts).unwrap();
+        z.write_all(&nested).unwrap();
+        z.finish().unwrap();
+    }
+
+    #[test]
+    fn a_nested_mods_needs_count_for_its_jar() {
+        let i = inst("bisect nested needs");
+        nesting_jar(&i, "a-1.jar", "a", "nested", "zlib");
+        jar(&i, "zlib-1.jar", Some("zlib"), &[]);
+        for n in 0..4 {
+            jar(&i, &format!("m{n}-1.jar"), Some(&format!("m{n}")), &[]);
+        }
+        let (provides, requires) = jar_links(&i.game_dir().join("mods/a-1.jar"));
+        assert!(provides.contains("nested") && requires.contains("zlib"), "{provides:?} {requires:?}");
+        assert!(!requires.contains("a"), "what the jar brings along isn't needed from elsewhere");
+
+        let b = start(&i, &Start { first: vec!["a-1.jar".into()], ..Default::default() }).unwrap();
+        assert_eq!(b.needs["a-1.jar"], BTreeSet::from(["zlib-1.jar".into()]));
+        // Every step that has a on has zlib on too.
+        let mut b = b;
+        while b.done.is_none() {
+            let on = &b.step.as_ref().unwrap().on;
+            assert!(!on.contains("a-1.jar") || on.contains("zlib-1.jar"), "a without zlib: {on:?}");
+            b = answer(&i, if on.contains("m2-1.jar") { Answer::Broken } else { Answer::Works }).unwrap();
+        }
+        restore(&i).unwrap();
+
+        // The sets checklist ticks zlib along with a.
+        let entries = mod_sets::scan(&i);
+        let needs = mod_sets::needs(&entries);
+        assert!(mod_sets::with_needs(&["a".into()], &needs).contains("zlib"));
         std::fs::remove_dir_all(i.dir()).unwrap();
     }
 }
