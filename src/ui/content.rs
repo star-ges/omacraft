@@ -76,7 +76,7 @@ pub struct ModJobDone {
 }
 
 impl ModJobDone {
-    fn new(kind: ToastKind, text: String) -> Self {
+    pub fn new(kind: ToastKind, text: String) -> Self {
         ModJobDone { kind, text, worlds: Vec::new() }
     }
 }
@@ -292,6 +292,25 @@ impl ContentState {
         }
     }
 
+    /// The mods as mod sets name them, with each one's title, once every file's metadata
+    /// has been read (None until then): the same keys `mod_sets::scan` reads from the jars.
+    pub fn mod_entries(&self, files: &[ModFile]) -> Option<(Vec<crate::mod_sets::Entry>, HashMap<String, String>)> {
+        let mut entries = Vec::new();
+        let mut titles = HashMap::new();
+        for f in files.iter().filter(|f| !f.is_dir) {
+            let info = self.meta.get(f)?;
+            let key = crate::mod_sets::key(info.mod_id.as_deref(), &f.name);
+            titles.entry(key.clone()).or_insert_with(|| info.name.clone().unwrap_or_else(|| f.display_name().to_string()));
+            entries.push(crate::mod_sets::Entry { file: f.clone(), key });
+        }
+        Some((entries, titles))
+    }
+
+    /// A mod's name from its metadata, if read yet.
+    pub fn title(&self, f: &ModFile) -> Option<String> {
+        self.meta.get(f).and_then(|m| m.name)
+    }
+
     pub fn poll(&mut self, toasts: &mut Vec<Toast>) {
         if let Some((_, Check::Running(p))) = &self.updates
             && let Some(r) = p.take()
@@ -416,15 +435,24 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
     // Installing into a folder that's being moved into or out of a share set could land
     // the file in the old place or get it renamed on a clash.
     let starting = app.sessions.get(&inst.id).is_some_and(|s| s.starting());
+    // Mods stay as each step of a search for the breaking mod sets them.
+    let searching = kind == ContentKind::Mods && app.mod_sets.searching(inst);
     let blocked = if app.sharing.is_some() && crate::shares::SET_FOLDERS.contains(&kind.dir()) {
         Some("Shared folders are moving; install again in a moment")
     } else if kind == ContentKind::Mods && app.content.updating(&inst.id) {
         Some("Mods are updating; install again in a moment")
     } else if kind == ContentKind::Mods && starting {
         Some("The game is starting; install again once it has")
+    } else if searching {
+        Some("Finding the breaking mod; install once it's done")
     } else {
         None
     };
+    if kind == ContentKind::Mods {
+        let found = app.content.mod_entries(&files);
+        super::mod_sets::bar(app, ui, inst, found.as_ref().map(|(e, n)| (e.as_slice(), n)));
+        ui.add_space(6.0);
+    }
     let ups = match kind {
         ContentKind::Mods => Some(Updates {
             list: match &app.content.updates {
@@ -432,7 +460,14 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
                 _ => Vec::new(),
             },
             checking: app.content.updates.as_ref().is_some_and(|(id, c)| *id == inst.id && matches!(c, Check::Running(_))),
-            running: app.content.updating(&inst.id) || starting,
+            running: app.content.updating(&inst.id) || starting || searching,
+            lock: if searching {
+                ""
+            } else if starting {
+                "game starting…"
+            } else {
+                "working…"
+            },
             key: app.content.key.take(),
         }),
         _ => None,
@@ -488,8 +523,11 @@ struct Out {
 struct Updates {
     list: Vec<Update>,
     checking: bool,
-    /// An update or rollback is running in this instance, or the game is starting.
+    /// An update, rollback or set switch is running in this instance, the game is
+    /// starting, or a search for the breaking mod has the mods.
     running: bool,
+    /// Why, in a word or two.
+    lock: &'static str,
     key: Option<Action>,
 }
 
@@ -726,7 +764,8 @@ fn installed(
 ) {
     let files = s.files(inst, kind);
     let update_for = |m: &ModFile| ups.and_then(|u| u.list.iter().find(|x| update_base(x) == base_path(m)));
-    // Mods aren't switched or removed under an update or rollback, or as the game starts.
+    // Mods aren't switched or removed under an update, rollback or set switch, as the game
+    // starts, or while a search for the breaking mod has them.
     let busy = ups.is_some_and(|u| u.running);
     // Selection is by file stem, so it survives enable/disable renames.
     let stem = |m: &ModFile| m.name.trim_end_matches(".disabled").to_string();
@@ -765,7 +804,9 @@ fn installed(
         if let Some(u) = ups {
             let key = u.key == Some(Action::Update);
             if u.running {
-                ui.label(RichText::new("updating…").color(t.muted));
+                if !u.lock.is_empty() {
+                    ui.label(RichText::new(u.lock).color(t.muted));
+                }
             } else if u.checking {
                 ui.label(RichText::new("checking…").color(t.muted));
             } else if !u.list.is_empty() {
@@ -775,7 +816,8 @@ fn installed(
             } else if w::button(ui, "check updates").clicked() || key {
                 out.check = true;
             }
-            if (w::button(ui, "roll back…").clicked() || u.key == Some(Action::RollBack)) && !u.running {
+            // A rollback waits for whatever has the mods now.
+            if !u.running && (w::button(ui, "roll back…").clicked() || u.key == Some(Action::RollBack)) {
                 out.roll_back = true;
             }
         }

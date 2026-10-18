@@ -5,6 +5,7 @@ mod group_manager;
 mod icon_picker;
 mod instances;
 mod logs;
+mod mod_sets;
 pub mod nav;
 mod new_instance;
 mod screenshots;
@@ -63,6 +64,10 @@ pub enum Modal {
     RollBack(Box<content::RollBack>),
     /// After a rollback: roll a world played with the newer mods back too?
     WorldRollBack(Box<content::WorldPrompt>),
+    /// An instance's mod sets.
+    ModSets(Box<mod_sets::SetsDialog>),
+    /// Starting a search for the breaking mod, or answering one of its steps.
+    Bisect(Box<mod_sets::BisectDialog>),
 }
 
 /// A yes/no question before something destructive.
@@ -86,6 +91,8 @@ pub enum ConfirmAction {
     DeleteBackup(crate::backups::Snapshot),
     /// Put an instance's mods and config back: (instance id, the backup).
     RollBack(String, crate::backups::Snapshot),
+    /// A mod set: (instance id, set name). Only the set goes; the mods stay.
+    DeleteModSet(String, String),
 }
 
 enum Phase {
@@ -164,6 +171,8 @@ pub struct App {
     pub sessions: HashMap<String, Session>,
     pub modal: Option<Modal>,
     pub content: content::ContentState,
+    /// Mod sets and the search for a breaking mod, per instance.
+    pub mod_sets: mod_sets::State,
     pub version: version::VersionState,
     pub worlds: worlds::WorldsState,
     pub servers: servers::ServersState,
@@ -229,6 +238,7 @@ impl App {
             sessions: HashMap::new(),
             modal: None,
             content: Default::default(),
+            mod_sets: Default::default(),
             version: Default::default(),
             worlds: Default::default(),
             servers: Default::default(),
@@ -432,6 +442,8 @@ impl App {
                                 let started = std::time::SystemTime::now() - res.played - Duration::from_secs(5);
                                 self.logs.watch_exit(&self.rt, ctx, &inst, self.cfg.default_memory_mb, started, res.exit.clone(), lines);
                             }
+                            // A step of a search for the breaking mod: ask how it went.
+                            mod_sets::game_ended(self, &id, &res.exit);
                         }
                         Err(e) => {
                             let msg = format!("{e:#}");
@@ -799,7 +811,7 @@ impl App {
         let mut cands = vec![Help, TabInstances, TabAccounts, TabSettings, Play, New, Import, Export, Groups];
         match self.tab {
             Tab::Instances => {
-                cands.extend([FocusLeft, FocusRight, PrevTab, NextTab, Back, ModsTab, LoaderType, Update, UpdateOne, RollBack, Why]);
+                cands.extend([FocusLeft, FocusRight, PrevTab, NextTab, Back, ModsTab, LoaderType, Update, UpdateOne, RollBack, Why, ModSets, FindBreaking]);
                 cands.extend(nav::PANE_ACTIONS);
             }
             Tab::Accounts => cands.extend([Microsoft, Down, Up, Top, Bottom, Activate, Delete, Add, TurnLeft, TurnRight, UploadSkin, Toggle, Cycle, Back]),
@@ -846,7 +858,7 @@ impl App {
                     self.version.cycle_loader();
                 }
             }
-            Action::Update | Action::UpdateOne | Action::RollBack => {
+            Action::Update | Action::UpdateOne | Action::RollBack | Action::ModSets => {
                 if self.inst_tab == InstTab::Mods {
                     self.content.key = Some(a);
                 }
@@ -854,6 +866,11 @@ impl App {
             Action::Why => {
                 if matches!(self.inst_tab, InstTab::Log | InstTab::LogHistory) {
                     self.logs.key = Some(a);
+                }
+            }
+            Action::FindBreaking => {
+                if let Some(id) = self.selected.clone() {
+                    mod_sets::key(self, &id);
                 }
             }
             Action::FocusLeft => {
@@ -1033,6 +1050,7 @@ impl App {
                 self.worlds.invalidate();
             }
             ConfirmAction::RollBack(id, snap) => content::start_roll_back(self, ctx, id, snap.clone()),
+            ConfirmAction::DeleteModSet(id, name) => mod_sets::delete_set(self, id, name),
             ConfirmAction::ResetSkin(uuid) => accounts::skin_change(self, ctx, uuid, crate::skins::Change::Reset),
             ConfirmAction::DeleteSet(kind, name) => {
                 // Checked again: an instance may have joined since the dialog opened.
@@ -1229,6 +1247,20 @@ impl App {
                     .backdrop_color(widgets::scrim(&t))
                     .show(ctx, |ui| content::world_prompt_dialog(self, &mut s, ui));
                 if r.inner || r.should_close() { None } else { Some(Modal::WorldRollBack(s)) }
+            }
+            Modal::ModSets(mut s) => {
+                let r = egui::Modal::new(egui::Id::new("mod-sets"))
+                    .frame(widgets::modal_frame(&t))
+                    .backdrop_color(widgets::scrim(&t))
+                    .show(ctx, |ui| mod_sets::sets_dialog(self, &mut s, ui));
+                if r.inner || r.should_close() { None } else { Some(Modal::ModSets(s)) }
+            }
+            Modal::Bisect(mut s) => {
+                let r = egui::Modal::new(egui::Id::new("bisect"))
+                    .frame(widgets::modal_frame(&t))
+                    .backdrop_color(widgets::scrim(&t))
+                    .show(ctx, |ui| mod_sets::bisect_dialog(self, &mut s, ui));
+                if r.inner || r.should_close() { None } else { Some(Modal::Bisect(s)) }
             }
             Modal::Confirm(c) => {
                 let mut yes = false;

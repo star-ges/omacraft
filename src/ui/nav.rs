@@ -214,7 +214,7 @@ pub fn hints(app: &App) -> Vec<(String, &'static str)> {
                     }
                     v
                 }
-                (InstTab::Mods, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(Update), "updates"), (l(RollBack), "roll back"), (l(FocusRight), "modrinth"), (l(Search), "search")],
+                (InstTab::Mods, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(Update), "updates"), (l(RollBack), "roll back"), (l(ModSets), "sets"), (l(FindBreaking), "find breaking mod"), (l(FocusRight), "modrinth"), (l(Search), "search")],
                 (_, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(FocusRight), "modrinth"), (l(Search), "search")],
                 (_, true) => vec![(p(Down, Up), "results"), (l(Activate), "install"), (l(Search), "search")],
             });

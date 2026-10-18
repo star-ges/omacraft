@@ -414,6 +414,7 @@ fn detail(app: &mut App, ui: &mut Ui, inst: &Instance) {
                 });
             });
         }
+        super::mod_sets::banner(app, ui, inst);
         ui.add_space(14.0);
         w::tab_strip(ui, &t, &mut app.inst_tab, &InstTab::ALL);
 
