@@ -97,6 +97,8 @@ pub enum ConfirmAction {
     RollBack(String, crate::backups::Snapshot),
     /// A mod set: (instance id, set name). Only the set goes; the mods stay.
     DeleteModSet(String, String),
+    /// Forget instance id's search for the breaking mod, leaving its mods as they are.
+    ForgetSearch(String),
     /// Throw away the unsaved changes to the open config file.
     RevertConfig,
 }
@@ -1085,6 +1087,7 @@ impl App {
             }
             ConfirmAction::RollBack(id, snap) => content::start_roll_back(self, ctx, id, snap.clone()),
             ConfirmAction::DeleteModSet(id, name) => mod_sets::delete_set(self, id, name),
+            ConfirmAction::ForgetSearch(id) => mod_sets::forget_search(self, ctx, id),
             ConfirmAction::RevertConfig => config::revert(self),
             ConfirmAction::ResetSkin(uuid) => accounts::skin_change(self, ctx, uuid, crate::skins::Change::Reset),
             ConfirmAction::DeleteSet(kind, name) => {
@@ -1212,6 +1215,7 @@ impl eframe::App for App {
         self.refresh_theme(&ctx);
         self.poll(&ctx);
         self.content.poll(&mut self.toasts);
+        self.mod_sets.tick(&self.rt, &ctx);
         self.acct.poll(&mut self.accounts, &mut self.toasts);
         self.keys(&ctx);
         self.dropped_files(&ctx);

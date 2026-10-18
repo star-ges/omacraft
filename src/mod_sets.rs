@@ -311,7 +311,7 @@ pub fn load(inst: &Instance) -> anyhow::Result<ModSets> {
 }
 
 fn load_from(p: &Path) -> anyhow::Result<ModSets> {
-    match std::fs::read(p) {
+    match std::fs::File::open(p).and_then(fsutil::read_capped) {
         Ok(bytes) => toml::from_str(&String::from_utf8_lossy(&bytes)).with_context(|| format!("reading {}", p.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ModSets::default()),
         Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),

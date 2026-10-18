@@ -136,7 +136,12 @@ test (and a rule here) with any fix that sets a new one.
   `Promise`/`Task`, and the old list stays up while a refresh runs. The configs tab checks the open file for changes on
   disk on a Promise (`config::reread`: stat, read, parse); the file stays as shown until the result comes, and a result
   is applied only to the same instance, area, file and `Open::generation` (bumped on every load, reload and save).
-  Test: `ui::config::tests::disk_checks_apply_only_to_the_file_they_were_made_of`.
+  The mods tab's sets and search
+  (`mod_sets.toml`, `bisect.toml`, read capped at `METADATA_LIMIT`) are read on a Promise (`ui::mod_sets::State`): the
+  last read stays shown while a new one runs, a mod job leaves its own read in the state's inbox as it ends (so no guard
+  sees the files from before its writes), and until the first read is back the search counts as possibly running.
+  Tests: `ui::config::tests::disk_checks_apply_only_to_the_file_they_were_made_of`,
+  `ui::mod_sets::tests::state_files_are_read_in_the_background_and_the_old_ones_stay_shown`.
 - **Decompression caps:** compressed metadata (`instance.cfg`, `mmc-pack.json`, `modrinth.index.json`, exported
   icons, mod metadata and icons, `level.dat`) is read through `fsutil::read_capped`, which fails past
   `METADATA_LIMIT` (16 MiB). Bulk extraction (`import::extract`) has no total-bytes cap yet.
@@ -255,12 +260,30 @@ test (and a rule here) with any fix that sets a new one.
   mods a set has never seen are off after a switch, and the mods tab offers to add them. The sets dialog edits a set's mods as a checklist without touching the mods folder (`ModSets::set_mods`); ticking a mod ticks what it requires (`mod_sets::with_needs`), and an unticked mod a ticked one requires is flagged. Tests: `mod_sets::tests`
   (incl. `switching_sets_is_exact`, `membership_survives_an_update_rename`,
   `new_mods_join_the_active_set_and_stay_off_elsewhere`, `sets_are_edited_without_touching_the_mods`).
-- **Finding the breaking mod:** `bisect.toml` keeps the exact original on/off state, and every end (stop, keep, turn it
-  off) restores it before anything else. Each step's mods are closed over required dependencies (`Bisect::closure`),
-  so no mod runs without what it needs; "turn it off" also disables whatever needs the culprit. A single suspect is
+- **Finding the breaking mod:** `bisect.toml` keeps the exact original on/off state (and each file's SHA-1), and every
+  end (stop, keep, turn it off) restores it before anything else. Every new arrangement (first step, next step, ending)
+  is saved with `applied = false` *before* any file is renamed, then switched (idempotent), then marked applied; answers
+  are refused unless the files are exactly the step's, and `bisect::recover` (run before every launch; an error stops the
+  game, and the banner's "try again") finishes a switch cut short or undoes one made by hand. The record is deleted only
+  once every original is found and as it should be: a file renamed since is found by its SHA-1 (the only unclaimed file
+  with it), one that can't be found keeps the record (`unresolved`, shown in the banner with "forget the search"). Twins
+  (`x.jar` and `x.jar.disabled`) are refused at the start. Every operation holds `.bisect.lock`, so a stop and an
+  answer never interleave. Each step's mods are closed over required dependencies (`Bisect::closure`; `bisect::jar_links` counts
+  the ids and requirements of nested jars, as deep as `world_sets::mod_inventory` follows them, for the outer file, and
+  the sets checklist uses the same links),
+  so no mod runs without what it needs; "turn it off" also disables whatever needs the culprit. Kept mods bring
+  everything they need into the fixed baseline (`keep` is their closure), which is never a suspect, so the confirming
+  step never turns a kept mod off; a check that did (an older record) doesn't confirm. A single suspect is
   only "found" after a step with everything but it on. While a search exists, the mods tab doesn't toggle, remove,
-  install, update, roll back or switch sets, and says so once (the banner). A crash analysis starts a search with its
-  suspects first (`mod_sets::open_bisect`). Answers are only sent from the question dialog, where a click selects and "answer" sends, so a slip can be corrected. Tests: `bisect::tests`.
+  install, update, roll back or switch sets, and says so once (the banner); nor does the crash panel, whose toggles go
+  through the same check (`ui::mod_sets::ModsBusy::by_hand`, which also refuses before the search's file has been read).
+  The search's own actions (answer, stop, finish, try again, forget) run only as mod jobs, refused while a game starts or
+  runs or any mod job or install runs (`ModsBusy::search_action`), checked when drawn and again when acted on. A crash analysis starts a search with its
+  suspects first (`mod_sets::open_bisect`). Answers are only sent from the question dialog, where a click selects and "answer" sends, so a slip can be corrected. Tests: `bisect::tests` (incl.
+  `a_search_is_saved_before_any_mod_is_switched`, `a_switch_cut_short_at_any_point_is_finished`,
+  `an_original_renamed_by_hand_is_found_by_its_bytes`, `an_original_that_cant_be_found_keeps_the_search`,
+  `twins_are_refused_at_the_start`, `a_stop_waits_for_an_answer_being_switched`,
+  `kept_mods_keep_what_they_need_through_the_confirming_step`, `a_nested_mods_needs_count_for_its_jar`), `ui::mod_sets::tests::search_controls_share_one_admission_check`.
 - **Crash analysis:** `crash::analyze_with` only says "certain" for what a loader or Minecraft states outright; stack
   frames and Suspected Mods are "likely" at best. A class a JVM error names (a class for a newer Java) is "certain" only
   when exactly one jar holds that very class (`JarFacts::classes`, `ModIndex::owners_of_class`); a package match is

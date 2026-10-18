@@ -586,6 +586,10 @@ async fn start(
     task.stage("Checking backups", 0);
     let i = inst.clone();
     tokio::task::spawn_blocking(move || crate::backups::recover(&i)).await?.context("a restore or rollback was left unfinished; the game wasn't started")?;
+    // A search for the breaking mod's switch cut short (or a mod switched by hand during
+    // one) is put right, so the game plays the step it's asked about.
+    let i = inst.clone();
+    tokio::task::spawn_blocking(move || crate::bisect::recover(&i)).await?.context("the mods couldn't be switched for the search for the breaking mod; the game wasn't started")?;
     // Worlds may have been played with mods this one lacks: in another instance of its
     // world set, or here before a mod rollback.
     task.stage("Checking worlds", 0);

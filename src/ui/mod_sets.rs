@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use egui::{Align, CornerRadius, Layout, RichText, Stroke, Ui, vec2};
@@ -28,11 +29,20 @@ const TICKED: &str = "\u{f0132}";
 const UNTICKED: &str = "\u{f0131}";
 const WARN: &str = "\u{f0026}";
 
-/// Each instance's sets and search, read from disk and read again when their files
-/// change (checked twice a second at most).
+/// How often the sets and search files are checked for changes.
+const RECHECK: Duration = Duration::from_millis(500);
+
+/// Each instance's sets and search, read from disk in the background and read again when
+/// their files change (checked twice a second at most). What was read last stays shown
+/// while a new read runs; nothing here reads a file on the UI thread.
 #[derive(Default)]
 pub struct State {
     cache: HashMap<String, Cached>,
+    /// Where reads run, set each frame by [`State::tick`].
+    rt: Option<(tokio::runtime::Handle, egui::Context)>,
+    /// Reads made by mod jobs as they finish, after their writes: shown before the job
+    /// stops counting as busy, so no guard sees the files as they were before it.
+    inbox: Arc<Mutex<HashMap<String, Read>>>,
     /// Games that ended mid-search, to ask about once no other dialog is open:
     /// (instance id, what suggests the problem happened).
     asks: Vec<(String, Option<String>)>,
@@ -41,71 +51,197 @@ pub struct State {
     absorb_failed: std::collections::HashSet<String>,
 }
 
-struct Cached {
-    checked: Instant,
-    stamps: (Option<SystemTime>, Option<SystemTime>),
+type Stamps = (Option<SystemTime>, Option<SystemTime>);
+
+/// The two files as read.
+pub struct Read {
+    stamps: Stamps,
     sets: Result<ModSets, String>,
     bisect: Result<Option<Bisect>, String>,
+}
+
+#[derive(Default)]
+struct Cached {
+    shown: Option<Read>,
+    /// When the last read was started.
+    checked: Option<Instant>,
+    /// A read running, and the generation it was started in.
+    reading: Option<(Promise<Option<Read>>, u64)>,
+    /// Bumped whenever something newer than a running read is shown: that read is dropped.
+    generation: u64,
 }
 
 fn stamp(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
+/// Read `inst`'s sets and search, unless their files' stamps are still `known`. Reads files: off the UI thread.
+pub fn read(inst: &Instance, known: Option<Stamps>) -> Option<Read> {
+    let stamps = (stamp(&mod_sets::path(inst)), stamp(&bisect::path(inst)));
+    if known == Some(stamps) {
+        return None;
+    }
+    Some(Read { stamps, sets: mod_sets::load(inst).map_err(|e| format!("{e:#}")), bisect: bisect::load(inst).map_err(|e| format!("{e:#}")) })
+}
+
 impl State {
-    fn get(&mut self, inst: &Instance) -> &Cached {
-        let fresh = self.cache.get(&inst.id).is_some_and(|c| c.checked.elapsed() < Duration::from_millis(500));
-        if !fresh {
-            let stamps = (stamp(&mod_sets::path(inst)), stamp(&bisect::path(inst)));
-            match self.cache.get_mut(&inst.id) {
-                Some(c) if c.stamps == stamps => c.checked = Instant::now(),
-                _ => {
-                    let sets = mod_sets::load(inst).map_err(|e| format!("{e:#}"));
-                    let bisect = bisect::load(inst).map_err(|e| format!("{e:#}"));
-                    self.cache.insert(inst.id.clone(), Cached { checked: Instant::now(), stamps, sets, bisect });
-                }
+    /// Note where background reads run (each frame).
+    pub fn tick(&mut self, rt: &tokio::runtime::Handle, ctx: &egui::Context) {
+        if self.rt.is_none() {
+            self.rt = Some((rt.clone(), ctx.clone()));
+        }
+    }
+
+    /// What's known of `inst`'s files, starting a read if it's time for one. None until the first read is back.
+    fn get(&mut self, inst: &Instance) -> Option<&Read> {
+        let c = self.cache.entry(inst.id.clone()).or_default();
+        if let Some(read) = self.inbox.lock().unwrap().remove(&inst.id) {
+            c.shown = Some(read);
+            c.generation += 1;
+        }
+        if let Some((p, generation)) = &c.reading
+            && let Some(r) = p.take()
+        {
+            let fresh = *generation == c.generation;
+            c.reading = None;
+            match r {
+                Ok(Some(read)) if fresh => c.shown = Some(read),
+                Ok(_) => {}
+                Err(e) => c.shown = Some(Read { stamps: (None, None), sets: Err(format!("{e:#}")), bisect: Err(format!("{e:#}")) }),
             }
         }
-        &self.cache[&inst.id]
+        if c.reading.is_none()
+            && c.checked.is_none_or(|t| t.elapsed() >= RECHECK)
+            && let Some((rt, ctx)) = &self.rt
+        {
+            let (i, known) = (inst.clone(), c.shown.as_ref().map(|r| r.stamps));
+            let p = Promise::spawn(rt, ctx, async move { Ok(tokio::task::spawn_blocking(move || read(&i, known)).await?) });
+            c.reading = Some((p, c.generation));
+            c.checked = Some(Instant::now());
+        }
+        c.shown.as_ref()
     }
 
-    pub fn sets(&mut self, inst: &Instance) -> Result<ModSets, String> {
-        self.get(inst).sets.clone()
+    /// `inst`'s sets, once read.
+    pub fn sets(&mut self, inst: &Instance) -> Option<Result<ModSets, String>> {
+        self.get(inst).map(|r| r.sets.clone())
     }
 
+    /// `inst`'s search, if one is known to exist.
     pub fn bisect(&mut self, inst: &Instance) -> Option<Bisect> {
-        self.get(inst).bisect.as_ref().ok().and_then(|b| b.clone())
+        self.get(inst).and_then(|r| r.bisect.as_ref().ok().cloned().flatten())
     }
 
-    /// Whether a search for the breaking mod has `inst`'s mods (running or showing its result).
+    /// Whether a search has `inst`'s mods; None until its file has been read.
+    pub fn search_known(&mut self, inst: &Instance) -> Option<bool> {
+        self.get(inst).map(|r| r.bisect.as_ref().is_ok_and(|b| b.is_some()))
+    }
+
+    /// Whether a search for the breaking mod has `inst`'s mods (running or showing its
+    /// result), or might (not read yet).
     pub fn searching(&mut self, inst: &Instance) -> bool {
-        self.get(inst).bisect.as_ref().is_ok_and(|b| b.is_some())
+        self.search_known(inst) != Some(false)
     }
 
-    /// [`Self::searching`] as last read, for the hints bar (which can't read files).
+    /// [`Self::searching`] as last read, for the hints bar.
     pub fn seen_searching(&self, id: &str) -> bool {
-        self.cache.get(id).is_some_and(|c| c.bisect.as_ref().is_ok_and(|b| b.is_some()))
+        self.cache.get(id).and_then(|c| c.shown.as_ref()).is_some_and(|r| r.bisect.as_ref().is_ok_and(|b| b.is_some()))
     }
 
-    /// Read `inst`'s files again next time (after writing them).
+    /// Read `inst`'s files again soon (after writing them).
     pub fn forget(&mut self, id: &str) {
-        self.cache.remove(id);
+        if let Some(c) = self.cache.get_mut(id) {
+            c.checked = None;
+        }
+    }
+
+    /// Show `sets` for instance `id` now (just saved), and check the files again soon.
+    fn put_sets(&mut self, id: &str, sets: ModSets) {
+        let c = self.cache.entry(id.to_string()).or_default();
+        if let Some(r) = &mut c.shown {
+            r.sets = Ok(sets);
+            r.stamps.0 = None;
+            c.generation += 1;
+        }
+        c.checked = None;
+    }
+
+    /// Where a mod job leaves its read of the files once it's done writing.
+    fn inbox(&self) -> Arc<Mutex<HashMap<String, Read>>> {
+        self.inbox.clone()
+    }
+}
+
+/// Who has an instance's mods right now: the one admission check every control that
+/// switches mods goes through (the mods tab, sets, the crash panel, the search's own actions).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModsBusy {
+    pub starting: bool,
+    pub running: bool,
+    /// A mod job: a switch, update, rollback or a search's step or ending.
+    pub jobs: bool,
+    /// Anything installing into the instance.
+    pub installing: bool,
+    /// Whether a search for the breaking mod has them; None until its file has been read.
+    pub search: Option<bool>,
+}
+
+impl ModsBusy {
+    /// Why a mod can't be switched on or off by hand (crash panel), if it can't.
+    pub fn by_hand(&self) -> Option<&'static str> {
+        if self.starting {
+            Some("the game is starting")
+        } else if self.jobs {
+            Some("mods are being switched or updated")
+        } else if self.search != Some(false) {
+            Some("the search for the breaking mod has them")
+        } else {
+            None
+        }
+    }
+
+    /// Why the mods can't be switched to a set, or a search started, if they can't.
+    pub fn switch(&self) -> Option<&'static str> {
+        if self.starting {
+            Some("the game is starting")
+        } else if self.running {
+            Some("the game is running")
+        } else if self.jobs || self.installing {
+            Some("mods are installing or updating")
+        } else {
+            self.by_hand()
+        }
+    }
+
+    /// Why a search's own step (answer, stop, finish, try again) can't run now, if it can't:
+    /// only one at a time, and never while a game has the mods.
+    pub fn search_action(&self) -> Option<&'static str> {
+        if self.starting {
+            Some("the game is starting")
+        } else if self.running {
+            Some("the game is running")
+        } else if self.jobs || self.installing {
+            Some("mods are being switched, installed or updated")
+        } else {
+            None
+        }
+    }
+}
+
+/// [`ModsBusy`] for `inst` now.
+pub fn busy(app: &mut App, inst: &Instance) -> ModsBusy {
+    ModsBusy {
+        starting: app.sessions.get(&inst.id).is_some_and(|s| s.starting()),
+        running: app.is_running(&inst.id),
+        jobs: app.content.updating(&inst.id),
+        installing: app.content.busy_with(&inst.id),
+        search: app.mod_sets.search_known(inst),
     }
 }
 
 /// Why `inst`'s mods can't be switched to a set right now, if they can't.
 fn switch_blocked(app: &mut App, inst: &Instance) -> Option<&'static str> {
-    if app.sessions.get(&inst.id).is_some_and(|s| s.starting()) {
-        Some("the game is starting")
-    } else if app.is_running(&inst.id) {
-        Some("the game is running")
-    } else if app.content.busy_with(&inst.id) {
-        Some("mods are installing or updating")
-    } else if app.mod_sets.searching(inst) {
-        Some("the search for the breaking mod has them")
-    } else {
-        None
-    }
+    busy(app, inst).switch()
 }
 
 /// Run `f` on `inst`'s mods in the background as a mod job (so the instance counts as
@@ -113,9 +249,15 @@ fn switch_blocked(app: &mut App, inst: &Instance) -> Option<&'static str> {
 fn job(app: &mut App, ctx: &egui::Context, inst: &Instance, stage: &str, f: impl FnOnce(&Instance) -> anyhow::Result<String> + Send + 'static) {
     let task = Task::new(format!("{stage} in {}", inst.name));
     task.stage(stage, 0);
-    let (i, rt) = (inst.clone(), app.rt.clone());
+    let (i, rt, inbox) = (inst.clone(), app.rt.clone(), app.mod_sets.inbox());
     app.content.start_mod_job(&rt, ctx, &inst.id, None, task, async move {
-        match tokio::task::spawn_blocking(move || f(&i)).await {
+        let r = tokio::task::spawn_blocking(move || {
+            let r = f(&i);
+            deliver(&inbox, &i);
+            r
+        })
+        .await;
+        match r {
             Ok(Ok(text)) => ModJobDone::new(ToastKind::Info, text),
             Ok(Err(e)) => ModJobDone::new(ToastKind::Error, format!("{e:#}")),
             Err(e) => ModJobDone::new(ToastKind::Error, e.to_string()),
@@ -124,15 +266,26 @@ fn job(app: &mut App, ctx: &egui::Context, inst: &Instance, stage: &str, f: impl
     app.mod_sets.forget(&inst.id);
 }
 
+/// Read `inst`'s files as a mod job ends, for [`State`] to show before the job stops counting as busy.
+fn deliver(inbox: &Mutex<HashMap<String, Read>>, inst: &Instance) {
+    if let Some(r) = read(inst, None) {
+        inbox.lock().unwrap().insert(inst.id.clone(), r);
+    }
+}
+
 /// Change `inst`'s sets on disk with `f`, toasting a failure.
 fn edit_sets(app: &mut App, inst: &Instance, f: impl FnOnce(&mut ModSets) -> anyhow::Result<()>) -> bool {
     let r = mod_sets::load(inst).and_then(|mut sets| {
         f(&mut sets)?;
-        mod_sets::save(inst, &sets)
+        mod_sets::save(inst, &sets)?;
+        Ok(sets)
     });
     app.mod_sets.forget(&inst.id);
     match r {
-        Ok(()) => true,
+        Ok(sets) => {
+            app.mod_sets.put_sets(&inst.id, sets);
+            true
+        }
         Err(e) => {
             app.toast(ToastKind::Error, format!("{e:#}"));
             false
@@ -167,7 +320,8 @@ pub fn bar(app: &mut App, ui: &mut Ui, inst: &Instance, found: Option<(&[Entry],
     if app.mod_sets.bisect(inst).is_some() {
         return;
     }
-    let sets = app.mod_sets.sets(inst);
+    // Nothing until the files have been read (a frame or two).
+    let Some(sets) = app.mod_sets.sets(inst) else { return };
     let busy = switch_blocked(app, inst);
     let sets = match sets {
         Ok(s) => s,
@@ -344,7 +498,7 @@ pub fn open_sets(app: &mut App, ctx: &egui::Context, inst: &Instance, names: Has
         })
         .await?)
     });
-    let sets = app.mod_sets.sets(inst).unwrap_or_default();
+    let sets = app.mod_sets.sets(inst).and_then(Result::ok).unwrap_or_default();
     let selected = sets.sets.iter().position(|s| s.name == sets.active).unwrap_or(0);
     app.modal = Some(Modal::ModSets(Box::new(SetsDialog {
         inst: inst.clone(),
@@ -381,7 +535,7 @@ pub fn sets_dialog(app: &mut App, s: &mut SetsDialog, ui: &mut Ui) -> bool {
         s.scan = None;
     }
     let inst = s.inst.clone();
-    let sets = app.mod_sets.sets(&inst).unwrap_or_default();
+    let sets = app.mod_sets.sets(&inst).and_then(Result::ok).unwrap_or_default();
     s.selected = s.selected.min(sets.sets.len().saturating_sub(1));
     let current = sets.sets.get(s.selected).cloned();
     if current.as_ref().map(|c| &c.name) != s.renaming.as_ref() {
@@ -751,6 +905,10 @@ pub fn open_bisect(app: &mut App, id: &str, first: Vec<String>) {
         app.toast(ToastKind::Error, "Vanilla instances don't load mods");
         return;
     }
+    if app.mod_sets.search_known(&inst).is_none() {
+        app.toast(ToastKind::Info, "Still reading the mods' state; try again in a moment");
+        return;
+    }
     if let Some(b) = app.mod_sets.bisect(&inst) {
         if b.done.is_none() {
             app.modal = Some(Modal::Bisect(Box::new(BisectDialog::Ask(AskDialog { inst_id: inst.id.clone(), why: None, choice: 0 }))));
@@ -923,58 +1081,64 @@ fn ask_dialog(app: &mut App, a: &mut AskDialog, ui: &mut Ui) -> bool {
 
 /// Send an answer for `inst`'s current step, then switch to the next.
 fn answer(app: &mut App, ctx: &egui::Context, inst: &Instance, a: Answer) {
-    if app.is_running(&inst.id) {
-        app.toast(ToastKind::Error, "Close the game first, then answer");
-        return;
-    }
-    if app.content.busy_with(&inst.id) {
-        app.toast(ToastKind::Error, "Wait for the mods to finish switching");
+    if let Some(why) = busy(app, inst).search_action() {
+        app.toast(ToastKind::Error, format!("Can't answer while {why}"));
         return;
     }
     let (i, rt) = (inst.clone(), app.rt.clone());
     let task = Task::new(format!("finding the breaking mod in {}", inst.name));
     task.stage("switching mods", 0);
+    let inbox = app.mod_sets.inbox();
     app.content.start_mod_job(&rt, ctx, &inst.id, None, task, async move {
-        let r = tokio::task::spawn_blocking({
-            let i = i.clone();
-            move || bisect::answer(&i, a)
-        })
-        .await;
-        let b = match r {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => return ModJobDone::new(ToastKind::Error, format!("{e:#}")),
-            Err(e) => return ModJobDone::new(ToastKind::Error, e.to_string()),
-        };
-        let Some(done) = &b.done else {
-            let (n, of) = b.progress();
-            let on = b.step.as_ref().map_or(0, |s| s.on.len());
-            return ModJobDone::new(ToastKind::Info, format!("Step {n} of ~{of}: {on} mods on, {} suspects. Play again.", b.suspects.len()));
-        };
-        // Its Modrinth page, if it has one, for "open its page".
-        if !done.culprits.is_empty() {
-            let dir = i.game_dir().join("mods");
-            let files: Vec<(String, Option<String>)> = done.culprits.iter().map(|c| (c.file.clone(), crate::net::sha1_file(&dir.join(&c.file)))).collect();
-            let hashes: Vec<String> = files.iter().filter_map(|(_, h)| h.clone()).collect();
-            if let Ok(found) = crate::content_meta::lookup(hashes).await
-                && let Ok(Some(mut b)) = bisect::load(&i)
-            {
-                for c in b.done.iter_mut().flat_map(|d| d.culprits.iter_mut()) {
-                    let hash = files.iter().find(|(f, _)| *f == c.file).and_then(|(_, h)| h.as_ref());
-                    if let Some(p) = hash.and_then(|h| found.get(h)) {
-                        c.project = Some(p.id.clone());
-                        c.name = c.name.take().or(Some(p.title.clone()));
-                    }
-                }
-                let _ = bisect::save(&i, &b);
-            }
-        }
-        match done.culprits.as_slice() {
-            [] => ModJobDone::new(ToastKind::Info, "Couldn't narrow the problem to one mod; the mods tab says why".into()),
-            [c] => ModJobDone::new(ToastKind::Info, format!("Breaking mod found: {}", c.label())),
-            many => ModJobDone::new(ToastKind::Info, format!("The breaking mod is one of {} mods that need each other", many.len())),
-        }
+        let done = answered(i.clone(), a).await;
+        let _ = tokio::task::spawn_blocking(move || deliver(&inbox, &i)).await;
+        done
     });
     app.mod_sets.forget(&inst.id);
+}
+
+/// Answer `i`'s step (off the UI thread), and name the culprits once it's over.
+async fn answered(i: Instance, a: Answer) -> ModJobDone {
+    let r = tokio::task::spawn_blocking({
+        let i = i.clone();
+        move || bisect::answer(&i, a)
+    })
+    .await;
+    let b = match r {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => return ModJobDone::new(ToastKind::Error, format!("{e:#}")),
+        Err(e) => return ModJobDone::new(ToastKind::Error, e.to_string()),
+    };
+    let Some(done) = &b.done else {
+        let (n, of) = b.progress();
+        let on = b.step.as_ref().map_or(0, |s| s.on.len());
+        return ModJobDone::new(ToastKind::Info, format!("Step {n} of ~{of}: {on} mods on, {} suspects. Play again.", b.suspects.len()));
+    };
+    // Its Modrinth page, if it has one, for "open its page".
+    if !done.culprits.is_empty() {
+        let dir = i.game_dir().join("mods");
+        let files: Vec<(String, Option<String>)> = done.culprits.iter().map(|c| (c.file.clone(), crate::net::sha1_file(&dir.join(&c.file)))).collect();
+        let hashes: Vec<String> = files.iter().filter_map(|(_, h)| h.clone()).collect();
+        if let Ok(found) = crate::content_meta::lookup(hashes).await {
+            let _ = tokio::task::spawn_blocking(move || {
+                bisect::edit(&i, |b| {
+                    for c in b.done.iter_mut().flat_map(|d| d.culprits.iter_mut()) {
+                        let hash = files.iter().find(|(f, _)| *f == c.file).and_then(|(_, h)| h.as_ref());
+                        if let Some(p) = hash.and_then(|h| found.get(h)) {
+                            c.project = Some(p.id.clone());
+                            c.name = c.name.take().or(Some(p.title.clone()));
+                        }
+                    }
+                })
+            })
+            .await;
+        }
+    }
+    match done.culprits.as_slice() {
+        [] => ModJobDone::new(ToastKind::Info, "Couldn't narrow the problem to one mod; the mods tab says why".into()),
+        [c] => ModJobDone::new(ToastKind::Info, format!("Breaking mod found: {}", c.label())),
+        many => ModJobDone::new(ToastKind::Info, format!("The breaking mod is one of {} mods that need each other", many.len())),
+    }
 }
 
 /// A game in `id` ended: if it was a step of a search, ask how it went. `exit` is its
@@ -1010,8 +1174,9 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
     let Some(b) = app.mod_sets.bisect(inst) else { return };
     let t = app.t.clone();
     let ctx = ui.ctx().clone();
+    let blocked = busy(app, inst).search_action();
     let running = app.is_running(&inst.id);
-    let busy = app.content.busy_with(&inst.id);
+    let busy = blocked.is_some();
     ui.add_space(12.0);
     let color = match &b.done {
         Some(d) if d.culprits.is_empty() => t.yellow,
@@ -1027,6 +1192,34 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 6.0;
+            // A switch that didn't finish, or an ending that couldn't find every mod, comes first.
+            if !b.unresolved.is_empty() {
+                let what = list_titles(&HashMap::new(), &b.unresolved);
+                w::para(ui, RichText::new(format!("Couldn't find {what} in the mods folder, so the search is kept to remember how the mods were. Put the files back and try again, or forget the search and sort them out by hand.")).color(t.red));
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_enabled_ui(!running && !busy, |ui| {
+                        if w::button(ui, "try again").clicked() {
+                            act = Some(Act::Recover);
+                        }
+                        if w::button(ui, "forget the search").on_hover_text("leave the mods as they are now").clicked() {
+                            act = Some(Act::Forget);
+                        }
+                    });
+                });
+                return;
+            }
+            if !b.applied {
+                w::para(ui, RichText::new("The mods didn't all switch. Nothing is lost: the search knows how they should be.").color(t.red));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled_ui(!running && !busy, |ui| w::button(ui, "try again")).inner.clicked() {
+                        act = Some(Act::Recover);
+                    }
+                    if b.ending.is_none() && ui.add_enabled_ui(!running && !busy, |ui| w::button(ui, "stop and put my mods back")).inner.clicked() {
+                        act = Some(Act::Restore);
+                    }
+                });
+                return;
+            }
             match &b.done {
                 None => {
                     let (n, of) = b.progress();
@@ -1045,7 +1238,7 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
                         if ui.add_enabled_ui(!running && !busy, |ui| w::button(ui, "answer…")).inner.clicked() {
                             act = Some(Act::Ask);
                         }
-                        if w::button(ui, "stop and put my mods back").clicked() {
+                        if ui.add_enabled_ui(!busy, |ui| w::button(ui, "stop and put my mods back")).inner.clicked() {
                             act = Some(Act::Restore);
                         }
                         ui.add_space(8.0);
@@ -1102,13 +1295,33 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
     let rect = r.response.rect;
     ui.painter().rect_filled(egui::Rect::from_min_size(rect.min, vec2(3.0, rect.height())), CornerRadius::ZERO, color);
 
+    // Checked again as it runs: a job may have started since the buttons were drawn.
+    if let Some(why) = blocked.filter(|_| act.as_ref().is_some_and(|a| !matches!(a, Act::Ask | Act::Forget))) {
+        app.toast(ToastKind::Error, format!("Can't do that while {why}"));
+        return;
+    }
     match act {
         Some(Act::Ask) => open_bisect(app, &inst.id, Vec::new()),
-        Some(Act::Restore) if running => app.toast(ToastKind::Error, "Close the game first"),
         Some(Act::Restore) => job(app, &ctx, inst, "putting the mods back", |i| {
             bisect::restore(i)?;
             Ok("Put the mods back as they were".into())
         }),
+        Some(Act::Recover) => job(app, &ctx, inst, "switching mods", |i| {
+            bisect::recover(i)?;
+            Ok(match bisect::load(i)? {
+                Some(b) if !b.unresolved.is_empty() => format!("Still couldn't find {}", b.unresolved.join(", ")),
+                Some(_) => "Switched the mods for the search".into(),
+                None => "Put the mods back as they were".into(),
+            })
+        }),
+        Some(Act::Forget) => {
+            app.modal = Some(Modal::Confirm(Confirm {
+                title: "forget the search".into(),
+                body: "Forget the search for the breaking mod? The mods stay as they are now, and the ones it couldn't find aren't put back.".into(),
+                button: "forget".into(),
+                action: ConfirmAction::ForgetSearch(inst.id.clone()),
+            }));
+        }
         Some(Act::Disable) => job(app, &ctx, inst, "putting the mods back", |i| {
             let also = bisect::disable_culprits(i)?;
             Ok(match also.len() {
@@ -1124,6 +1337,21 @@ enum Act {
     Ask,
     Restore,
     Disable,
+    Recover,
+    Forget,
+}
+
+/// Forget instance `id`'s search (confirmed already), leaving its mods as they are.
+pub fn forget_search(app: &mut App, ctx: &egui::Context, id: &str) {
+    let Some(inst) = app.instances.iter().find(|i| i.id == id).cloned() else { return };
+    if let Some(why) = busy(app, &inst).search_action() {
+        app.toast(ToastKind::Error, format!("Can't forget the search while {why}"));
+        return;
+    }
+    job(app, ctx, &inst, "forgetting the search", |i| {
+        bisect::forget(i)?;
+        Ok("Forgot the search; the mods stay as they are".into())
+    });
 }
 
 /// The `b` key: answer the running search's step, or start one from the mods tab.
@@ -1144,6 +1372,70 @@ mod tests {
     #[test]
     fn step_estimates() {
         assert_eq!([1, 2, 3, 4, 5, 8, 9, 14, 100].map(steps_for), [1, 2, 3, 3, 4, 4, 5, 5, 8]);
+    }
+
+    #[test]
+    fn search_controls_share_one_admission_check() {
+        let idle = ModsBusy { search: Some(false), ..Default::default() };
+        assert!(idle.by_hand().is_none() && idle.switch().is_none() && idle.search_action().is_none());
+        // The crash panel's toggles: never while a search has the mods, or before that's known.
+        let searching = ModsBusy { search: Some(true), ..idle };
+        assert!(searching.by_hand().is_some() && searching.switch().is_some());
+        assert!(searching.search_action().is_none(), "the search's own actions still run");
+        assert!(ModsBusy { search: None, ..idle }.by_hand().is_some());
+        // Stop, answer or try again while a step is being switched: refused.
+        let switching = ModsBusy { jobs: true, ..searching };
+        assert!(switching.search_action().is_some() && switching.by_hand().is_some());
+        for b in [ModsBusy { running: true, ..searching }, ModsBusy { starting: true, ..searching }, ModsBusy { installing: true, ..searching }] {
+            assert!(b.search_action().is_some(), "{b:?}");
+        }
+        assert!(ModsBusy { starting: true, ..idle }.by_hand().is_some());
+    }
+
+    #[test]
+    fn state_files_are_read_in_the_background_and_the_old_ones_stay_shown() {
+        use crate::loaders::Loader;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ctx = egui::Context::default();
+        let mut inst = Instance::new("sets reads", "1.21.1", Loader::Fabric("0.16.5".into()));
+        inst.assign_id().unwrap();
+        let named = |name: &str| ModSets { active: name.into(), sets: vec![mod_sets::ModSet { name: name.into(), ..Default::default() }] };
+        let shown = |s: &mut State| s.sets(&inst).and_then(Result::ok).map(|x| x.active);
+        let wait_for = |s: &mut State, want: &str| {
+            let start = Instant::now();
+            while shown(s).as_deref() != Some(want) {
+                assert!(start.elapsed() < Duration::from_secs(5), "never showed {want}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        mod_sets::save(&inst, &named("one")).unwrap();
+        let mut s = State::default();
+        s.tick(rt.handle(), &ctx);
+        assert!(s.sets(&inst).is_none(), "nothing is read on the drawing thread");
+        assert!(s.searching(&inst) && s.search_known(&inst).is_none(), "unknown counts as searching for the guards");
+        wait_for(&mut s, "one");
+        assert_eq!(s.search_known(&inst), Some(false));
+
+        // Changed on disk: the old sets stay up until the new read is back.
+        std::thread::sleep(Duration::from_millis(20));
+        mod_sets::save(&inst, &named("two")).unwrap();
+        assert_eq!(shown(&mut s).as_deref(), Some("one"));
+        wait_for(&mut s, "two");
+
+        // A mod job's read, made after its writes, is shown at once.
+        mod_sets::save(&inst, &named("three")).unwrap();
+        deliver(&s.inbox(), &inst);
+        assert_eq!(shown(&mut s).as_deref(), Some("three"));
+
+        // An oversized file is an error shown, not a frame held up.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(mod_sets::path(&inst), vec![b'#'; (crate::fsutil::METADATA_LIMIT + 1) as usize]).unwrap();
+        let start = Instant::now();
+        while !s.sets(&inst).is_some_and(|r| r.is_err()) {
+            assert!(start.elapsed() < Duration::from_secs(5), "the error never showed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::remove_dir_all(inst.dir()).unwrap();
     }
 
     #[test]
