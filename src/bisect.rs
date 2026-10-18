@@ -9,6 +9,12 @@
 //!   to confirm the problem goes away. If it doesn't, it wasn't one mod alone.
 //! - The state lives in `bisect.toml` in the instance folder, so it survives a restart,
 //!   and the mods are put back exactly as they were when it started ([`restore`]).
+//! - Every change of arrangement is saved before any file is renamed (`applied` false),
+//!   then made ([`publish`], idempotent), then marked done. A switch cut short is finished
+//!   by [`recover`] (before every launch) or by trying again; answers wait for it.
+//! - The record is only deleted once every original file has been found and put back.
+//!   A file renamed since is found by its SHA-1; one that can't be found keeps the record.
+//! - Every operation holds `.bisect.lock` in the instance folder, so two never interleave.
 //!
 //! Mods are named by file name as if enabled (`sodium-0.6.0.jar`), since nothing
 //! else changes the mods folder while a bisect runs (the mods tab is locked).
@@ -20,8 +26,8 @@ use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::instance::Instance;
-use crate::{content_meta, fsutil, mod_sets, world_sets};
+use crate::instance::{Instance, ModFile};
+use crate::{content_meta, fsutil, mod_sets, net, world_sets};
 
 pub const FILE: &str = "bisect.toml";
 
@@ -115,6 +121,23 @@ pub struct Bisect {
     pub history: Vec<Tried>,
     pub step: Option<Step>,
     pub done: Option<Done>,
+    /// Each original file's SHA-1, to find it again if it's renamed meanwhile.
+    #[serde(default)]
+    pub ids: BTreeMap<String, String>,
+    /// The mods are known to be as [`Bisect::wanted`] says. False from the moment a new
+    /// arrangement is saved until every file has been switched to it.
+    #[serde(default = "yes")]
+    pub applied: bool,
+    /// Ending: the mods on once it's over (as they were, or with the culprits off).
+    #[serde(default)]
+    pub ending: Option<BTreeSet<String>>,
+    /// Originals the last try at ending couldn't find in the mods folder.
+    #[serde(default)]
+    pub unresolved: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// What to start from: by default every enabled mod is a suspect.
@@ -140,7 +163,7 @@ pub fn path(inst: &Instance) -> PathBuf {
 /// The bisect running in `inst`, if one is.
 pub fn load(inst: &Instance) -> anyhow::Result<Option<Bisect>> {
     let p = path(inst);
-    match std::fs::read(&p) {
+    match std::fs::File::open(&p).and_then(fsutil::read_capped) {
         Ok(bytes) => Ok(Some(toml::from_str(&String::from_utf8_lossy(&bytes)).with_context(|| format!("reading {}", p.display()))?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
@@ -149,8 +172,14 @@ pub fn load(inst: &Instance) -> anyhow::Result<Option<Bisect>> {
 
 pub fn save(inst: &Instance, b: &Bisect) -> anyhow::Result<()> {
     let text = toml::to_string_pretty(b)?;
-    fsutil::write_atomic(&path(inst), text.as_bytes(), 0o644)?;
+    fsutil::write_atomic(&path(inst), text.as_bytes(), 0o644).context("saving the search")?;
     Ok(())
+}
+
+/// Held through every operation on `inst`'s search, by any process, so a stop can't
+/// interleave with an answer's renames.
+fn lock(inst: &Instance) -> anyhow::Result<fsutil::FileLock> {
+    fsutil::lock(&inst.dir().join(".bisect.lock")).context("locking the search")
 }
 
 /// The mod ids a jar answers to, and the ones it requires. Platform ids (minecraft,
@@ -216,11 +245,18 @@ pub fn jar_links(jar: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
 /// is a suspect. Turns the first step's mods on and the rest off, and saves the state.
 /// Reads every enabled jar: run it off the UI thread.
 pub fn start(inst: &Instance, opts: &Start) -> anyhow::Result<Bisect> {
+    let _held = lock(inst)?;
     if load(inst)?.is_some() {
         bail!("it's already finding a breaking mod; stop that one first");
     }
-    let files: Vec<_> = inst.mods().into_iter().filter(|f| !f.is_dir).collect();
-    let original: BTreeMap<String, bool> = files.iter().map(|f| (base(&f.name), f.enabled)).collect();
+    let files = mod_files(inst)?;
+    let mut original: BTreeMap<String, bool> = BTreeMap::new();
+    for f in &files {
+        if original.insert(base(&f.name), f.enabled).is_some() {
+            bail!("both {0} and {0}.disabled are in the mods folder; remove one of the two first", base(&f.name));
+        }
+    }
+    let ids = files.iter().filter_map(|f| Some((base(&f.name), net::sha1_file(&f.path)?))).collect();
     let enabled: Vec<&crate::instance::ModFile> = files.iter().filter(|f| f.enabled).collect();
     let links: Vec<(String, BTreeSet<String>, BTreeSet<String>)> = enabled
         .iter()
@@ -266,10 +302,15 @@ pub fn start(inst: &Instance, opts: &Start) -> anyhow::Result<Bisect> {
         history: Vec::new(),
         step: None,
         done: None,
+        ids,
+        applied: false,
+        ending: None,
+        unresolved: Vec::new(),
     };
     b.step = Some(b.plan());
-    apply_step(inst, &b)?;
+    // Saved before anything is renamed, so what it started from is never lost.
     save(inst, &b)?;
+    publish(inst, &mut b)?;
     Ok(b)
 }
 
@@ -298,6 +339,15 @@ impl Bisect {
         }
         out.retain(|f| !these.contains(f));
         out
+    }
+
+    /// The mods that should be on now: the ending's, the step's, or (showing the result) the original ones.
+    pub fn wanted(&self) -> BTreeSet<String> {
+        match (&self.ending, &self.step) {
+            (Some(on), _) => on.clone(),
+            (None, Some(s)) => s.on.clone(),
+            (None, None) => self.originally_on(),
+        }
     }
 
     fn originally_on(&self) -> BTreeSet<String> {
@@ -408,44 +458,109 @@ impl Bisect {
     }
 }
 
-/// Turn `inst`'s mods on and off for the current step (or as they were, if none).
-pub fn apply_step(inst: &Instance, b: &Bisect) -> anyhow::Result<()> {
-    let on = match &b.step {
-        Some(s) => s.on.clone(),
-        None => b.originally_on(),
-    };
-    set_mods(inst, b, &on)
+/// The mods folder's files (an unreadable folder is an error, not an empty one).
+fn mod_files(inst: &Instance) -> anyhow::Result<Vec<ModFile>> {
+    let dir = inst.game_dir().join("mods");
+    match std::fs::read_dir(&dir) {
+        Ok(_) => Ok(inst.mods().into_iter().filter(|f| !f.is_dir).collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", dir.display())),
+    }
 }
 
-/// Every file that was there at the start on if in `on`, else off. Files added since stay as they are.
-fn set_mods(inst: &Instance, b: &Bisect, on: &BTreeSet<String>) -> anyhow::Result<()> {
-    let mut failed = Vec::new();
-    for f in inst.mods().into_iter().filter(|f| !f.is_dir) {
+/// Each original file as it is now, by its name at the start; and the originals it can't
+/// find. A file under another name (renamed by hand) counts if it's the only unclaimed
+/// file with the original's SHA-1.
+fn locate(inst: &Instance, b: &Bisect) -> anyhow::Result<(BTreeMap<String, ModFile>, Vec<String>)> {
+    let mut found: BTreeMap<String, ModFile> = BTreeMap::new();
+    let mut unclaimed = Vec::new();
+    for f in mod_files(inst)? {
         let name = base(&f.name);
-        if b.original.contains_key(&name)
-            && let Err(e) = mod_sets::rename(&f.path, on.contains(&name))
-        {
+        if !b.original.contains_key(&name) {
+            unclaimed.push(f);
+        } else if found.insert(name.clone(), f).is_some() {
+            bail!("both {name} and {name}.disabled are in the mods folder; remove one of the two first");
+        }
+    }
+    let mut missing = Vec::new();
+    let mut hashed: Option<Vec<(Option<String>, ModFile)>> = None;
+    for name in b.original.keys().filter(|n| !found.contains_key(*n)).cloned().collect::<Vec<_>>() {
+        let hit = b.ids.get(&name).and_then(|id| {
+            let all = hashed.get_or_insert_with(|| unclaimed.iter().map(|f| (net::sha1_file(&f.path), f.clone())).collect());
+            let claimed: BTreeSet<&Path> = found.values().map(|f| f.path.as_path()).collect();
+            let mut hits = all.iter().filter(|(h, f)| h.as_ref() == Some(id) && !claimed.contains(f.path.as_path()));
+            match (hits.next(), hits.next()) {
+                (Some((_, f)), None) => Some(f.clone()),
+                _ => None,
+            }
+        });
+        match hit {
+            Some(f) => {
+                found.insert(name, f);
+            }
+            None => missing.push(name),
+        }
+    }
+    Ok((found, missing))
+}
+
+/// Every original file on if in `on`, else off; files added since stay as they are. Fails
+/// unless every original it found is then as asked. Returns the originals it couldn't find.
+fn set_mods(inst: &Instance, b: &Bisect, on: &BTreeSet<String>) -> anyhow::Result<Vec<String>> {
+    let (found, _) = locate(inst, b)?;
+    let mut failed = Vec::new();
+    for (name, f) in &found {
+        if let Err(e) = mod_sets::rename(&f.path, on.contains(name)) {
             failed.push(format!("{e:#}"));
         }
     }
     if !failed.is_empty() {
         bail!("couldn't switch every mod: {}", failed.join("; "));
     }
-    Ok(())
+    let (found, missing) = locate(inst, b)?;
+    let wrong: Vec<&String> = found.iter().filter(|(n, f)| f.enabled != on.contains(*n)).map(|(n, _)| n).collect();
+    if !wrong.is_empty() {
+        bail!("couldn't switch every mod: {} didn't change", wrong.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", "));
+    }
+    Ok(missing)
 }
 
-/// Answer the current step, then switch to the next one. Saves the state.
+/// Switch the mods to what `b` wants (saved beforehand, with `applied` false), then save
+/// that they are. Safe to repeat. Returns the originals it couldn't find.
+fn publish(inst: &Instance, b: &mut Bisect) -> anyhow::Result<Vec<String>> {
+    let missing = set_mods(inst, b, &b.wanted()).context("the search is saved, so trying again finishes the switch")?;
+    b.applied = true;
+    save(inst, b)?;
+    Ok(missing)
+}
+
+/// Whether the mods are as `b` wants right now (none of them switched by hand since).
+fn in_place(inst: &Instance, b: &Bisect) -> anyhow::Result<bool> {
+    let want = b.wanted();
+    let (found, _) = locate(inst, b)?;
+    Ok(found.iter().all(|(n, f)| f.enabled == want.contains(n)))
+}
+
+/// Answer the current step, then switch to the next one. Refused unless the mods are
+/// exactly the step's (a switch cut short, or a mod switched since, is put right first
+/// with [`recover`]). The next step is saved before any mod is switched.
 pub fn answer(inst: &Instance, a: Answer) -> anyhow::Result<Bisect> {
+    let _held = lock(inst)?;
     let mut b = load(inst)?.context("there's no search for a breaking mod running")?;
+    if b.ending.is_some() {
+        bail!("the search is ending; put the mods back first");
+    }
+    if !b.applied || !in_place(inst, &b)? {
+        bail!("the mods aren't as this step set them, so the answer wouldn't mean anything: switch them again, then play the step");
+    }
     b.answer(a)?;
     if b.done.is_some() {
         // Back to how it was while the result is read; the player picks what to keep.
-        set_mods(inst, &b, &b.originally_on())?;
         describe(inst, &mut b);
-    } else {
-        apply_step(inst, &b)?;
     }
+    b.applied = false;
     save(inst, &b)?;
+    publish(inst, &mut b)?;
     Ok(b)
 }
 
@@ -462,24 +577,88 @@ fn describe(inst: &Instance, b: &mut Bisect) {
     }
 }
 
-/// Put the mods back exactly as they were when it started and forget the bisect.
-pub fn restore(inst: &Instance) -> anyhow::Result<()> {
-    let Some(b) = load(inst)? else { return Ok(()) };
-    set_mods(inst, &b, &b.originally_on())?;
+/// End with the mods `on`: saved as the ending first, then switched, and the record is
+/// deleted only once every original file is found and as it should be.
+fn end(inst: &Instance, mut b: Bisect, on: BTreeSet<String>) -> anyhow::Result<()> {
+    b.ending = Some(on);
+    b.applied = false;
+    save(inst, &b)?;
+    finish(inst, &mut b)
+}
+
+fn finish(inst: &Instance, b: &mut Bisect) -> anyhow::Result<()> {
+    let missing = publish(inst, b)?;
+    if !missing.is_empty() {
+        b.unresolved = missing.clone();
+        save(inst, b)?;
+        let (them, were) = if missing.len() == 1 { ("it", "it was") } else { ("them", "they were") };
+        bail!(
+            "couldn't find {} in the mods folder, so the search is kept to remember how {were}: put {them} back and try again, or forget the search",
+            missing.join(", ")
+        );
+    }
     std::fs::remove_file(path(inst)).context("forgetting the search")?;
     Ok(())
+}
+
+/// Put the mods back exactly as they were when it started and forget the bisect.
+pub fn restore(inst: &Instance) -> anyhow::Result<()> {
+    let _held = lock(inst)?;
+    let Some(b) = load(inst)? else { return Ok(()) };
+    let on = b.originally_on();
+    end(inst, b, on)
 }
 
 /// Restore, then turn the culprits off, with whatever needs them. Returns the mods
 /// turned off besides the culprits.
 pub fn disable_culprits(inst: &Instance) -> anyhow::Result<Vec<String>> {
+    let _held = lock(inst)?;
     let b = load(inst)?.context("there's no search for a breaking mod running")?;
     let culprits: BTreeSet<String> = b.done.iter().flat_map(|d| &d.culprits).map(|c| c.file.clone()).collect();
     let also = b.dependents(&culprits);
     let on: BTreeSet<String> = b.originally_on().into_iter().filter(|f| !culprits.contains(f) && !also.contains(f)).collect();
-    set_mods(inst, &b, &on)?;
-    std::fs::remove_file(path(inst)).context("forgetting the search")?;
+    end(inst, b, on)?;
     Ok(also.into_iter().collect())
+}
+
+/// Put `inst`'s mods as its search says they should be: finish a switch cut short (or
+/// undo one made by hand), or an ending. Run before every launch: an error stops the game.
+/// An ending that can't find some originals keeps its record but doesn't stop the game.
+pub fn recover(inst: &Instance) -> anyhow::Result<()> {
+    let _held = lock(inst)?;
+    let Some(mut b) = load(inst)? else { return Ok(()) };
+    if b.ending.is_some() {
+        b.applied = false;
+        return match finish(inst, &mut b) {
+            Err(_) if b.applied => Ok(()),
+            r => r,
+        };
+    }
+    if !b.applied || !in_place(inst, &b)? {
+        b.applied = false;
+        save(inst, &b)?;
+        publish(inst, &mut b)?;
+    }
+    Ok(())
+}
+
+/// Forget the search without touching the mods (when its originals can't all be found).
+pub fn forget(inst: &Instance) -> anyhow::Result<()> {
+    let _held = lock(inst)?;
+    match std::fs::remove_file(path(inst)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).context("forgetting the search"),
+        _ => Ok(()),
+    }
+}
+
+/// Change the saved search with `f` (under its lock), if one is still there.
+pub fn edit(inst: &Instance, f: impl FnOnce(&mut Bisect)) -> anyhow::Result<()> {
+    let _held = lock(inst)?;
+    if let Some(mut b) = load(inst)? {
+        f(&mut b);
+        save(inst, &b)?;
+    }
+    Ok(())
 }
 
 /// Whether a crash report appeared in `inst` since `since`.
@@ -662,6 +841,179 @@ mod tests {
         restore(&i).unwrap();
         assert_eq!(on_now(&i), before);
         assert!(load(&i).unwrap().is_none());
+        std::fs::remove_dir_all(i.dir()).unwrap();
+    }
+
+    fn chmod(p: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn mods_of(i: &Instance) -> Vec<(String, bool)> {
+        i.mods().into_iter().map(|m| (m.name, m.enabled)).collect()
+    }
+
+    #[test]
+    fn a_search_is_saved_before_any_mod_is_switched() {
+        let i = inst("bisect save first");
+        for n in 0..4 {
+            jar(&i, &format!("m{n}-1.jar"), Some(&format!("m{n}")), &[]);
+        }
+        let before = mods_of(&i);
+        // The instance folder can't be written: no search can be saved, so nothing is switched.
+        chmod(&i.dir(), 0o555);
+        assert!(start(&i, &Start::default()).is_err());
+        chmod(&i.dir(), 0o755);
+        assert_eq!(mods_of(&i), before, "nothing switched without a record");
+        assert!(load(&i).unwrap().is_none());
+
+        // The mods can't be switched: the search is kept, waiting, and launches put it right.
+        let mods = i.game_dir().join("mods");
+        chmod(&mods, 0o555);
+        assert!(start(&i, &Start::default()).is_err());
+        let b = load(&i).unwrap().expect("the search is kept");
+        assert!(!b.applied && b.step.is_some());
+        assert!(answer(&i, Answer::Works).is_err(), "no answer for a step that never ran");
+        assert!(recover(&i).is_err(), "a launch is refused while the mods can't switch");
+        chmod(&mods, 0o755);
+        recover(&i).unwrap();
+        let b = load(&i).unwrap().unwrap();
+        assert!(b.applied);
+        assert_eq!(on_now(&i), b.step.unwrap().on);
+        restore(&i).unwrap();
+        assert_eq!(mods_of(&i), before);
+        std::fs::remove_dir_all(i.dir()).unwrap();
+    }
+
+    #[test]
+    fn a_switch_cut_short_at_any_point_is_finished() {
+        let i = inst("bisect interrupted");
+        for n in 0..6 {
+            jar(&i, &format!("m{n}-1.jar"), Some(&format!("m{n}")), &[]);
+        }
+        let before = mods_of(&i);
+        start(&i, &Start::default()).unwrap();
+        let first = load(&i).unwrap().unwrap();
+        // What an answer saves before switching: the next step, not yet applied.
+        let mut next = first.clone();
+        next.answer(Answer::Broken).unwrap();
+        next.applied = false;
+        let want = next.wanted();
+        let flips: Vec<String> = first.original.keys().filter(|f| first.wanted().contains(*f) != want.contains(*f)).cloned().collect();
+        assert!(!flips.is_empty());
+        for k in 0..=flips.len() {
+            // Back to step one, then the next saved and `k` of its renames made: a crash there.
+            save(&i, &first).unwrap();
+            set_mods(&i, &first, &first.wanted()).unwrap();
+            save(&i, &next).unwrap();
+            for f in &flips[..k] {
+                let p = i.game_dir().join("mods").join(f);
+                let p = if p.exists() { p } else { p.with_file_name(format!("{f}.disabled")) };
+                mod_sets::rename(&p, want.contains(f)).unwrap();
+            }
+            assert!(answer(&i, Answer::Works).is_err(), "no answer until the switch is finished ({k})");
+            recover(&i).unwrap();
+            let b = load(&i).unwrap().unwrap();
+            assert!(b.applied && b.history.len() == 1, "the saved step is the one now in place");
+            assert_eq!(on_now(&i), want, "after {k} of {} renames", flips.len());
+        }
+        // A mod switched by hand during a step: answers wait until it's put right.
+        let one = i.game_dir().join("mods").join(want.iter().next().unwrap());
+        mod_sets::rename(&one, false).unwrap();
+        assert!(answer(&i, Answer::Works).is_err());
+        recover(&i).unwrap();
+        answer(&i, Answer::Works).unwrap();
+        // An ending cut short: the next launch finishes it.
+        let mut b = load(&i).unwrap().unwrap();
+        b.ending = Some(b.originally_on());
+        b.applied = false;
+        save(&i, &b).unwrap();
+        recover(&i).unwrap();
+        assert!(load(&i).unwrap().is_none());
+        assert_eq!(mods_of(&i), before);
+        std::fs::remove_dir_all(i.dir()).unwrap();
+    }
+
+    #[test]
+    fn an_original_renamed_by_hand_is_found_by_its_bytes() {
+        let i = inst("bisect renamed");
+        for n in 0..4 {
+            jar(&i, &format!("m{n}-1.jar"), Some(&format!("m{n}")), &[]);
+        }
+        let b = start(&i, &Start::default()).unwrap();
+        let off = b.original.keys().find(|f| !b.step.as_ref().unwrap().on.contains(*f)).unwrap().clone();
+        let mods = i.game_dir().join("mods");
+        std::fs::rename(mods.join(format!("{off}.disabled")), mods.join("renamed.jar.disabled")).unwrap();
+        restore(&i).unwrap();
+        assert!(load(&i).unwrap().is_none());
+        assert!(mods.join("renamed.jar").is_file(), "on again, as it was before the search");
+        assert_eq!(on_now(&i).len(), 4);
+        std::fs::remove_dir_all(i.dir()).unwrap();
+    }
+
+    #[test]
+    fn an_original_that_cant_be_found_keeps_the_search() {
+        let i = inst("bisect missing");
+        for n in 0..4 {
+            jar(&i, &format!("m{n}-1.jar"), Some(&format!("m{n}")), &[]);
+        }
+        let b = start(&i, &Start::default()).unwrap();
+        let off = b.original.keys().find(|f| !b.step.as_ref().unwrap().on.contains(*f)).unwrap().clone();
+        let mods = i.game_dir().join("mods");
+        // Replaced under a new name by another tool: other bytes, so it can't be told it's the same.
+        std::fs::remove_file(mods.join(format!("{off}.disabled"))).unwrap();
+        jar(&i, "other-2.jar.disabled", Some("other"), &["x"]);
+        let e = restore(&i).unwrap_err();
+        assert!(format!("{e:#}").contains(&off), "{e:#}");
+        let b = load(&i).unwrap().expect("kept, so nothing is forgotten");
+        assert_eq!(b.unresolved, [off.clone()]);
+        assert_eq!(on_now(&i).len(), 3, "the rest are back");
+        assert!(mods.join("other-2.jar.disabled").exists(), "files it doesn't know stay as they are");
+        recover(&i).unwrap();
+        assert!(load(&i).unwrap().is_some(), "launches go ahead, the record stays");
+        // Put back by hand: the next try ends it.
+        jar(&i, &format!("{off}.disabled"), Some("whatever"), &[]);
+        restore(&i).unwrap();
+        assert!(load(&i).unwrap().is_none());
+        assert!(mods.join(&off).is_file());
+        // Or forgotten on purpose.
+        start(&i, &Start::default()).unwrap();
+        forget(&i).unwrap();
+        assert!(load(&i).unwrap().is_none());
+        std::fs::remove_dir_all(i.dir()).unwrap();
+    }
+
+    #[test]
+    fn twins_are_refused_at_the_start() {
+        let i = inst("bisect twins");
+        jar(&i, "a-1.jar", Some("a"), &[]);
+        jar(&i, "a-1.jar.disabled", Some("a"), &[]);
+        jar(&i, "b-1.jar", Some("b"), &[]);
+        let before = mods_of(&i);
+        let e = start(&i, &Start::default()).unwrap_err();
+        assert!(format!("{e:#}").contains("a-1.jar.disabled"), "{e:#}");
+        assert!(load(&i).unwrap().is_none());
+        assert_eq!(mods_of(&i), before);
+        std::fs::remove_dir_all(i.dir()).unwrap();
+    }
+
+    #[test]
+    fn a_stop_waits_for_an_answer_being_switched() {
+        let i = inst("bisect serial");
+        for n in 0..4 {
+            jar(&i, &format!("m{n}-1.jar"), Some(&format!("m{n}")), &[]);
+        }
+        let before = mods_of(&i);
+        start(&i, &Start::default()).unwrap();
+        let held = lock(&i).unwrap();
+        let j = i.clone();
+        let stop = std::thread::spawn(move || restore(&j));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(!stop.is_finished(), "waits while another operation has the search");
+        drop(held);
+        stop.join().unwrap().unwrap();
+        assert!(answer(&i, Answer::Works).is_err(), "an answer after the stop finds nothing to answer");
+        assert_eq!(mods_of(&i), before);
         std::fs::remove_dir_all(i.dir()).unwrap();
     }
 }

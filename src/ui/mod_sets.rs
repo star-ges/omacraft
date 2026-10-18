@@ -955,17 +955,19 @@ fn answer(app: &mut App, ctx: &egui::Context, inst: &Instance, a: Answer) {
             let dir = i.game_dir().join("mods");
             let files: Vec<(String, Option<String>)> = done.culprits.iter().map(|c| (c.file.clone(), crate::net::sha1_file(&dir.join(&c.file)))).collect();
             let hashes: Vec<String> = files.iter().filter_map(|(_, h)| h.clone()).collect();
-            if let Ok(found) = crate::content_meta::lookup(hashes).await
-                && let Ok(Some(mut b)) = bisect::load(&i)
-            {
-                for c in b.done.iter_mut().flat_map(|d| d.culprits.iter_mut()) {
-                    let hash = files.iter().find(|(f, _)| *f == c.file).and_then(|(_, h)| h.as_ref());
-                    if let Some(p) = hash.and_then(|h| found.get(h)) {
-                        c.project = Some(p.id.clone());
-                        c.name = c.name.take().or(Some(p.title.clone()));
-                    }
-                }
-                let _ = bisect::save(&i, &b);
+            if let Ok(found) = crate::content_meta::lookup(hashes).await {
+                let _ = tokio::task::spawn_blocking(move || {
+                    bisect::edit(&i, |b| {
+                        for c in b.done.iter_mut().flat_map(|d| d.culprits.iter_mut()) {
+                            let hash = files.iter().find(|(f, _)| *f == c.file).and_then(|(_, h)| h.as_ref());
+                            if let Some(p) = hash.and_then(|h| found.get(h)) {
+                                c.project = Some(p.id.clone());
+                                c.name = c.name.take().or(Some(p.title.clone()));
+                            }
+                        }
+                    })
+                })
+                .await;
             }
         }
         match done.culprits.as_slice() {
@@ -1027,6 +1029,34 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 6.0;
+            // A switch that didn't finish, or an ending that couldn't find every mod, comes first.
+            if !b.unresolved.is_empty() {
+                let what = list_titles(&HashMap::new(), &b.unresolved);
+                w::para(ui, RichText::new(format!("Couldn't find {what} in the mods folder, so the search is kept to remember how the mods were. Put the files back and try again, or forget the search and sort them out by hand.")).color(t.red));
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_enabled_ui(!running && !busy, |ui| {
+                        if w::button(ui, "try again").clicked() {
+                            act = Some(Act::Recover);
+                        }
+                        if w::button(ui, "forget the search").on_hover_text("leave the mods as they are now").clicked() {
+                            act = Some(Act::Forget);
+                        }
+                    });
+                });
+                return;
+            }
+            if !b.applied {
+                w::para(ui, RichText::new("The mods didn't all switch. Nothing is lost: the search knows how they should be.").color(t.red));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled_ui(!running && !busy, |ui| w::button(ui, "try again")).inner.clicked() {
+                        act = Some(Act::Recover);
+                    }
+                    if b.ending.is_none() && ui.add_enabled_ui(!running && !busy, |ui| w::button(ui, "stop and put my mods back")).inner.clicked() {
+                        act = Some(Act::Restore);
+                    }
+                });
+                return;
+            }
             match &b.done {
                 None => {
                     let (n, of) = b.progress();
@@ -1109,6 +1139,22 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
             bisect::restore(i)?;
             Ok("Put the mods back as they were".into())
         }),
+        Some(Act::Recover) => job(app, &ctx, inst, "switching mods", |i| {
+            bisect::recover(i)?;
+            Ok(match bisect::load(i)? {
+                Some(b) if !b.unresolved.is_empty() => format!("Still couldn't find {}", b.unresolved.join(", ")),
+                Some(_) => "Switched the mods for the search".into(),
+                None => "Put the mods back as they were".into(),
+            })
+        }),
+        Some(Act::Forget) => {
+            app.modal = Some(Modal::Confirm(Confirm {
+                title: "forget the search".into(),
+                body: "Forget the search for the breaking mod? The mods stay as they are now, and the ones it couldn't find aren't put back.".into(),
+                button: "forget".into(),
+                action: ConfirmAction::ForgetSearch(inst.id.clone()),
+            }));
+        }
         Some(Act::Disable) => job(app, &ctx, inst, "putting the mods back", |i| {
             let also = bisect::disable_culprits(i)?;
             Ok(match also.len() {
@@ -1124,6 +1170,21 @@ enum Act {
     Ask,
     Restore,
     Disable,
+    Recover,
+    Forget,
+}
+
+/// Forget instance `id`'s search (confirmed already), leaving its mods as they are.
+pub fn forget_search(app: &mut App, ctx: &egui::Context, id: &str) {
+    let Some(inst) = app.instances.iter().find(|i| i.id == id).cloned() else { return };
+    if app.is_running(id) || app.content.busy_with(id) {
+        app.toast(ToastKind::Error, "Wait for the game and mod jobs to finish");
+        return;
+    }
+    job(app, ctx, &inst, "forgetting the search", |i| {
+        bisect::forget(i)?;
+        Ok("Forgot the search; the mods stay as they are".into())
+    });
 }
 
 /// The `b` key: answer the running search's step, or start one from the mods tab.
