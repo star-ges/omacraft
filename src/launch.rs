@@ -183,7 +183,17 @@ pub async fn resolve_version(inst: &Instance) -> anyhow::Result<VersionJson> {
     })
 }
 
+/// Games launch on x86_64 Linux only: Mojang's Java runtimes and the older versions'
+/// natives are picked for it, and elsewhere they'd be the wrong ones, half matched.
+pub fn check_platform(os: &str, arch: &str) -> anyhow::Result<()> {
+    if os != "linux" || arch != "x86_64" {
+        bail!("unsupported platform: Omacraft launches games on x86_64 Linux only, and this is {arch} {os}");
+    }
+    Ok(())
+}
+
 async fn prepare(task: &Task, inst: &Instance, cfg: &Config, features: &Features) -> anyhow::Result<Prepared> {
+    check_platform(std::env::consts::OS, std::env::consts::ARCH)?;
     task.stage("Resolving version", 0);
     let mut version = resolve_version(inst).await?;
     // merge_child renames to the loader id; the client jar is always vanilla's.
@@ -739,6 +749,15 @@ pub async fn launch(
 mod tests {
     use super::*;
     use crate::loaders::Loader;
+
+    #[test]
+    fn games_launch_on_x86_64_linux_only() {
+        assert!(check_platform("linux", "x86_64").is_ok());
+        for (os, arch) in [("linux", "aarch64"), ("linux", "x86"), ("linux", "riscv64"), ("macos", "x86_64"), ("windows", "x86_64")] {
+            let e = check_platform(os, arch).unwrap_err().to_string();
+            assert!(e.contains("x86_64 Linux only") && e.contains(arch), "{os} {arch}: {e}");
+        }
+    }
 
     fn args_for(version: VersionJson, quick: Option<QuickPlay>) -> Vec<String> {
         let inst = Instance::new("t", &version.id, Loader::Vanilla);

@@ -221,6 +221,18 @@ pub struct Features {
     pub quick_play_multiplayer: bool,
 }
 
+/// Whether a rule's `os.arch` names `ours` (a Rust `target_arch`). Each name has its
+/// aliases; one we don't know never matches, so a library meant for another CPU is left out.
+fn arch_matches(rule: &str, ours: &str) -> bool {
+    let canonical = |a: &str| match a {
+        "x86_64" | "amd64" | "x64" => Some("x86_64"),
+        "x86" | "i386" | "i686" => Some("x86"),
+        "aarch64" | "arm64" => Some("aarch64"),
+        _ => None,
+    };
+    canonical(rule).is_some_and(|r| canonical(ours) == Some(r))
+}
+
 pub fn rules_allow(rules: &[Rule], features: &Features) -> bool {
     if rules.is_empty() {
         return true;
@@ -235,13 +247,7 @@ pub fn rules_allow(rules: &[Rule], features: &Features) -> bool {
                 matches = false;
             }
             if let Some(arch) = &os.arch {
-                let ours = if cfg!(target_pointer_width = "64") { "x86_64" } else { "x86" };
-                let arm = cfg!(target_arch = "aarch64");
-                matches &= match arch.as_str() {
-                    "x86" => ours == "x86" && !arm,
-                    "arm64" | "aarch64" => arm,
-                    _ => true,
-                };
+                matches &= arch_matches(arch, std::env::consts::ARCH);
             }
         }
         if let Some(feats) = &rule.features {
@@ -458,6 +464,17 @@ impl AssetObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn architectures_match_exactly() {
+        for (rule, ours) in [("x86_64", "x86_64"), ("amd64", "x86_64"), ("x86", "x86"), ("arm64", "aarch64"), ("aarch64", "aarch64")] {
+            assert!(arch_matches(rule, ours), "{rule} on {ours}");
+        }
+        // A library for another CPU, or one we can't name, is never ours.
+        for (rule, ours) in [("x86_64", "aarch64"), ("x86", "x86_64"), ("arm64", "x86_64"), ("arm32", "x86_64"), ("x86_64", "riscv64"), ("riscv64", "riscv64")] {
+            assert!(!arch_matches(rule, ours), "{rule} on {ours}");
+        }
+    }
 
     #[test]
     fn asset_hashes_must_be_sha1() {

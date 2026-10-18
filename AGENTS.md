@@ -362,5 +362,7 @@ test (and a rule here) with any fix that sets a new one.
   on CurseForge packs with a clear error, and content search is Modrinth-only.
 - **LiteLoader, Forge before 1.6:** legacy loaders, only worth it for old packs. Pre-1.6 Forge patches the
   jar instead of using launchwrapper.
-- **Non-x86_64:** Java runtime and native matching assume x86_64. An explicit "unsupported architecture"
-  error would be kinder than the current partial matching.
+- **Non-x86_64:** games launch on x86_64 Linux only (`launch::check_platform` refuses anything else, with a
+  clear error; the CLI's other commands still work). Library rules match `os.arch` exactly
+  (`mojang::arch_matches`: an unknown name never matches), so arm64 support would mostly need Java runtimes and
+  natives for it. Tests: `launch::tests::games_launch_on_x86_64_linux_only`, `mojang::tests::architectures_match_exactly`.

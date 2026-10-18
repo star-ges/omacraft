@@ -14,9 +14,8 @@ use crate::task::Task;
 const RUNTIMES_URL: &str =
     "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 
-fn platform() -> &'static str {
-    if cfg!(target_arch = "x86") { "linux-i386" } else { "linux" }
-}
+/// Mojang's name for x86_64 Linux, the only platform games launch on (`launch::check_platform`).
+const PLATFORM: &str = "linux";
 
 #[derive(Deserialize)]
 struct RuntimeEntry {
@@ -78,10 +77,10 @@ pub async fn ensure_runtime(task: &Task, component: &str) -> anyhow::Result<Path
             Err(e) => return Err(e),
         };
     let entry = all
-        .get(platform())
+        .get(PLATFORM)
         .and_then(|p| p.get(component))
         .and_then(|v| v.first())
-        .with_context(|| format!("Mojang has no {component} runtime for {}; set a Java override in settings", platform()))?;
+        .with_context(|| format!("Mojang has no {component} runtime for {PLATFORM}; set a Java override in settings"))?;
 
     if java.exists() && std::fs::read_to_string(&marker).ok().as_deref() == Some(entry.version.name.as_str()) {
         return Ok(java);
