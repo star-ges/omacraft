@@ -133,7 +133,11 @@ test (and a rule here) with any fix that sets a new one.
   is looked up again. Install jobs are keyed by (instance, project).
 - **Frame work:** nothing a pane draws runs subprocesses or reads files in bulk. Settings shows `app.fonts`
   (re-resolved only when the theme watcher sees fontconfig change); worlds are listed and duplicated on a
-  `Promise`/`Task`, and the old list stays up while a refresh runs.
+  `Promise`/`Task`, and the old list stays up while a refresh runs. The mods tab's sets and search
+  (`mod_sets.toml`, `bisect.toml`, read capped at `METADATA_LIMIT`) are read on a Promise (`ui::mod_sets::State`): the
+  last read stays shown while a new one runs, a mod job leaves its own read in the state's inbox as it ends (so no guard
+  sees the files from before its writes), and until the first read is back the search counts as possibly running.
+  Test: `ui::mod_sets::tests::state_files_are_read_in_the_background_and_the_old_ones_stay_shown`.
 - **Decompression caps:** compressed metadata (`instance.cfg`, `mmc-pack.json`, `modrinth.index.json`, exported
   icons, mod metadata and icons, `level.dat`) is read through `fsutil::read_capped`, which fails past
   `METADATA_LIMIT` (16 MiB). Bulk extraction (`import::extract`) has no total-bytes cap yet.

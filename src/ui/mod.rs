@@ -1215,6 +1215,7 @@ impl eframe::App for App {
         self.refresh_theme(&ctx);
         self.poll(&ctx);
         self.content.poll(&mut self.toasts);
+        self.mod_sets.tick(&self.rt, &ctx);
         self.acct.poll(&mut self.accounts, &mut self.toasts);
         self.keys(&ctx);
         self.dropped_files(&ctx);
