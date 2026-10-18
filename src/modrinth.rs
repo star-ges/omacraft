@@ -45,6 +45,10 @@ pub struct Version {
     pub dependencies: Vec<Dependency>,
     #[serde(default)]
     pub date_published: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub game_versions: Vec<String>,
+    #[serde(default)]
+    pub version_type: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,6 +106,18 @@ pub async fn search(kind: ContentKind, query: &str, inst: &Instance) -> anyhow::
     let index = if query.trim().is_empty() { "downloads" } else { "relevance" };
     let url = format!("{API}/search?query={}&facets={}&index={index}&limit=40", enc(query), enc(&facets));
     net::get_json(&url).await
+}
+
+/// Modpacks, for the import dialog: any game version, most downloaded first when there's no query.
+pub async fn search_packs(query: &str) -> anyhow::Result<SearchResponse> {
+    let facets = enc(r#"[["project_type:modpack"]]"#);
+    let index = if query.trim().is_empty() { "downloads" } else { "relevance" };
+    net::get_json(&format!("{API}/search?query={}&facets={facets}&index={index}&limit=40", enc(query))).await
+}
+
+/// A modpack's versions, newest first (as Modrinth lists them).
+pub async fn pack_versions(project: &str) -> anyhow::Result<Vec<Version>> {
+    net::get_json(&format!("{API}/project/{}/version", enc(project))).await
 }
 
 async fn compatible_version(kind: ContentKind, project: &str, inst: &Instance) -> anyhow::Result<Version> {
@@ -562,6 +578,8 @@ mod tests {
             files: Vec::new(),
             loaders: Vec::new(),
             date_published: None,
+            game_versions: Vec::new(),
+            version_type: String::new(),
             dependencies: deps
                 .iter()
                 .map(|(p, v)| Dependency { project_id: p.map(Into::into), version_id: v.map(Into::into), dependency_type: "required".into() })
@@ -790,6 +808,19 @@ mod tests {
         assert_eq!(mod_names(&mods), ["a-1.jar.disabled"]);
         std::fs::remove_dir_all(inst.dir()).unwrap();
         crate::backups::forget_instance(&inst.id).unwrap();
+    }
+
+    /// Hits the network; run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn modpacks_are_found_with_their_versions() {
+        let hits = search_packs("fabulously optimized").await.unwrap().hits;
+        let fo = hits.iter().find(|h| h.slug == "fabulously-optimized").expect("found by name");
+        let versions = pack_versions(&fo.project_id).await.unwrap();
+        assert!(versions.len() > 10);
+        assert!(versions.iter().all(|v| v.project_id == fo.project_id && !v.game_versions.is_empty()));
+        assert!(versions.windows(2).all(|w| w[0].date_published >= w[1].date_published), "newest first");
+        assert!(!search_packs("").await.unwrap().hits.is_empty());
     }
 
     /// Hits the network; run with `cargo test -- --ignored`.

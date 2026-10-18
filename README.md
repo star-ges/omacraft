@@ -48,18 +48,31 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
 - **Loaders**: vanilla (every release and snapshot), Fabric, Quilt, Forge and NeoForge. Forge 1.13+
   and NeoForge patch the game on the first launch of each build, so that launch takes a minute longer.
 - **Modrinth**: search and install mods, resource packs and shader packs, with dependencies resolved.
-  Installed items show their name, icon and version.
-- **Import**: Prism, PolyMC and MultiMC instances (found automatically, or from a `.zip` or folder)
-  and Modrinth packs (a `.mrpack` or a modrinth.com modpack link). Drop a file on the window to import
-  it. On btrfs, even huge instances import instantly.
+  Installed items show their name, icon and version. `u` in the mods tab updates them (see
+  [mod updates](#how-omacraft-handles-game-files)).
+- **Import**: browse Modrinth modpacks right in the import dialog and pick any version, or import Prism,
+  PolyMC and MultiMC instances (found automatically, or from a `.zip` or folder), a `.mrpack` or a
+  modrinth.com modpack link. On btrfs, even huge instances import instantly.
+- **Drag and drop**: drop mods, resource packs or shader packs on their tab to add them, a world folder
+  or world `.zip` on the worlds tab, and a pack or instance anywhere else to import it. Nothing already
+  there is ever replaced.
 - **Disk dedup**: each mod and pack is downloaded once. On btrfs or xfs, every instance gets its own
   copy, but the bytes are stored only once. **settings → reclaim disk space** merges identical files that
   came in another way (imports, jars added by hand) and clears cached downloads no instance uses.
+- **Share sets**: instances in the same share set share their resource packs, shader packs and schematics,
+  so a pack added to one shows up in all of them. Pick a set when editing an instance; **settings → shared
+  folders** lists every set and its members.
+- **World sets**: instances on the same Minecraft version and loader can share their worlds, say a
+  lightweight one and a shaders one. Each world remembers the mods it was last played with, and Omacraft
+  backs a world up before another instance with fewer or older mods opens it.
+- **Backups**: each world a game played is backed up when it exits, and the worlds tab can back up, restore or
+  delete by hand. Mod updates back up `mods` and `config` first, and `z` rolls them back.
 - **Export**: a Modrinth pack (`.mrpack`) or an instance zip that Prism, PolyMC and MultiMC open.
   You choose which folders go in.
 - **Per-instance tabs**: version and loader, live game log, mods, resource packs, shader packs, configs (game, mods, shaders),
-  notes, worlds (open one directly on 1.20+, rename, duplicate, delete), servers (edit the list, join directly),
+  notes, worlds (open one directly on 1.20+, rename, duplicate, delete, backups), servers (edit the list, join directly),
   screenshots (just this instance's, or every instance's at once) and past logs and crash reports.
+- **Copy settings**: a new instance can start with another one's keybinds, FOV and sound (`options.txt`).
 - **Config editor**: the configs tab has three parts. **minecraft** is the game's own `options.txt`, named and
   grouped like its menus (video, sound, controls, chat…), key bindings set by pressing the key. **mods** lists each mod's config files (`c` or the cog on
   a mod in the mods tab goes straight there) and edits TOML, JSON and JSON5 settings as switches, sliders and
@@ -70,7 +83,9 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
   Saving changes only the values you touched, never overwrites a file the game rewrote meanwhile without asking,
   and nothing unsaved is lost on the way out.
 - **Mod sets**: save the mods as they are as a named set ("performance", "full pack") and switch between sets in
-  one step from the mods tab (`s`). Nothing is removed or duplicated, and updates keep a mod in its sets.
+  one step from the mods tab (`s`). Edit a set as a checklist without touching the mods folder; ticking a mod
+  ticks what it needs. Nothing is removed or duplicated, updates keep a mod in its sets, and newly added mods
+  join the set in use.
 - **Why it crashed**: when a game crashes, the log tab says which mod is most likely at fault and why, quoting the
   lines in the crash report or log that say so. Unmet dependencies, failed mixins, mods for the wrong loader or
   Java, and out-of-memory or graphics-driver crashes are explained in plain words. Disable the suspect right there,
@@ -81,7 +96,7 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
 - **Groups**: collapsible groups in the instance list, each with an optional colour from the theme.
   Drag instances between them, or press `g` to manage them.
 - **Accounts and skins**: Microsoft and offline accounts. A 3D preview of each skin and cape; upload a
-  skin, switch between classic and slim arms, or pick a cape you own.
+  skin (or drop a `.png` on the accounts tab), switch between classic and slim arms, reset it, or pick a cape you own.
 - **Keyboard first**: `h`/`l` move between panes and `j`/`k` within them, `enter` does the obvious
   thing (play, join, install, open) and `p` plays from anywhere. The bottom bar shows the keys for the
   focused pane, `?` lists them all, and every key can be rebound in **settings → keys** or in `config.toml`:
@@ -122,8 +137,8 @@ Every instance stays a normal `.minecraft` folder that Minecraft, and you, can u
   example two Fabric instances with different client mods. Pick one under **world set**. When one member
   changes version, Omacraft asks whether to change the whole set or leave it with a copy of the worlds.
   Each world records which instance last played it and with which mods (`omacraft.toml` in the world).
-  If a world was last played with a mod this instance lacks, or a newer version of one, Omacraft warns
-  in the log and backs the world up before the game starts. It never blocks the launch.
+  Before any instance starts, a world last played with a mod it lacks, a newer version of one or a newer
+  Minecraft gets a warning in the log and a backup first. It never blocks the launch.
 - **Game settings are copied, not shared.** The new-instance dialog can copy `options.txt` (keybinds, FOV,
   sound) from another instance once. A live shared file would lose keys, since older versions drop
   settings they don't know.
@@ -165,12 +180,14 @@ Prism alone, so don't borrow it.
 ~/.local/share/omacraft/
   instances/<id>/instance.toml
   instances/<id>/minecraft/        game dir (mods/, saves/, …)
+  instances/<id>/mod_sets.toml     mod sets
   groups.toml                      group order and colours
   icons/                           your own instance icons
   shared/sets/<set>/               share sets' packs and schematics
   shared/worlds/<set>/saves/       world sets' worlds
   backups/                         world and mod backups
   cache/content/                   downloaded mods and packs, by SHA-1
+  config-view.toml                 which config groups you left open
   libraries/  assets/  versions/  runtimes/  meta/
   accounts.json                    0600
 ```

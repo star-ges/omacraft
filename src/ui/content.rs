@@ -46,7 +46,7 @@ struct Job {
 pub struct ContentState {
     kinds: HashMap<ContentKind, KindState>,
     meta: MetaStore,
-    remote: RemoteIcons,
+    pub remote: RemoteIcons,
     pub focus_search: bool,
     /// An update or rollback key for the mods tab, taken while it draws.
     pub key: Option<Action>,
@@ -179,12 +179,12 @@ impl MetaStore {
 
 /// Icons for search results, downloaded once into the cache.
 #[derive(Default, Clone)]
-struct RemoteIcons {
+pub struct RemoteIcons {
     map: Arc<Mutex<HashMap<String, Option<PathBuf>>>>,
 }
 
 impl RemoteIcons {
-    fn get(&self, url: &str, rt: &tokio::runtime::Handle, ctx: &egui::Context) -> Option<PathBuf> {
+    pub fn get(&self, url: &str, rt: &tokio::runtime::Handle, ctx: &egui::Context) -> Option<PathBuf> {
         let mut map = self.map.lock().unwrap();
         if let Some(p) = map.get(url) {
             return p.clone();
@@ -229,7 +229,7 @@ fn is_slug_file(name: &str, slug: &str) -> bool {
     false
 }
 
-fn file_image(p: &std::path::Path) -> egui::ImageSource<'static> {
+pub fn file_image(p: &std::path::Path) -> egui::ImageSource<'static> {
     egui::ImageSource::Uri(format!("file://{}", p.display()).into())
 }
 
@@ -993,7 +993,7 @@ fn config_hover(kind: ContentKind) -> &'static str {
 }
 
 /// How long typing has to pause before the Modrinth search goes out.
-const SEARCH_DELAY: Duration = Duration::from_millis(250);
+pub const SEARCH_DELAY: Duration = Duration::from_millis(250);
 
 #[allow(clippy::too_many_arguments)]
 fn browse(
@@ -1199,7 +1199,7 @@ mod tests {
             game: modrinth::game_key(&inst),
             title: name.into(),
             from: "1".into(),
-            to: modrinth::Version { id: "x".into(), project_id: "p".into(), version_number: "2".into(), files: vec![], loaders: vec![], dependencies: vec![], date_published: None },
+            to: modrinth::Version { id: "x".into(), project_id: "p".into(), version_number: "2".into(), files: vec![], loaders: vec![], game_versions: vec![], version_type: String::new(), dependencies: vec![], date_published: None },
         };
         let list = [up("a.jar"), up("b.jar")];
         // a was disabled since the check, b removed.

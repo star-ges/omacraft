@@ -41,7 +41,7 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim 
 | `auth.rs` | MSA device code → XBL → XSTS → Minecraft; offline accounts |
 | `skins.rs` | Profile skins/capes (upload, classic/slim, cape, reset; refresh + retry on 401), textures cached by hash in `cache/textures/`, Steve/Alex default by UUID. Skins always go up as multipart PNGs: the API's firewall 403s the JSON `{"url": …}` form, so classic/slim re-uploads the cached texture |
 | `instance.rs`, `groups.rs` | `instance.toml` per instance; `groups.toml` (order, colour by palette name) |
-| `modrinth.rs`, `content_meta.rs` | Search/install by `ContentKind`, mod updates (`check_updates`/`update` via `version_files/update`); name/icon from jar or pack, else Modrinth hash lookup |
+| `modrinth.rs`, `content_meta.rs` | Search/install by `ContentKind`, modpack search for the import dialog (`search_packs`, `pack_versions`), mod updates (`check_updates`/`update` via `version_files/update`); name/icon from jar or pack, else Modrinth hash lookup |
 | `import.rs` | Prism/MultiMC folder or zip, `.mrpack` file or URL, auto-detects other launchers |
 | `export.rs` | Instance zip (MultiMC format) or `.mrpack` (Modrinth-hosted files via `content_meta::hosted`, rest in `overrides/`) |
 | `saves.rs` | `level.dat` and `servers.dat` via fastnbt `Value` (round-trips unknown fields) |

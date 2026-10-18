@@ -1160,10 +1160,7 @@ impl App {
         }
         let source = path.display().to_string();
         match &mut self.modal {
-            Some(Modal::NewInstance(s)) => {
-                s.mode = new_instance::Mode::Import;
-                s.source = source;
-            }
+            Some(Modal::NewInstance(s)) => s.set_source(source),
             _ => self.modal = Some(Modal::NewInstance(Box::new(new_instance::NewInstance::import(&self.cfg, source)))),
         }
         self.tab = Tab::Instances;
