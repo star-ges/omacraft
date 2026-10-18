@@ -93,19 +93,76 @@ impl State {
     }
 }
 
+/// Who has an instance's mods right now: the one admission check every control that
+/// switches mods goes through (the mods tab, sets, the crash panel, the search's own actions).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModsBusy {
+    pub starting: bool,
+    pub running: bool,
+    /// A mod job: a switch, update, rollback or a search's step or ending.
+    pub jobs: bool,
+    /// Anything installing into the instance.
+    pub installing: bool,
+    /// Whether a search for the breaking mod has them; None until its file has been read.
+    pub search: Option<bool>,
+}
+
+impl ModsBusy {
+    /// Why a mod can't be switched on or off by hand (crash panel), if it can't.
+    pub fn by_hand(&self) -> Option<&'static str> {
+        if self.starting {
+            Some("the game is starting")
+        } else if self.jobs {
+            Some("mods are being switched or updated")
+        } else if self.search != Some(false) {
+            Some("the search for the breaking mod has them")
+        } else {
+            None
+        }
+    }
+
+    /// Why the mods can't be switched to a set, or a search started, if they can't.
+    pub fn switch(&self) -> Option<&'static str> {
+        if self.starting {
+            Some("the game is starting")
+        } else if self.running {
+            Some("the game is running")
+        } else if self.jobs || self.installing {
+            Some("mods are installing or updating")
+        } else {
+            self.by_hand()
+        }
+    }
+
+    /// Why a search's own step (answer, stop, finish, try again) can't run now, if it can't:
+    /// only one at a time, and never while a game has the mods.
+    pub fn search_action(&self) -> Option<&'static str> {
+        if self.starting {
+            Some("the game is starting")
+        } else if self.running {
+            Some("the game is running")
+        } else if self.jobs || self.installing {
+            Some("mods are being switched, installed or updated")
+        } else {
+            None
+        }
+    }
+}
+
+/// [`ModsBusy`] for `inst` now.
+pub fn busy(app: &mut App, inst: &Instance) -> ModsBusy {
+    ModsBusy {
+        starting: app.sessions.get(&inst.id).is_some_and(|s| s.starting()),
+        running: app.is_running(&inst.id),
+        jobs: app.content.updating(&inst.id),
+        installing: app.content.busy_with(&inst.id),
+        search: Some(app.mod_sets.searching(inst)),
+    }
+}
+
 /// Why `inst`'s mods can't be switched to a set right now, if they can't.
 fn switch_blocked(app: &mut App, inst: &Instance) -> Option<&'static str> {
-    if app.sessions.get(&inst.id).is_some_and(|s| s.starting()) {
-        Some("the game is starting")
-    } else if app.is_running(&inst.id) {
-        Some("the game is running")
-    } else if app.content.busy_with(&inst.id) {
-        Some("mods are installing or updating")
-    } else if app.mod_sets.searching(inst) {
-        Some("the search for the breaking mod has them")
-    } else {
-        None
-    }
+    busy(app, inst).switch()
 }
 
 /// Run `f` on `inst`'s mods in the background as a mod job (so the instance counts as
@@ -923,12 +980,8 @@ fn ask_dialog(app: &mut App, a: &mut AskDialog, ui: &mut Ui) -> bool {
 
 /// Send an answer for `inst`'s current step, then switch to the next.
 fn answer(app: &mut App, ctx: &egui::Context, inst: &Instance, a: Answer) {
-    if app.is_running(&inst.id) {
-        app.toast(ToastKind::Error, "Close the game first, then answer");
-        return;
-    }
-    if app.content.busy_with(&inst.id) {
-        app.toast(ToastKind::Error, "Wait for the mods to finish switching");
+    if let Some(why) = busy(app, inst).search_action() {
+        app.toast(ToastKind::Error, format!("Can't answer while {why}"));
         return;
     }
     let (i, rt) = (inst.clone(), app.rt.clone());
@@ -1012,8 +1065,9 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
     let Some(b) = app.mod_sets.bisect(inst) else { return };
     let t = app.t.clone();
     let ctx = ui.ctx().clone();
+    let blocked = busy(app, inst).search_action();
     let running = app.is_running(&inst.id);
-    let busy = app.content.busy_with(&inst.id);
+    let busy = blocked.is_some();
     ui.add_space(12.0);
     let color = match &b.done {
         Some(d) if d.culprits.is_empty() => t.yellow,
@@ -1075,7 +1129,7 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
                         if ui.add_enabled_ui(!running && !busy, |ui| w::button(ui, "answer…")).inner.clicked() {
                             act = Some(Act::Ask);
                         }
-                        if w::button(ui, "stop and put my mods back").clicked() {
+                        if ui.add_enabled_ui(!busy, |ui| w::button(ui, "stop and put my mods back")).inner.clicked() {
                             act = Some(Act::Restore);
                         }
                         ui.add_space(8.0);
@@ -1132,9 +1186,13 @@ pub fn banner(app: &mut App, ui: &mut Ui, inst: &Instance) {
     let rect = r.response.rect;
     ui.painter().rect_filled(egui::Rect::from_min_size(rect.min, vec2(3.0, rect.height())), CornerRadius::ZERO, color);
 
+    // Checked again as it runs: a job may have started since the buttons were drawn.
+    if let Some(why) = blocked.filter(|_| act.as_ref().is_some_and(|a| !matches!(a, Act::Ask | Act::Forget))) {
+        app.toast(ToastKind::Error, format!("Can't do that while {why}"));
+        return;
+    }
     match act {
         Some(Act::Ask) => open_bisect(app, &inst.id, Vec::new()),
-        Some(Act::Restore) if running => app.toast(ToastKind::Error, "Close the game first"),
         Some(Act::Restore) => job(app, &ctx, inst, "putting the mods back", |i| {
             bisect::restore(i)?;
             Ok("Put the mods back as they were".into())
@@ -1177,8 +1235,8 @@ enum Act {
 /// Forget instance `id`'s search (confirmed already), leaving its mods as they are.
 pub fn forget_search(app: &mut App, ctx: &egui::Context, id: &str) {
     let Some(inst) = app.instances.iter().find(|i| i.id == id).cloned() else { return };
-    if app.is_running(id) || app.content.busy_with(id) {
-        app.toast(ToastKind::Error, "Wait for the game and mod jobs to finish");
+    if let Some(why) = busy(app, &inst).search_action() {
+        app.toast(ToastKind::Error, format!("Can't forget the search while {why}"));
         return;
     }
     job(app, ctx, &inst, "forgetting the search", |i| {
@@ -1205,6 +1263,24 @@ mod tests {
     #[test]
     fn step_estimates() {
         assert_eq!([1, 2, 3, 4, 5, 8, 9, 14, 100].map(steps_for), [1, 2, 3, 3, 4, 4, 5, 5, 8]);
+    }
+
+    #[test]
+    fn search_controls_share_one_admission_check() {
+        let idle = ModsBusy { search: Some(false), ..Default::default() };
+        assert!(idle.by_hand().is_none() && idle.switch().is_none() && idle.search_action().is_none());
+        // The crash panel's toggles: never while a search has the mods, or before that's known.
+        let searching = ModsBusy { search: Some(true), ..idle };
+        assert!(searching.by_hand().is_some() && searching.switch().is_some());
+        assert!(searching.search_action().is_none(), "the search's own actions still run");
+        assert!(ModsBusy { search: None, ..idle }.by_hand().is_some());
+        // Stop, answer or try again while a step is being switched: refused.
+        let switching = ModsBusy { jobs: true, ..searching };
+        assert!(switching.search_action().is_some() && switching.by_hand().is_some());
+        for b in [ModsBusy { running: true, ..searching }, ModsBusy { starting: true, ..searching }, ModsBusy { installing: true, ..searching }] {
+            assert!(b.search_action().is_some(), "{b:?}");
+        }
+        assert!(ModsBusy { starting: true, ..idle }.by_hand().is_some());
     }
 
     #[test]

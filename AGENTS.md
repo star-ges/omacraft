@@ -258,12 +258,15 @@ test (and a rule here) with any fix that sets a new one.
   everything they need into the fixed baseline (`keep` is their closure), which is never a suspect, so the confirming
   step never turns a kept mod off; a check that did (an older record) doesn't confirm. A single suspect is
   only "found" after a step with everything but it on. While a search exists, the mods tab doesn't toggle, remove,
-  install, update, roll back or switch sets, and says so once (the banner). A crash analysis starts a search with its
+  install, update, roll back or switch sets, and says so once (the banner); nor does the crash panel, whose toggles go
+  through the same check (`ui::mod_sets::ModsBusy::by_hand`, which also refuses before the search's file has been read).
+  The search's own actions (answer, stop, finish, try again, forget) run only as mod jobs, refused while a game starts or
+  runs or any mod job or install runs (`ModsBusy::search_action`), checked when drawn and again when acted on. A crash analysis starts a search with its
   suspects first (`mod_sets::open_bisect`). Answers are only sent from the question dialog, where a click selects and "answer" sends, so a slip can be corrected. Tests: `bisect::tests` (incl.
   `a_search_is_saved_before_any_mod_is_switched`, `a_switch_cut_short_at_any_point_is_finished`,
   `an_original_renamed_by_hand_is_found_by_its_bytes`, `an_original_that_cant_be_found_keeps_the_search`,
   `twins_are_refused_at_the_start`, `a_stop_waits_for_an_answer_being_switched`,
-  `kept_mods_keep_what_they_need_through_the_confirming_step`, `a_nested_mods_needs_count_for_its_jar`).
+  `kept_mods_keep_what_they_need_through_the_confirming_step`, `a_nested_mods_needs_count_for_its_jar`), `ui::mod_sets::tests::search_controls_share_one_admission_check`.
 - **Crash analysis:** `crash::analyze_with` only says "certain" for what a loader or Minecraft states outright; stack
   frames and Suspected Mods are "likely" at best, frames below the top 8 "possible", and with nothing likely the
   headline says no single mod stands out. Frames from Minecraft, loaders, Java and common libraries (`LIBRARIES`,

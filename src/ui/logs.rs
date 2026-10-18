@@ -328,14 +328,8 @@ fn modified_label(m: Option<SystemTime>) -> String {
 pub fn history(app: &mut App, ui: &mut Ui, inst: &Instance) {
     let t = app.t.clone();
     let mem = app.cfg.default_memory_mb;
-    // Mods can't be switched while they're being updated, or as the game starts.
-    let mods_busy = if app.content.updating(&inst.id) {
-        Some("mods are being updated")
-    } else if app.sessions.get(&inst.id).is_some_and(|s| s.starting()) {
-        Some("the game is starting")
-    } else {
-        None
-    };
+    // Mods can't be switched while a job has them, as the game starts, or while a search for the breaking mod does.
+    let mods_busy = super::mod_sets::busy(app, inst).by_hand();
     let why = app.logs.key.take() == Some(Action::Why);
     let s = &mut app.logs;
     let fresh = s.files.as_ref().is_some_and(|(id, _, at)| *id == inst.id && at.elapsed() < Duration::from_secs(3));
@@ -540,6 +534,11 @@ fn act(app: &mut App, ctx: &egui::Context, inst: &Instance, a: &Analysis, out: P
         && let Some(s) = a.suspects.get(i)
         && let Some(file) = &s.file
     {
+        // Checked again here, on the same check the mods tab uses.
+        if let Some(why) = super::mod_sets::busy(app, inst).by_hand() {
+            app.toast(ToastKind::Error, format!("Can't switch {} while {why}", s.name));
+            return;
+        }
         let Some(m) = current_file(inst, file) else {
             app.toast(ToastKind::Error, format!("{} isn't in the mods folder any more", s.name));
             return;
