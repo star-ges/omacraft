@@ -1,6 +1,6 @@
 # Omacraft
 
-![Omacraft showing an instance's mods beside Modrinth search](docs/screenshot.png)
+![Omacraft showing an instance's mods beside Modrinth search](docs/screenshots/Title%20Screenshot.png)
 
 A Minecraft launcher in Rust, modeled on [Prism Launcher](https://github.com/PrismLauncher/PrismLauncher)
 and drawn in [Omarchy](https://omarchy.org)'s design language.
@@ -45,14 +45,26 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
 - **Instances**: each one is a self-contained `.minecraft` with its own version, loader, memory,
   JVM args, Java, window size, icon, group and notes. Libraries, assets and runtimes are shared
   between instances.
+
+  ![Instances](docs/screenshots/instances.png)
+
 - **Loaders**: vanilla (every release and snapshot), Fabric, Quilt, Forge and NeoForge. Forge 1.13+
   and NeoForge patch the game on the first launch of each build, so that launch takes a minute longer.
+
+  ![Loaders](docs/screenshots/loaders.png)
+
 - **Modrinth**: search and install mods, resource packs and shader packs, with dependencies resolved.
   Installed items show their name, icon and version. `u` in the mods tab updates them (see
   [mod updates](#how-omacraft-handles-game-files)).
+
+  ![Modrinth](docs/screenshots/modrinth.png)
+
 - **Import**: browse Modrinth modpacks right in the import dialog and pick any version, or import Prism,
   PolyMC and MultiMC instances (found automatically, or from a `.zip` or folder), a `.mrpack` or a
   modrinth.com modpack link. On btrfs, even huge instances import instantly.
+
+  ![Import](docs/screenshots/import.png)
+
 - **Drag and drop**: drop mods, resource packs or shader packs on their tab to add them, a world folder
   or world `.zip` on the worlds tab, and a pack or instance anywhere else to import it. Nothing already
   there is ever replaced.
@@ -82,10 +94,16 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
   headers fold, and stay as you left them.
   Saving changes only the values you touched, never overwrites a file the game rewrote meanwhile without asking,
   and nothing unsaved is lost on the way out.
+
+  ![Config editor](docs/screenshots/config%20editor.png)
+
 - **Mod sets**: save the mods as they are as a named set ("performance", "full pack") and switch between sets in
   one step from the mods tab (`s`). Edit a set as a checklist without touching the mods folder; ticking a mod
   ticks what it needs. Nothing is removed or duplicated, updates keep a mod in its sets, and newly added mods
   join the set in use.
+
+  ![Mod sets](docs/screenshots/mod%20sets.png)
+
 - **Why it crashed**: when a game crashes, the log tab says which mod is most likely at fault and why, quoting the
   lines in the crash report or log that say so. Unmet dependencies, failed mixins, mods for the wrong loader or
   Java, and out-of-memory or graphics-driver crashes are explained in plain words. Disable the suspect right there,
@@ -93,10 +111,16 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
 - **Find the breaking mod**: `b` in the mods tab (or the crash analysis) turns about half the mods off at a time.
   You play and say whether the problem occurred, and a few games later Omacraft names the mod, then puts
   everything back exactly as it was.
+
+  ![Find the breaking mod](docs/screenshots/find%20the%20breaking%20mod.png)
+
 - **Groups**: collapsible groups in the instance list, each with an optional colour from the theme.
   Drag instances between them, or press `g` to manage them.
 - **Accounts and skins**: Microsoft and offline accounts. A 3D preview of each skin and cape; upload a
   skin (or drop a `.png` on the accounts tab), switch between classic and slim arms, reset it, or pick a cape you own.
+
+  ![Accounts and skins](docs/screenshots/accounts%20and%20skins.png)
+
 - **Keyboard first**: `h`/`l` move between panes and `j`/`k` within them, `enter` does the obvious
   thing (play, join, install, open) and `p` plays from anywhere. The bottom bar shows the keys for the
   focused pane, `?` lists them all, and every key can be rebound in **settings → keys** or in `config.toml`:
