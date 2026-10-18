@@ -37,7 +37,7 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim 
 
 | Module | What it does |
 |---|---|
-| `main.rs`, `cli.rs` | tokio runtime; the CLI if there are args, otherwise eframe (`with_decorations(false)`) |
+| `main.rs`, `cli.rs` | tokio runtime; the CLI if there are args, otherwise eframe (decorated: Hyprland draws no title bar, other desktops do) |
 | `paths.rs`, `config.rs` | `~/.local/share/omacraft`, `~/.config/omacraft/config.toml` (incl. `[keys]`, `collapsed_groups`, `msa_client_id`) |
 | `theme.rs` | Reads Omarchy `colors.toml` + `shell.toml`; fonts via fontconfig; live watcher; Tokyo Night fallback |
 | `mojang.rs`, `loaders.rs`, `java.rs`, `launch.rs` | Version JSON + rules, loader profiles (Fabric/Quilt meta; Forge/NeoForge from Prism's meta: launchwrapper `+tweakers` for 1.6–1.12, ForgeWrapper + `mavenFiles` for 1.13+), Mojang Java runtimes, prepare + spawn (incl. QuickPlay) |

@@ -236,8 +236,9 @@ Exports always contain real files, never links, so a shared instance exports lik
 | Modal and toast border | `[hyprland] active-border` (your window border colour) |
 | Font and size | fontconfig `monospace` (what `omarchy font set` writes) and `[font] base-size`; icons from a Nerd Font, with one bundled as a fallback |
 
-Outside Omarchy it uses Omarchy's stock Tokyo Night theme. The window has no client-side decorations,
-since Hyprland draws the frame, and its Wayland app-id is `omacraft`, for window rules.
+Outside Omarchy it uses Omarchy's stock Tokyo Night theme. On Omarchy the window has no title bar, like
+every other Omarchy window; other desktops give it their usual one. Its Wayland app-id is `omacraft`, for
+window rules.
 
 ## Microsoft sign-in
 

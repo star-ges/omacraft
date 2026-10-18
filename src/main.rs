@@ -48,9 +48,9 @@ fn main() -> eframe::Result {
             .with_app_id(paths::APP_ID)
             .with_title("Omacraft")
             .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([760.0, 480.0])
-            // Omarchy windows have no title bars; Hyprland draws the border.
-            .with_decorations(false),
+            // Decorated, so other desktops give it a title bar: Hyprland asks for server-side
+            // decorations and draws none, so Omarchy windows still have no title bar.
+            .with_min_inner_size([760.0, 480.0]),
         ..Default::default()
     };
     let handle = rt.handle().clone();
