@@ -204,6 +204,11 @@ impl Instance {
                 let what = if kind == ContentKind::Mods { ".jar files" } else { ".zip files or folders" };
                 anyhow::bail!("{name} isn't a {} ({}s are {what})", kind.noun(), kind.noun());
             }
+            // A folder holding this one (its own `resourcepacks`, `minecraft`, or a link to
+            // either) would be copied into itself.
+            if is_dir && real_path(&dir).starts_with(p.canonicalize()?) {
+                anyhow::bail!("{name} holds the {} folder it would be added to", kind.dir());
+            }
             match taken(&dir, &name) {
                 Some(e) if !is_dir && same_bytes(p, &e) => {}
                 Some(_) => anyhow::bail!("a different {name} is already in {}", kind.dir()),
@@ -221,6 +226,15 @@ impl Instance {
     }
 }
 
+/// `p` with every link resolved, also where its end doesn't exist yet.
+fn real_path(p: &Path) -> PathBuf {
+    match (p.canonicalize(), p.parent(), p.file_name()) {
+        (Ok(c), ..) => c,
+        (Err(_), Some(parent), Some(name)) => real_path(parent).join(name),
+        _ => p.to_path_buf(),
+    }
+}
+
 /// The entry already holding `name` in `dir`, enabled or disabled.
 fn taken(dir: &Path, name: &str) -> Option<PathBuf> {
     [dir.join(name), dir.join(format!("{name}.disabled"))].into_iter().find(|e| std::fs::symlink_metadata(e).is_ok())
@@ -230,9 +244,10 @@ fn taken(dir: &Path, name: &str) -> Option<PathBuf> {
 /// another drop took meanwhile is skipped if it holds the same file, else an error.
 fn publish_all(kind: ContentKind, dir: &Path, stage: &Path, todo: Vec<(PathBuf, String, bool)>) -> anyhow::Result<Vec<String>> {
     let mut added = Vec::new();
+    let keep_out = stage.canonicalize()?;
     for (src, name, is_dir) in todo {
         let staged = stage.join(&name);
-        let copied = if is_dir { fsutil::copy_tree(&src, &staged, &|_| {}).map(|_| ()) } else { reflink_copy::reflink_or_copy(&src, &staged).map(|_| ()) };
+        let copied = if is_dir { fsutil::copy_tree_outside(&src, &staged, Some(&keep_out), &|_| {}).map(|_| ()) } else { reflink_copy::reflink_or_copy(&src, &staged).map(|_| ()) };
         #[cfg(test)]
         tests::BEFORE_PUBLISH.with(|h| h.borrow().as_ref().map(|h| h()));
         let clash = || anyhow::anyhow!("a different {name} was put in {} meanwhile", kind.dir());
@@ -417,6 +432,42 @@ mod tests {
         let ra = ta.join().unwrap();
         go_b.send(()).unwrap();
         (ra, tb.join().unwrap())
+    }
+
+    #[test]
+    fn a_folder_holding_the_destination_is_not_copied_into_itself() {
+        let mut inst = Instance::new("Drop Ancestor", "1.21.1", Loader::Vanilla);
+        inst.assign_id().unwrap();
+        let packs = inst.game_dir().join("resourcepacks");
+        std::fs::create_dir_all(packs.join("Old/assets")).unwrap();
+        std::fs::write(packs.join("Old/assets/f"), "o").unwrap();
+        let src = paths::test_root().join("drop-ancestor-src");
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(src.join("Inner/assets")).unwrap();
+        std::fs::write(src.join("Inner/assets/f"), "i").unwrap();
+        std::os::unix::fs::symlink(inst.game_dir(), src.join("game")).unwrap();
+        std::os::unix::fs::symlink(&packs, src.join("Inner/packs")).unwrap();
+        let only_old = || {
+            let names: Vec<_> = std::fs::read_dir(&packs).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            assert_eq!(names, ["Old"], "something was added or left behind");
+        };
+        // The folder itself, its parent, and its parent through a link are refused up front.
+        for p in [packs.clone(), inst.game_dir(), src.join("game")] {
+            let err = inst.add_content(ContentKind::ResourcePacks, &[p.clone()]).unwrap_err();
+            assert!(format!("{err:#}").contains("holds the resourcepacks folder"), "{}: {err:#}", p.display());
+            only_old();
+        }
+        // A link inside the pack that leads to the folder stops the copy.
+        let err = inst.add_content(ContentKind::ResourcePacks, &[src.join("Inner")]).unwrap_err();
+        assert!(format!("{err:#}").contains("would be copied into"), "{err:#}");
+        only_old();
+        // A link to something else in the folder is copied through as before.
+        std::fs::remove_file(src.join("Inner/packs")).unwrap();
+        std::os::unix::fs::symlink(packs.join("Old"), src.join("Inner/old")).unwrap();
+        assert_eq!(inst.add_content(ContentKind::ResourcePacks, &[src.join("Inner")]).unwrap(), ["Inner"]);
+        assert_eq!(std::fs::read(packs.join("Inner/old/assets/f")).unwrap(), b"o");
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+        std::fs::remove_dir_all(&src).unwrap();
     }
 
     #[test]

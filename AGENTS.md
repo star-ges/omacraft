@@ -270,12 +270,15 @@ test (and a rule here) with any fix that sets a new one.
   and refused if not, never replaced. Each drop copies into a stage folder of its own (`.adding-<pid>-<uuid>`, cleared
   only by its own call, or once its process is gone), checks the name and its `.disabled` twin again when moving in
   and moves in with `fsutil::rename_noreplace`, so concurrent drops of one name, also into a shared folder through two
-  instances, never publish each other's bytes: the first in wins, an identical one is skipped. On the worlds tab a world folder (with `level.dat`) or a `.zip` of one world
+  instances, never publish each other's bytes: the first in wins, an identical one is skipped. A folder that holds the
+  destination (canonical paths, so also through a link) is refused up front, and the copy
+  (`fsutil::copy_tree_outside`) stops at any folder, reached through links or not, that holds the stage or lies in it,
+  so a pack never copies itself into itself. On the worlds tab a world folder (with `level.dat`) or a `.zip` of one world
   is added to `saves` (`saves::add_world`): copied or extracted beside `saves`, never inside it, then moved in under
   the next free name (`<name> (2)`), without its `session.lock`. A zip with several worlds, or a folder open in a
   game, is refused. It runs as a world job (`jobs_on` its saves, not while shared folders move), so launches wait
   for it. Tests: `instance::tests::{dropped_content_is_checked_before_anything_is_copied,
-  drops_of_the_same_name_never_share_a_stage}`,
+  drops_of_the_same_name_never_share_a_stage, a_folder_holding_the_destination_is_not_copied_into_itself}`,
   `saves::tests::dropped_worlds_are_added_beside_the_others`.
 - **Saving:** write config/state files with `fsutil::write_atomic` (unique temp + rename; accounts at 0600).
 
