@@ -122,7 +122,7 @@ To remove it, delete those three files; your data is in `~/.local/share/omacraft
 - **Copy settings**: a new instance can start with another one's keybinds, FOV and sound (`options.txt`),
   copied once rather than shared, since older versions drop settings they don't know.
 
-[How Omacraft handles game files](#how-omacraft-handles-game-files) has the details.
+For more details, see [How Omacraft handles game files](#how-omacraft-handles-game-files).
 
 ### Made for Omarchy and the keyboard
 
