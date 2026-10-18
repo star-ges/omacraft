@@ -280,7 +280,10 @@ pub fn start(inst: &Instance, opts: &Start) -> anyhow::Result<Bisect> {
         .collect();
 
     let on: BTreeSet<String> = enabled.iter().map(|f| base(&f.name)).collect();
-    let keep: BTreeSet<String> = opts.keep.iter().map(|k| base(k)).filter(|k| on.contains(k)).collect();
+    // Kept mods stay on with everything they need: what they need is never a suspect,
+    // since taking it away would take the kept mod with it.
+    let keep: Vec<String> = opts.keep.iter().map(|k| base(k)).filter(|k| on.contains(k)).collect();
+    let keep: BTreeSet<String> = closure(&needs, &keep);
     let good: BTreeSet<String> = opts.good.iter().map(|k| base(k)).collect();
     let mut suspects: Vec<String> = Vec::new();
     for f in opts.first.iter().map(|f| base(f)).chain(on.iter().cloned()) {
@@ -289,7 +292,7 @@ pub fn start(inst: &Instance, opts: &Start) -> anyhow::Result<Bisect> {
         }
     }
     if suspects.is_empty() {
-        bail!("there's nothing to test: every enabled mod is kept on or marked fine");
+        bail!("there's nothing to test: every enabled mod is kept on, needed by one that is, or marked fine");
     }
     let mut b = Bisect {
         started: Utc::now(),
@@ -314,17 +317,22 @@ pub fn start(inst: &Instance, opts: &Start) -> anyhow::Result<Bisect> {
     Ok(b)
 }
 
+/// `seed` and everything it requires, by `needs`.
+fn closure<'a>(needs: &BTreeMap<String, BTreeSet<String>>, seed: impl IntoIterator<Item = &'a String>) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    let mut queue: VecDeque<String> = seed.into_iter().cloned().collect();
+    while let Some(f) = queue.pop_front() {
+        if out.insert(f.clone()) {
+            queue.extend(needs.get(&f).into_iter().flatten().filter(|d| !out.contains(*d)).cloned());
+        }
+    }
+    out
+}
+
 impl Bisect {
     /// `seed` and everything it requires, among the mods on at the start.
     pub fn closure<'a>(&self, seed: impl IntoIterator<Item = &'a String>) -> BTreeSet<String> {
-        let mut out: BTreeSet<String> = BTreeSet::new();
-        let mut queue: VecDeque<String> = seed.into_iter().cloned().collect();
-        while let Some(f) = queue.pop_front() {
-            if out.insert(f.clone()) {
-                queue.extend(self.needs.get(&f).into_iter().flatten().filter(|d| !out.contains(*d)).cloned());
-            }
-        }
-        out
+        closure(&self.needs, seed)
     }
 
     /// The mods on at the start that need any of `these`, directly or not.
@@ -417,6 +425,11 @@ impl Bisect {
                 if self.skips > self.suspects.len() {
                     self.done = Some(Done { culprits: Vec::new(), confirmed: false, note: "Too many steps couldn't be told apart to narrow the problem down.".into() });
                 }
+            }
+            (StepKind::Confirm, Answer::Works) if !self.closure(&self.keep).is_subset(&step.on) => {
+                // The check took a kept mod away too (a search saved before kept mods brought
+                // their needs along): it can't tell the suspect from the kept mod.
+                self.done = Some(Done { culprits: culprits(self), confirmed: false, note: "This is the likely mod, but the last check also turned off a mod you kept on, so it couldn't confirm it.".into() });
             }
             (StepKind::Confirm, Answer::Works) => {
                 self.done = Some(Done { culprits: culprits(self), confirmed: true, note: "With this mod off, the problem went away.".into() });
@@ -1014,6 +1027,40 @@ mod tests {
         stop.join().unwrap().unwrap();
         assert!(answer(&i, Answer::Works).is_err(), "an answer after the stop finds nothing to answer");
         assert_eq!(mods_of(&i), before);
+        std::fs::remove_dir_all(i.dir()).unwrap();
+    }
+
+    #[test]
+    fn kept_mods_keep_what_they_need_through_the_confirming_step() {
+        let i = inst("bisect kept needs");
+        jar(&i, "a-1.jar", Some("a"), &["b"]);
+        jar(&i, "b-1.jar", Some("b"), &[]);
+        jar(&i, "c-1.jar", Some("c"), &[]);
+        jar(&i, "d-1.jar", Some("d"), &[]);
+        let keep = Start { keep: vec!["a-1.jar".into()], ..Default::default() };
+        let b = start(&i, &keep).unwrap();
+        assert!(!b.suspects.contains(&"b-1.jar".to_string()), "a kept mod's need isn't a suspect: {:?}", b.suspects);
+        assert!(b.keep.contains("b-1.jar"));
+        restore(&i).unwrap();
+        // The kept mod is the broken one: every step has it and what it needs, and nothing is "confirmed".
+        let b = run(&i, &keep, |on| {
+            assert!(on.contains("a-1.jar") && on.contains("b-1.jar"), "the kept mod and its need are on in every step");
+            on.contains("a-1.jar")
+        });
+        let done = b.done.unwrap();
+        assert!(!done.culprits.iter().any(|c| c.file == "b-1.jar") && !done.confirmed, "{done:?}");
+        restore(&i).unwrap();
+        // With only the kept mod's need left to test, there's nothing to test.
+        let only = Start { keep: vec!["a-1.jar".into()], good: vec!["c-1.jar".into(), "d-1.jar".into()], ..Default::default() };
+        assert!(start(&i, &only).is_err());
+
+        // An older record, with the need still a suspect: the check can't confirm it.
+        let mut b = Bisect { suspects: vec!["b-1.jar".into()], keep: BTreeSet::from(["a-1.jar".into()]), ..start(&i, &Start::default()).unwrap() };
+        restore(&i).unwrap();
+        b.step = Some(b.plan());
+        assert!(!b.step.as_ref().unwrap().on.contains("a-1.jar"), "the old plan took the kept mod away");
+        b.answer(Answer::Works).unwrap();
+        assert!(!b.done.unwrap().confirmed);
         std::fs::remove_dir_all(i.dir()).unwrap();
     }
 }

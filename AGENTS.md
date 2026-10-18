@@ -252,13 +252,16 @@ test (and a rule here) with any fix that sets a new one.
   with it), one that can't be found keeps the record (`unresolved`, shown in the banner with "forget the search"). Twins
   (`x.jar` and `x.jar.disabled`) are refused at the start. Every operation holds `.bisect.lock`, so a stop and an
   answer never interleave. Each step's mods are closed over required dependencies (`Bisect::closure`),
-  so no mod runs without what it needs; "turn it off" also disables whatever needs the culprit. A single suspect is
+  so no mod runs without what it needs; "turn it off" also disables whatever needs the culprit. Kept mods bring
+  everything they need into the fixed baseline (`keep` is their closure), which is never a suspect, so the confirming
+  step never turns a kept mod off; a check that did (an older record) doesn't confirm. A single suspect is
   only "found" after a step with everything but it on. While a search exists, the mods tab doesn't toggle, remove,
   install, update, roll back or switch sets, and says so once (the banner). A crash analysis starts a search with its
   suspects first (`mod_sets::open_bisect`). Answers are only sent from the question dialog, where a click selects and "answer" sends, so a slip can be corrected. Tests: `bisect::tests` (incl.
   `a_search_is_saved_before_any_mod_is_switched`, `a_switch_cut_short_at_any_point_is_finished`,
   `an_original_renamed_by_hand_is_found_by_its_bytes`, `an_original_that_cant_be_found_keeps_the_search`,
-  `twins_are_refused_at_the_start`, `a_stop_waits_for_an_answer_being_switched`).
+  `twins_are_refused_at_the_start`, `a_stop_waits_for_an_answer_being_switched`,
+  `kept_mods_keep_what_they_need_through_the_confirming_step`).
 - **Crash analysis:** `crash::analyze_with` only says "certain" for what a loader or Minecraft states outright; stack
   frames and Suspected Mods are "likely" at best, frames below the top 8 "possible", and with nothing likely the
   headline says no single mod stands out. Frames from Minecraft, loaders, Java and common libraries (`LIBRARIES`,
