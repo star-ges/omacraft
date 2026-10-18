@@ -324,6 +324,10 @@ test (and a rule here) with any fix that sets a new one.
   drops_of_the_same_name_never_share_a_stage, a_folder_holding_the_destination_is_not_copied_into_itself}`,
   `saves::tests::dropped_worlds_are_added_beside_the_others`, and in the vendored crate
   `drop::tests::{transfers_are_capped_in_bytes_paths_and_reads_per_wake, abandoned_and_endless_drops_leave_other_transfers_working}`.
+- **Mod metadata JSON:** `fabric.mod.json`, `quilt.mod.json`, `mcmod.info` and jarjar's `metadata.json` are read
+  through `content_meta::zip_json`, as leniently as the loaders' Gson (raw control characters in strings, comments,
+  a BOM): real mods ship raw line breaks in descriptions, and strict parsing dropped them from play records, names
+  and the search's dependency links. Test: `world_sets::tests::metadata_the_loaders_accept_is_read`.
 - **Saving:** write config/state files with `fsutil::write_atomic` (unique temp + rename; accounts at 0600).
 
 ## Testing the GUI safely

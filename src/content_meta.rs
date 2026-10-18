@@ -56,6 +56,55 @@ pub(crate) fn zip_bytes<R: std::io::Read + std::io::Seek>(zip: &mut zip::ZipArch
     fsutil::read_capped(zip.by_name(name.trim_start_matches('/')).ok()?).ok()
 }
 
+/// A mod's JSON metadata (`fabric.mod.json`, `mcmod.info`…), parsed as leniently as the
+/// loaders' Gson does: raw line breaks and other control characters inside strings, `//`
+/// and `/* */` comments and a BOM are all accepted. Strict JSON loses whole mods.
+pub(crate) fn zip_json<R: std::io::Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Option<Value> {
+    lenient_json(&zip_bytes(zip, name)?)
+}
+
+fn lenient_json(bytes: &[u8]) -> Option<Value> {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    if let Ok(v) = serde_json::from_slice(bytes) {
+        return Some(v);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let (mut i, mut in_string) = (0, false);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            match b {
+                b'\\' if i + 1 < bytes.len() => {
+                    out.extend_from_slice(&bytes[i..i + 2]);
+                    i += 1;
+                }
+                b'"' => {
+                    in_string = false;
+                    out.push(b);
+                }
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                0..0x20 => out.extend_from_slice(format!("\\u{b:04x}").as_bytes()),
+                _ => out.push(b),
+            }
+        } else if bytes[i..].starts_with(b"//") {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        } else if bytes[i..].starts_with(b"/*") {
+            i = bytes[i + 2..].windows(2).position(|w| w == b"*/").map_or(bytes.len(), |p| i + 2 + p + 2);
+            continue;
+        } else {
+            in_string = b == b'"';
+            out.push(b);
+        }
+        i += 1;
+    }
+    serde_json::from_slice(&out).ok()
+}
+
 /// Fabric's `icon` is a path or a map of size → path; take the largest ≤ 128.
 fn fabric_icon(v: &Value) -> Option<String> {
     match v {
@@ -71,9 +120,7 @@ fn fabric_icon(v: &Value) -> Option<String> {
 
 /// Fill in name, version and mod id from the jar's metadata; returns its icon's path in the jar.
 fn parse_mod(zip: &mut zip::ZipArchive<std::fs::File>, meta: &mut FileMeta) -> Option<String> {
-    let json = |zip: &mut zip::ZipArchive<std::fs::File>, name| {
-        zip_bytes(zip, name).and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-    };
+    let json = zip_json::<std::fs::File>;
     if let Some(f) = json(zip, "fabric.mod.json") {
         meta.name = f["name"].as_str().map(String::from);
         meta.version = f["version"].as_str().map(String::from);

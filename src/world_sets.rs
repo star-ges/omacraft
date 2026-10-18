@@ -112,7 +112,7 @@ fn add_mod(out: &mut BTreeMap<String, String>, id: String, version: String) {
 
 fn inventory<R: std::io::Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, depth: usize, budget: &mut usize, out: &mut BTreeMap<String, String>) {
     use serde_json::Value;
-    let json = |zip: &mut zip::ZipArchive<R>, name| content_meta::zip_bytes(zip, name).and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let json = content_meta::zip_json::<R>;
     let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
     // A nested jar is a string (Quilt) or an object's "file" (Fabric) or "path" (jarjar).
     let paths = |v: &Value| -> Vec<String> {
@@ -577,6 +577,16 @@ mod tests {
         let inner = jar(&[("quilt.mod.json", br#"{"quilt_loader": {"id": "qsl_base", "version": "7.0"}}"#)]);
         let q = br#"{"quilt_loader": {"id": "qsl", "version": "7.0", "jars": ["META-INF/jars/base.jar"]}}"#;
         assert_eq!(inventory_of(jar(&[("quilt.mod.json", q), ("META-INF/jars/base.jar", &inner)])), pairs(&[("qsl", "7.0"), ("qsl_base", "7.0")]));
+    }
+
+    #[test]
+    fn metadata_the_loaders_accept_is_read() {
+        // BetterGrassify and Entity Model Features ship descriptions with raw line breaks,
+        // which strict JSON refuses; Fabric's Gson reads them, and the game runs them.
+        let raw = b"\xEF\xBB\xBF{\n  // made by hand\n  \"id\": \"bettergrass\", /* yes */\n  \"version\": \"1.8.8\",\n  \"description\": \"Gamers can touch grass!\n\tOptiFine's \\\"better\\\" grass\"\n}";
+        assert_eq!(inventory_of(jar(&[("fabric.mod.json", raw)])), pairs(&[("bettergrass", "1.8.8")]));
+        let info = b"[{\"modid\": \"old\", \"version\": \"1.0\", \"description\": \"two\r\nlines\"}]";
+        assert_eq!(inventory_of(jar(&[("mcmod.info", info)])), pairs(&[("old", "1.0")]));
     }
 
     #[test]

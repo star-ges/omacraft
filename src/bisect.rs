@@ -201,7 +201,7 @@ pub fn jar_links(jar: &Path) -> (BTreeSet<String>, BTreeSet<String>) {
 
 fn links<R: std::io::Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>, depth: usize, budget: &mut usize, provides: &mut BTreeSet<String>, requires: &mut BTreeSet<String>) {
     use serde_json::Value;
-    let json = |zip: &mut zip::ZipArchive<R>, name| content_meta::zip_bytes(zip, name).and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let json = content_meta::zip_json::<R>;
     let strings = |v: &Value| -> Vec<String> { v.as_array().into_iter().flatten().filter_map(|x| x.as_str().or(x["id"].as_str())).map(String::from).collect() };
     let id = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(String::from);
     // A nested jar is a string (Quilt) or an object's "file" (Fabric) or "path" (jarjar).
