@@ -86,6 +86,40 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
 
 Not supported: CurseForge packs and downloads, LiteLoader, and Forge before 1.6.
 
+## How Omacraft handles game files
+
+Every instance stays a normal `.minecraft` folder that Minecraft, and you, can use as usual. On top of that:
+
+- **Each download is stored once.** Mods and packs from Modrinth go into a content store and are copied into
+  each instance. On btrfs or xfs those copies are reflinks, so they take no extra space, yet every instance
+  can still change its own files freely. **settings → reclaim disk space** (or `omacraft reclaim`) merges
+  identical files that arrived some other way. It only merges files whose bytes match exactly, through
+  the kernel's dedupe call, which checks them first.
+- **Share sets** share resource packs, shader packs and schematics between instances. Pick one under
+  **share set** when editing an instance. Its folders become links into `shared/`; files with the same name
+  but different contents keep both copies, the newcomer renamed. Leaving a set gives the instance its own copy
+  of everything again, which is free on btrfs. Packs are often tied to a Minecraft version, which is why sets
+  are named groups rather than one global pool.
+- **World sets** share worlds between instances that play the same Minecraft version and loader, for
+  example two Fabric instances with different client mods. Pick one under **world set**. When one member
+  changes version, Omacraft asks whether to change the whole set or leave it with a copy of the worlds.
+  Each world records which instance last played it and with which mods (`omacraft.toml` in the world).
+  If a world was last played with a mod this instance lacks, or a newer version of one, Omacraft warns
+  in the log and backs the world up before the game starts. It never blocks the launch.
+- **Game settings are copied, not shared.** The new-instance dialog can copy `options.txt` (keybinds, FOV,
+  sound) from another instance once. A live shared file would lose keys, since older versions drop
+  settings they don't know.
+- **Backups.** When a game exits, each world it played is backed up (the last 5 per world by default, set
+  under **settings → backups**; 0 turns it off). The worlds tab has a backups pane to back up now,
+  restore or delete, and worlds you deleted stay listed by their backups. Restoring backs up what's there
+  first. Backups are reflink copies too, so on btrfs they cost only what changed.
+- **Mod updates and rollback.** In the mods tab, `u` checks Modrinth for updates and installs them all, and
+  `shift+u` updates one. Before anything changes, Omacraft backs up the instance's `mods` and `config`
+  and any world without a recent backup, and stops if that fails. `z` rolls the mods back to such a
+  backup and offers to restore each world that was played with the newer mods.
+
+Exports always contain real files, never links, so a shared instance exports like any other.
+
 ## Omarchy integration
 
 | What | Source |
@@ -115,6 +149,10 @@ Prism alone, so don't borrow it.
   instances/<id>/minecraft/        game dir (mods/, saves/, …)
   groups.toml                      group order and colours
   icons/                           your own instance icons
+  shared/sets/<set>/               share sets' packs and schematics
+  shared/worlds/<set>/saves/       world sets' worlds
+  backups/                         world and mod backups
+  cache/content/                   downloaded mods and packs, by SHA-1
   libraries/  assets/  versions/  runtimes/  meta/
   accounts.json                    0600
 ```
