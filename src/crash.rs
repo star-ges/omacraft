@@ -162,6 +162,18 @@ pub struct JarFacts {
     pub packages: Vec<String>,
     /// Mixin config files at its root ("sodium.mixins.json").
     pub mixin_configs: Vec<String>,
+    /// Every class it holds, nested jars' included, as [`class_key`]s (sorted): which jar really
+    /// holds a class a JVM error names, where packages only say which jar might.
+    pub classes: Vec<u64>,
+}
+
+/// A class's key in [`JarFacts::classes`], from its name in either form (`pkg/Class$Inner` or
+/// `pkg.Class$Inner`). A hash keeps a big modpack's hundreds of thousands of names small.
+pub fn class_key(class: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    class.trim_end_matches(".class").replace('.', "/").hash(&mut h);
+    h.finish()
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +201,8 @@ pub struct ModIndex {
     by_id: HashMap<String, usize>,
     by_package: HashMap<String, usize>,
     by_mixin: HashMap<String, usize>,
+    /// Class key → every jar holding that class, enabled ones first.
+    by_class: HashMap<u64, Vec<usize>>,
 }
 
 /// Jar facts by path, kept while the jar's size and mtime stay the same.
@@ -221,6 +235,9 @@ impl ModIndex {
             for c in &f.mixin_configs {
                 ix.by_mixin.entry(c.to_lowercase()).or_insert(i);
             }
+            for c in &f.classes {
+                ix.by_class.entry(*c).or_default().push(i);
+            }
         }
         ix.mods = mods;
         ix
@@ -247,6 +264,13 @@ impl ModIndex {
                 _ => return None,
             }
         }
+    }
+
+    /// The jars that really hold class `class` (either form): the enabled ones, which the game
+    /// loaded, if any holds it, else the disabled ones. More than one means it can't be told which.
+    pub fn owners_of_class(&self, class: &str) -> Vec<&ModEntry> {
+        let all: Vec<&ModEntry> = self.by_class.get(&class_key(class)).into_iter().flatten().map(|&i| &self.mods[i]).collect();
+        if all.iter().any(|m| m.enabled) { all.into_iter().filter(|m| m.enabled).collect() } else { all }
     }
 
     pub fn by_mixin_config(&self, config: &str) -> Option<&ModEntry> {
@@ -298,7 +322,8 @@ fn read_facts(path: &Path) -> JarFacts {
         }
     }
     let mut packages = std::collections::BTreeSet::new();
-    add_packages(&names, &mut packages);
+    let mut classes = std::collections::BTreeSet::new();
+    add_classes(&names, &mut packages, &mut classes);
     f.mixin_configs = names.iter().filter(|n| !n.contains('/') && n.ends_with(".json") && n.to_lowercase().contains("mixin")).cloned().collect();
     // Bundled jars (Fabric's `jars`, Forge's jarjar): their classes are this mod's.
     let nested: Vec<String> = names.iter().filter(|n| n.ends_with(".jar")).take(NESTED_JARS).cloned().collect();
@@ -306,20 +331,23 @@ fn read_facts(path: &Path) -> JarFacts {
         let Some(bytes) = content_meta::zip_bytes(&mut zip, &n) else { continue };
         if let Ok(inner) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) {
             let inner_names: Vec<String> = inner.file_names().filter_map(|n| n.ok().map(|n| n.into_owned())).collect();
-            add_packages(&inner_names, &mut packages);
+            add_classes(&inner_names, &mut packages, &mut classes);
         }
     }
     f.packages = packages.into_iter().collect();
+    f.classes = classes.into_iter().collect();
     f
 }
 
-fn add_packages(names: &[String], out: &mut std::collections::BTreeSet<String>) {
+fn add_classes(names: &[String], packages: &mut std::collections::BTreeSet<String>, classes: &mut std::collections::BTreeSet<u64>) {
     for n in names {
         if let Some(class) = n.strip_suffix(".class")
             && !n.starts_with("META-INF/")
-            && let Some((dir, _)) = class.rsplit_once('/')
         {
-            out.insert(dir.replace('/', "."));
+            classes.insert(class_key(class));
+            if let Some((dir, _)) = class.rsplit_once('/') {
+                packages.insert(dir.replace('/', "."));
+            }
         }
     }
 }
@@ -735,10 +763,28 @@ impl Reader<'_> {
             let class = l.split_whitespace().find(|w| w.contains('/') && !w.starts_with("java/")).map(|c| c.replace('/', "."));
             let needs_txt = needs.map(|n| format!("Java {n}")).unwrap_or("a newer Java".into());
             let has_txt = has.map(|n| format!("Java {n}")).unwrap_or("an older one".into());
-            match class.as_deref().and_then(|c| self.ix.by_class(c)) {
-                Some(m) => {
-                    let id = m.facts.id.clone().unwrap_or_else(|| file_stem(&m.file));
-                    self.hit(&id, None, None, Confidence::Certain, format!("needs {needs_txt}, but this Minecraft runs on {has_txt}: it's made for a newer Minecraft"), i)
+            // Certain only when exactly one jar holds the very class; a package match is a guess,
+            // and a class several jars hold names none of them for sure.
+            let owners = class.as_deref().map(|c| self.ix.owners_of_class(c)).unwrap_or_default();
+            let guess = class.as_deref().and_then(|c| self.ix.by_class(c));
+            let (found, confidence): (Vec<&ModEntry>, _) = match owners.len() {
+                1 => (owners, Confidence::Certain),
+                0 => (guess.into_iter().collect(), Confidence::Likely),
+                _ => (owners, Confidence::Possible),
+            };
+            let found: Vec<String> = found.iter().map(|m| m.facts.id.clone().unwrap_or_else(|| file_stem(&m.file))).collect();
+            if found.len() > 1 && !l.trim_start().starts_with("at ") {
+                self.cause(
+                    "wrong java version",
+                    format!("A class in this game needs {needs_txt}, but it runs on {has_txt}. Several mods hold that class ({}), so it can't be told which one is made for a newer Minecraft.", found.join(", ")),
+                    i,
+                );
+            }
+            match found.first() {
+                Some(_) => {
+                    for id in &found {
+                        self.hit(id, None, None, confidence, format!("needs {needs_txt}, but this Minecraft runs on {has_txt}: it's made for a newer Minecraft"), i)
+                    }
                 }
                 None if !l.trim_start().starts_with("at ") => self.cause(
                     "wrong java version",
@@ -951,8 +997,17 @@ mod tests {
                 kinds: kinds.to_vec(),
                 packages: packages.iter().map(|p| p.to_string()).collect(),
                 mixin_configs: mixins.iter().map(|p| p.to_string()).collect(),
+                classes: Vec::new(),
             }),
         }
+    }
+
+    /// `e`, holding exactly the classes named (`pkg/Class`).
+    fn holding(mut e: ModEntry, classes: &[&str]) -> ModEntry {
+        let mut f = (*e.facts).clone();
+        f.classes = classes.iter().map(|c| class_key(c)).collect();
+        e.facts = Arc::new(f);
+        e
     }
 
     /// Loader unknown, so the wrong-loader check stays out of the way.
@@ -1171,14 +1226,41 @@ java.lang.OutOfMemoryError: Java heap space
         let log = "\
 java.lang.UnsupportedClassVersionError: com/example/examplemod/ExampleMod has been compiled by a more recent version of the Java Runtime (class file version 65.0), this version of the Java Runtime only recognizes class file versions up to 61.0
 ";
-        let a = analyze_with(log, &fabric_pack(), FABRIC);
-        assert_eq!(top(&a), ("examplemod", Confidence::Certain));
+        let mut mods = fabric_pack().mods;
+        let a = analyze_with(log, &ModIndex::new(mods.clone()), FABRIC);
+        // Only the package matches: a guess, not a certainty.
+        assert_eq!(top(&a), ("examplemod", Confidence::Likely));
         assert_eq!(a.suspects[0].reason, "needs Java 21, but this Minecraft runs on Java 17: it's made for a newer Minecraft");
+        // The jar that really holds the class is named for sure.
+        mods[3] = holding(mods[3].clone(), &["com/example/examplemod/ExampleMod"]);
+        let a = analyze_with(log, &ModIndex::new(mods), FABRIC);
+        assert_eq!(top(&a), ("examplemod", Confidence::Certain));
         // A class no jar holds is still explained.
         let log = log.replace("com/example/examplemod", "org/unknown");
         let a = analyze_with(&log, &fabric_pack(), FABRIC);
         assert!(a.suspects.is_empty());
         assert_eq!(a.causes[0].title, "wrong java version");
+    }
+
+    /// Two jars share a package: the one first in the index isn't blamed for a class only the other
+    /// holds, and a class both hold names neither for sure.
+    #[test]
+    fn a_shared_package_never_makes_a_java_error_certain() {
+        let line = |class: &str| format!("java.lang.UnsupportedClassVersionError: {class} has been compiled by a more recent version of the Java Runtime (class file version 65.0), this version of the Java Runtime only recognizes class file versions up to 61.0\n");
+        let ix = ModIndex::new(vec![
+            holding(entry("a", "A", "1", &["com.shared.widgets"], &[], &[], true), &["com/shared/widgets/Common", "com/shared/widgets/OnlyInA"]),
+            holding(entry("b", "B", "1", &["com.shared.widgets"], &[], &[], true), &["com/shared/widgets/Common", "com/shared/widgets/OnlyInB"]),
+        ]);
+        let a = analyze_with(&line("com/shared/widgets/OnlyInB"), &ix, FABRIC);
+        assert_eq!(top(&a), ("b", Confidence::Certain));
+        assert_eq!(a.suspects.len(), 1);
+        // Held by both: neither is certain, and the mismatch is still explained.
+        let a = analyze_with(&line("com/shared/widgets/Common"), &ix, FABRIC);
+        assert!(a.suspects.iter().all(|s| s.confidence < Confidence::Likely), "{:?}", a.suspects);
+        assert_eq!(a.causes[0].title, "wrong java version");
+        // Held by neither (not indexed exactly): the package says at most "likely".
+        let a = analyze_with(&line("com/shared/widgets/Missing"), &ix, FABRIC);
+        assert!(a.suspects.iter().all(|s| s.confidence <= Confidence::Likely), "{:?}", a.suspects);
     }
 
     #[test]
@@ -1284,6 +1366,7 @@ Fabric Mods:
         assert_eq!(f.kinds, [JarKind::Fabric]);
         assert_eq!(f.packages, ["me.jellysquid.mods.lithium.common", "org.bundled.lib"]);
         assert_eq!(f.mixin_configs, ["lithium.mixins.json"]);
+        assert!(f.classes.contains(&class_key("org/bundled/lib/Thing")) && f.classes.contains(&class_key("me.jellysquid.mods.lithium.common.X")));
         assert!(f.ids.contains(&"bundled-lib".to_string()));
         assert!(Arc::ptr_eq(&f, &facts(&path)), "unchanged jars come from the cache");
 

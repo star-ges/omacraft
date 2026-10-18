@@ -258,11 +258,15 @@ test (and a rule here) with any fix that sets a new one.
   install, update, roll back or switch sets, and says so once (the banner). A crash analysis starts a search with its
   suspects first (`mod_sets::open_bisect`). Answers are only sent from the question dialog, where a click selects and "answer" sends, so a slip can be corrected. Tests: `bisect::tests`.
 - **Crash analysis:** `crash::analyze_with` only says "certain" for what a loader or Minecraft states outright; stack
-  frames and Suspected Mods are "likely" at best, frames below the top 8 "possible", and with nothing likely the
+  frames and Suspected Mods are "likely" at best. A class a JVM error names (a class for a newer Java) is "certain" only
+  when exactly one jar holds that very class (`JarFacts::classes`, `ModIndex::owners_of_class`); a package match is
+  "likely", a class several jars hold "possible" for each, with the mismatch explained as a cause. Stack frames below the top 8 are
+  "possible", and with nothing likely the
   headline says no single mod stands out. Frames from Minecraft, loaders, Java and common libraries (`LIBRARIES`,
   `NOT_MODS`) never point at a mod. Analysis runs on a Promise; a log only gets a jar index if `looks_crashed`. A
   game that exits with a new crash report or a failed exit gets a notice in its log tab, cleared on the next launch;
-  a JVM killed by SIGKILL/SIGTERM/SIGINT counts as stopped, any other signal as a crash. Tests: `crash::tests`.
+  a JVM killed by SIGKILL/SIGTERM/SIGINT counts as stopped, any other signal as a crash. Tests: `crash::tests` (incl.
+  `a_shared_package_never_makes_a_java_error_certain`).
 - **Screenshots stay per instance:** never pool them on disk (a shared pool needed guessed ownership, which lost or
   misattributed files). The screenshots tab's "all instances" toggle (config `all_screenshots`) lists every
   instance's folder in the background, each tile captioned with its instance. Test:
