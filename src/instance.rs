@@ -391,7 +391,8 @@ pub fn format_duration(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     match (h, m) {
-        (0, 0) => "never".into(),
+        (0, 0) if secs == 0 => "never".into(),
+        (0, 0) => "<1m".into(),
         (0, m) => format!("{m}m"),
         (h, m) => format!("{h}h {m}m"),
     }
@@ -404,6 +405,13 @@ mod tests {
     thread_local! {
         /// Runs in [`add_content`] after each copy, before it's moved in.
         pub static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[test]
+    fn a_short_game_still_counts_as_played() {
+        assert_eq!(format_duration(0), "never");
+        assert_eq!(format_duration(40), "<1m");
+        assert_eq!(format_duration(3720), "1h 2m");
     }
 
     type Job = Box<dyn FnOnce() -> anyhow::Result<Vec<String>> + Send>;

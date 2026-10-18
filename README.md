@@ -19,15 +19,22 @@ On Linux (x86_64) with [Rust](https://rustup.rs) 1.95 or newer:
 curl -fsSL https://raw.githubusercontent.com/star-ges/omacraft/master/install.sh | bash
 ```
 
-It builds Omacraft and installs it for your user (`~/.local`), with a desktop entry and icon. From a
-clone, `./install.sh` does the same with that checkout. Omacraft runs under
-Wayland or X11 and uses the XDG desktop portal for file pickers. Java isn't needed: Omacraft downloads
-the runtime each Minecraft version expects.
+It builds the latest release and installs it for your user (`~/.local`), with a desktop entry and icon.
+Omacraft runs under Wayland or X11 and uses the XDG desktop portal for file pickers. Java isn't needed:
+Omacraft downloads the runtime each Minecraft version expects.
 
-To update, run the same command again: it always fetches the latest version. From a clone, pull first:
+To update, run the same command again: it always fetches the latest release. To build the latest `master`
+instead (newer, less tested), add `--master`:
 
 ```sh
-git pull
+curl -fsSL https://raw.githubusercontent.com/star-ges/omacraft/master/install.sh | bash -s -- --master
+```
+
+From a clone, `./install.sh` builds whatever is checked out. To update to the latest release, or to `master`:
+
+```sh
+git fetch --tags && git checkout "$(git tag -l 'v*' --sort=-v:refname | head -n1)"   # latest release
+git switch master && git pull                                                       # or latest master
 ./install.sh
 ```
 

@@ -12,11 +12,11 @@ pub const USER_AGENT: &str = concat!("omacraft/", env!("CARGO_PKG_VERSION"), " (
 pub fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .build()
-            .expect("http client")
+        let b = reqwest::Client::builder().user_agent(USER_AGENT).connect_timeout(std::time::Duration::from_secs(15));
+        // Each #[tokio::test] has its own runtime, and a pooled connection dies with the runtime that opened it.
+        #[cfg(test)]
+        let b = b.pool_max_idle_per_host(0);
+        b.build().expect("http client")
     })
 }
 
