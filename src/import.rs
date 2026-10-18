@@ -316,7 +316,7 @@ fn mrpack_downloads(index: &MrIndex) -> anyhow::Result<Vec<Download>> {
 }
 
 /// A relative path that stays inside the game dir.
-fn safe_rel(p: &str) -> Option<PathBuf> {
+pub(crate) fn safe_rel(p: &str) -> Option<PathBuf> {
     let path = Path::new(p);
     let ok = path.components().all(|c| matches!(c, std::path::Component::Normal(_)));
     (ok && !p.is_empty()).then(|| path.to_path_buf())

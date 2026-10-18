@@ -21,6 +21,10 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim 
 - **Style:** don't run `cargo fmt`; the code uses longer lines than rustfmt's defaults. Match the
   surrounding style.
 - **Warnings:** keep the build warning-free.
+- **Vendored crate:** `vendor/smithay-clipboard` is smithay-clipboard 0.7.3 patched (`[patch.crates-io]`) to take
+  file drops: winit has no drag and drop on Wayland, and Hyprland sends drops only to a client's first data
+  device, which is the clipboard's. The patch is `src/drop.rs` plus the `DataDeviceHandler` drop methods in
+  `src/state.rs`; when egui moves to a new smithay-clipboard, re-apply it or drop it if winit gains Wayland drops.
 - **Binary size:** the release profile strips symbols, and `zip` is trimmed to Deflate (flate2/zlib-rs),
   Deflate64 and `time`. Keep new dependencies' default features in check. LTO is off on purpose: full LTO
   with codegen-units=1 saved 7 MB (35 to 28) but tripled build times.
@@ -259,6 +263,16 @@ test (and a rule here) with any fix that sets a new one.
   `options.txt` (plus OptiFine's `optionsof.txt`/`optionsshaders.txt`, `instance::SETTINGS_FILES`) once, at creation.
   Sharing it live would lose keys: older versions drop keys they don't know when they save, and mod keybinds differ
   between instances. Test: `instance::tests::copy_settings_takes_only_settings_files`.
+- **File drops:** files dropped on an instance's mods, resource packs or shader packs tab are copied into that folder
+  (`Instance::add_content`, run as an install job under the same guards as Modrinth installs); anywhere else, or a
+  `.mrpack`, opens the import dialog. Everything is checked before anything is copied: each file must be what the
+  tab lists (`.jar` mods; `.zip` or folder packs), and a name already there, enabled or not, is skipped if identical
+  and refused if not, never replaced. On the worlds tab a world folder (with `level.dat`) or a `.zip` of one world
+  is added to `saves` (`saves::add_world`): copied or extracted beside `saves`, never inside it, then moved in under
+  the next free name (`<name> (2)`), without its `session.lock`. A zip with several worlds, or a folder open in a
+  game, is refused. It runs as a world job (`jobs_on` its saves, not while shared folders move), so launches wait
+  for it. Tests: `instance::tests::dropped_content_is_checked_before_anything_is_copied`,
+  `saves::tests::dropped_worlds_are_added_beside_the_others`.
 - **Saving:** write config/state files with `fsutil::write_atomic` (unique temp + rename; accounts at 0600).
 
 ## Testing the GUI safely

@@ -119,6 +119,74 @@ pub fn duplicate_world(w: &World) -> anyhow::Result<String> {
     Ok(folder)
 }
 
+/// Add a world from outside the instance: a world folder (one with `level.dat`) or a
+/// `.zip` holding one, at its root or in a folder. Copied (or extracted) beside `saves`,
+/// never inside it where the game would list a half-made world, then moved in under the
+/// next free name ("<name> (2)"…). A folder open in a game is refused. Returns the folder.
+pub fn add_world(src: &Path, saves: &Path) -> anyhow::Result<String> {
+    let file_name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let is_zip = src.is_file() && file_name.to_lowercase().ends_with(".zip");
+    if !(src.join("level.dat").is_file() || is_zip) {
+        anyhow::bail!("{file_name} isn't a world (a folder with level.dat, or a .zip of one)");
+    }
+    if !is_zip && crate::world_sets::lock_holder(src).is_some() {
+        anyhow::bail!("{file_name} is open in a game; close it first");
+    }
+    std::fs::create_dir_all(saves)?;
+    let saves = saves.canonicalize()?;
+    let stage = saves.parent().context("saves has no parent")?.join(format!(".adding-world-{}", uuid::Uuid::new_v4()));
+    let made = if is_zip { extract_world(src, &stage) } else { fsutil::copy_tree(src, &stage, &|_| {}).map_err(Into::into).map(|_| file_name.clone()) };
+    let moved = made.and_then(|name| {
+        let _ = std::fs::remove_file(stage.join("session.lock"));
+        anyhow::ensure!(stage.join("level.dat").is_file(), "{file_name} has no level.dat");
+        let mut folder = name.clone();
+        for n in 2.. {
+            match fsutil::rename_noreplace(&stage, &saves.join(&folder)) {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists || e.raw_os_error() == Some(libc::ENOTEMPTY) => folder = format!("{name} ({n})"),
+                r => return r.map(|_| folder).map_err(Into::into),
+            }
+        }
+        unreachable!()
+    });
+    if moved.is_err() {
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    moved.with_context(|| format!("Couldn't add {file_name}"))
+}
+
+/// Extract the one world in `zip` into `dst`, returning its name: the folder holding
+/// `level.dat`, or the zip's own name when that's at the root.
+fn extract_world(zip_path: &Path, dst: &Path) -> anyhow::Result<String> {
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(zip_path)?)?;
+    let roots: Vec<String> = zip.file_names().flatten().filter_map(|n| n.strip_suffix("level.dat").filter(|p| p.is_empty() || p.ends_with('/')).map(str::to_string)).collect();
+    // Worlds' own folders can hold more level.dat files (old backups); only the outermost counts.
+    let mut outer: Vec<&String> = roots.iter().filter(|r| !roots.iter().any(|o| o.len() < r.len() && r.starts_with(o.as_str()))).collect();
+    outer.dedup();
+    let prefix = match outer.as_slice() {
+        [one] => one.to_string(),
+        [] => anyhow::bail!("no world in it (no level.dat)"),
+        _ => anyhow::bail!("it holds {} worlds; drop them one at a time", outer.len()),
+    };
+    if !prefix.is_empty() && crate::import::safe_rel(prefix.trim_end_matches('/')).is_none() {
+        anyhow::bail!("its world folder has an unsafe path");
+    }
+    for i in 0..zip.len() {
+        let mut e = zip.by_index(i)?;
+        let name = e.name()?.to_string();
+        let Some(rel) = name.strip_prefix(&prefix) else { continue };
+        let Some(rel) = crate::import::safe_rel(rel.trim_end_matches('/')) else { continue };
+        let out = dst.join(rel);
+        if e.is_dir() {
+            std::fs::create_dir_all(&out)?;
+            continue;
+        }
+        std::fs::create_dir_all(out.parent().unwrap())?;
+        std::io::copy(&mut e, &mut std::fs::File::create(&out)?)?;
+    }
+    let name = prefix.trim_end_matches('/').rsplit('/').next().filter(|n| !n.is_empty()).map(str::to_string);
+    Ok(name.unwrap_or_else(|| zip_path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "World".into())))
+}
+
 // -- servers.dat ---------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -273,6 +341,45 @@ mod tests {
             assert!(!dir.join("saves").join(&copy).join("session.lock").exists());
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn dropped_worlds_are_added_beside_the_others() {
+        let dir = synthetic();
+        let (world, saves) = (dir.join("saves/Wörld"), dir.join("other/saves"));
+        let staged = || std::fs::read_dir(dir.join("other")).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with('.'));
+        // A folder, twice: the second gets the next free name, and neither keeps the lock file.
+        assert_eq!(add_world(&world, &saves).unwrap(), "Wörld");
+        assert_eq!(add_world(&world, &saves).unwrap(), "Wörld (2)");
+        assert!(!saves.join("Wörld/session.lock").exists());
+        assert_eq!(list_worlds(&saves)[0].name, "Wörld ✓");
+
+        let zip_of = |name: &str, entries: &[(&str, &[u8])]| {
+            let p = dir.join(name);
+            let mut z = zip::ZipWriter::new(std::fs::File::create(&p).unwrap());
+            for (n, b) in entries {
+                z.start_file(*n, zip::write::SimpleFileOptions::default()).unwrap();
+                z.write_all(b).unwrap();
+            }
+            z.finish().unwrap();
+            p
+        };
+        let level = std::fs::read(world.join("level.dat")).unwrap();
+        // A world in a folder of the zip, with an old level.dat inside it and a path that climbs out.
+        let z = zip_of("pack.zip", &[("Big Base/level.dat", &level), ("Big Base/backup/level.dat", b"old"), ("Big Base/region/r.0.0.mca", b"r"), ("Big Base/../../escape", b"x")]);
+        assert_eq!(add_world(&z, &saves).unwrap(), "Big Base");
+        assert!(saves.join("Big Base/region/r.0.0.mca").is_file() && !dir.join("escape").exists());
+        // level.dat at the zip's root: named after the zip.
+        let z = zip_of("Flat Land.zip", &[("level.dat", &level)]);
+        assert_eq!(add_world(&z, &saves).unwrap(), "Flat Land");
+        // Two worlds, none, or not a world at all: nothing is added.
+        let before = list_worlds(&saves).len();
+        assert!(add_world(&zip_of("two.zip", &[("A/level.dat", &level), ("B/level.dat", &level)]), &saves).is_err());
+        assert!(add_world(&zip_of("none.zip", &[("readme.txt", b"hi")]), &saves).is_err());
+        assert!(add_world(&dir.join("saves"), &saves).is_err());
+        assert_eq!(list_worlds(&saves).len(), before);
+        assert!(!staged(), "no staged copy is left behind");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -27,6 +27,8 @@ rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal", 
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha1 = "0.11.0"
+# egui's Wayland clipboard, patched (below) to also take file drops: winit has none on Wayland.
+smithay-clipboard = "0.7.3"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "fs", "process", "io-util", "sync", "time"] }
 toml = "1.1.8"
 # Already built for proc-macro-crate; reads TOML configs with the position of every
@@ -37,6 +39,9 @@ uuid = { version = "1.28.0", features = ["v4", "serde"] }
 # Explorer writes for big archives. The rest of zip's codecs (zopfli, bzip2, zstd,
 # lzma/xz, ppmd, AES) only cost binary size.
 zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "time"] }
+
+[patch.crates-io]
+smithay-clipboard = { path = "vendor/smithay-clipboard" }
 
 [profile.release]
 # Full LTO with one codegen unit saved 7 MB (35 to 28) but tripled build times, so it's off.

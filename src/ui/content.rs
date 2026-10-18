@@ -359,7 +359,11 @@ impl ContentState {
             let done: Vec<(String, String)> = s.installing.iter().filter(|(_, j)| j.promise.ready()).map(|(k, _)| k.clone()).collect();
             for key in done {
                 let Job { promise, title, dir, .. } = s.installing.remove(&key).unwrap();
+                let dropped = key.1.starts_with("drop:");
                 let (kind, text) = match promise.take().unwrap() {
+                    Ok(done) if dropped && done.files.is_empty() => (ToastKind::Info, format!("{title} is already there")),
+                    Ok(done) if dropped => (ToastKind::Info, format!("Added {}", done.files.join(", "))),
+                    Err(e) if dropped => (ToastKind::Error, format!("{e:#}")),
                     Ok(done) if done.files.is_empty() && done.missing.is_empty() => (ToastKind::Info, format!("{title} is already installed")),
                     Ok(done) => {
                         meta.installed(&dir, &done);
@@ -403,6 +407,55 @@ impl KindState {
     }
 }
 
+/// Why nothing can be installed into `inst`'s `kind` folder right now, if anything stops it.
+fn install_blocked(app: &mut App, inst: &Instance, kind: ContentKind) -> Option<&'static str> {
+    // Installing into a folder that's being moved into or out of a share set could land
+    // the file in the old place or get it renamed on a clash.
+    if app.sharing.is_some() && crate::shares::SET_FOLDERS.contains(&kind.dir()) {
+        Some("Shared folders are moving; install again in a moment")
+    } else if kind == ContentKind::Mods && app.content.updating(&inst.id) {
+        Some("Mods are updating; install again in a moment")
+    } else if kind == ContentKind::Mods && app.sessions.get(&inst.id).is_some_and(|s| s.starting()) {
+        Some("The game is starting; install again once it has")
+    } else if kind == ContentKind::Mods && app.mod_sets.searching(inst) {
+        // Mods stay as each step of a search for the breaking mod sets them.
+        Some("Finding the breaking mod; install once it's done")
+    } else {
+        None
+    }
+}
+
+/// Add files dropped on a content tab to the instance's folder, as an install job.
+pub fn add_dropped(app: &mut App, ctx: &egui::Context, inst: &Instance, kind: ContentKind, paths: Vec<PathBuf>) {
+    if kind == ContentKind::Mods && inst.loader.modrinth().is_none() {
+        app.toast(ToastKind::Error, "Vanilla instances don't load mods. Pick a mod loader in the version tab.");
+        return;
+    }
+    if let Some(why) = install_blocked(app, inst, kind) {
+        app.toast(ToastKind::Error, why);
+        return;
+    }
+    let title = match paths.as_slice() {
+        [one] => one.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+        many => format!("{} files", many.len()),
+    };
+    let job = (inst.id.clone(), format!("drop:{}", paths[0].display()));
+    let s = app.content.kinds.entry(kind).or_default();
+    if s.installing.contains_key(&job) {
+        return;
+    }
+    let task = Task::new(format!("adding {title}"));
+    task.stage(format!("Adding {title}"), 0);
+    let (i, tk) = (inst.clone(), task.clone());
+    let promise = Promise::spawn(&app.rt, ctx, async move {
+        let r = tokio::task::spawn_blocking(move || i.add_content(kind, &paths)).await.map_err(anyhow::Error::from).and_then(|r| r);
+        tk.finish(&r.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
+        r.map(|files| modrinth::Installed { files, projects: Vec::new(), missing: Vec::new() })
+    });
+    let dir = inst.game_dir().join(kind.dir());
+    s.installing.insert(job, Job { task, promise, title, dir });
+}
+
 pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
     let t = app.t.clone();
     let ctx = ui.ctx().clone();
@@ -439,22 +492,9 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
     let files = s.files(inst, kind);
     meta.ensure(&files, kind, &rt, &ctx);
     let mut out = Out::default();
-    // Installing into a folder that's being moved into or out of a share set could land
-    // the file in the old place or get it renamed on a clash.
     let starting = app.sessions.get(&inst.id).is_some_and(|s| s.starting());
-    // Mods stay as each step of a search for the breaking mod sets them.
     let searching = kind == ContentKind::Mods && app.mod_sets.searching(inst);
-    let blocked = if app.sharing.is_some() && crate::shares::SET_FOLDERS.contains(&kind.dir()) {
-        Some("Shared folders are moving; install again in a moment")
-    } else if kind == ContentKind::Mods && app.content.updating(&inst.id) {
-        Some("Mods are updating; install again in a moment")
-    } else if kind == ContentKind::Mods && starting {
-        Some("The game is starting; install again once it has")
-    } else if searching {
-        Some("Finding the breaking mod; install once it's done")
-    } else {
-        None
-    };
+    let blocked = install_blocked(app, inst, kind);
     if kind == ContentKind::Mods {
         let found = app.content.mod_entries(&files);
         super::mod_sets::bar(app, ui, inst, found.as_ref().map(|(e, n)| (e.as_slice(), n)));

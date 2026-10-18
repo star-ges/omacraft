@@ -19,6 +19,7 @@ pub mod widgets;
 mod worlds;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,7 @@ use egui::{Align, CornerRadius, Key, Layout, RichText, Sense, Stroke, Ui, vec2};
 
 use crate::auth::{self, Account, Accounts, MsaAccount};
 use crate::config::Config;
-use crate::instance::{self, Instance};
+use crate::instance::{self, ContentKind, Instance};
 use crate::launch::{self, GameLog, LaunchResult, LogLevel, QuickPlay, SharedLog};
 use crate::shares::Kind;
 use instances::{InstTab, ListRow};
@@ -209,6 +210,8 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle) -> Self {
         let t = Theme::load();
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        let ctx = cc.egui_ctx.clone();
+        smithay_clipboard::set_drop_notify(move || ctx.request_repaint());
         let fonts = FontSet::resolve();
         fonts.apply(&cc.egui_ctx);
         t.apply(&cc.egui_ctx);
@@ -1098,10 +1101,56 @@ impl App {
         }
     }
 
-    /// Files dropped on the window open the import dialog.
+    /// While files are dragged over the window, say what dropping them does.
+    fn drop_hint(&self, ctx: &egui::Context) {
+        if !smithay_clipboard::hovering() && ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            return;
+        }
+        let t = &self.t;
+        let text = match self.drop_target() {
+            Some((_, DropTarget::Content(kind))) => format!("drop to add {}s", kind.noun()),
+            Some((_, DropTarget::Worlds)) => "drop to add worlds (folders or .zip)".into(),
+            None if self.tab == Tab::Accounts && self.modal.is_none() => "drop a skin (.png) or a pack to import".into(),
+            None => "drop to import".into(),
+        };
+        let rect = ctx.content_rect();
+        let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("drop-hint")));
+        p.rect_filled(rect, 0.0, widgets::scrim(t));
+        p.rect_stroke(rect.shrink(6.0), 0.0, Stroke::new(2.0, t.border_active), egui::StrokeKind::Inside);
+        p.text(rect.center(), egui::Align2::CENTER_CENTER, format!("\u{f019}  {text}"), egui::FontId::monospace(t.body_size() + 4.0), t.fg);
+    }
+
+    /// The tab a drop would add files to: mods, packs or worlds, with no dialog up.
+    fn drop_target(&self) -> Option<(Instance, DropTarget)> {
+        if self.tab != Tab::Instances || self.modal.is_some() {
+            return None;
+        }
+        let target = match self.inst_tab {
+            InstTab::Mods => DropTarget::Content(ContentKind::Mods),
+            InstTab::ResourcePacks => DropTarget::Content(ContentKind::ResourcePacks),
+            InstTab::ShaderPacks => DropTarget::Content(ContentKind::ShaderPacks),
+            InstTab::Worlds => DropTarget::Worlds,
+            _ => return None,
+        };
+        Some((self.selected_instance()?.clone(), target))
+    }
+
+    /// Files dropped on a mods, packs or worlds tab go into that folder; anywhere else (or
+    /// a `.mrpack`) they open the import dialog.
     fn dropped_files(&mut self, ctx: &egui::Context) {
-        let dropped = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
-        let Some(path) = dropped else { return };
+        // winit only reports drops on X11; on Wayland they come through the patched clipboard crate.
+        let mut paths: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        paths.extend(smithay_clipboard::take_dropped());
+        if paths.is_empty() {
+            return;
+        }
+        let packs = paths.iter().all(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mrpack")));
+        match self.drop_target().filter(|_| !packs) {
+            Some((inst, DropTarget::Content(kind))) => return content::add_dropped(self, ctx, &inst, kind, paths),
+            Some((inst, DropTarget::Worlds)) => return worlds::add_dropped(self, ctx, &inst, paths),
+            None => {}
+        }
+        let path = paths.swap_remove(0);
         let png = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"));
         if self.tab == Tab::Accounts && png && self.modal.is_none() && accounts::drop_file(self, &path) {
             return;
@@ -1116,6 +1165,12 @@ impl App {
         }
         self.tab = Tab::Instances;
     }
+}
+
+/// Where files dropped on the window go, besides the import dialog.
+enum DropTarget {
+    Content(ContentKind),
+    Worlds,
 }
 
 /// Instance folder sizes, measured in the background and refreshed now and then.
@@ -1180,6 +1235,7 @@ impl eframe::App for App {
         config::guard(self, &ctx);
         self.show_modal(&ctx);
         self.toasts(&ctx);
+        self.drop_hint(&ctx);
         self.nav = None;
     }
 }

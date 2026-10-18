@@ -206,6 +206,32 @@ pub fn start_restore(app: &mut App, ctx: &egui::Context, id: &str, snap: Snapsho
     });
 }
 
+/// Add worlds dropped on the worlds tab (folders or zips) to the instance's saves.
+pub fn add_dropped(app: &mut App, ctx: &egui::Context, inst: &Instance, paths: Vec<PathBuf>) {
+    // One job per saves folder at a time, as with duplicates; not while shared folders move.
+    let why = if app.sharing.is_some() { Some("shared folders are moving") } else { jobs_on(&app.content, &app.worlds, &saves_key(inst)) };
+    if let Some(why) = why {
+        app.toast(ToastKind::Error, format!("Can't add worlds while {why}"));
+        return;
+    }
+    let (rt, saves) = (app.rt.clone(), inst.saves_dir());
+    let title = match paths.as_slice() {
+        [one] => one.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+        many => format!("{} worlds", many.len()),
+    };
+    app.worlds.start(&rt, ctx, inst, "add world", format!("Adding {title}"), move || {
+        let mut added = Vec::new();
+        for p in &paths {
+            match saves::add_world(p, &saves) {
+                Ok(folder) => added.push(folder),
+                Err(e) if added.is_empty() => return Err(e),
+                Err(e) => anyhow::bail!("{e:#} (added {} first)", added.join(", ")),
+            }
+        }
+        Ok(JobDone { select: added.first().cloned(), note: Some(format!("Added {}", added.join(", "))) })
+    });
+}
+
 pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
     let t = app.t.clone();
     let Some(listing) = app.worlds.sync(&app.rt, ui.ctx(), inst).cloned() else {
@@ -215,7 +241,7 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance) {
     };
     let gone = listing.gone();
     if listing.worlds.is_empty() && gone.is_empty() {
-        w::empty_state(ui, &t, "󰕒", "no worlds yet", "Create one in game, or drop a world folder into saves.");
+        w::empty_state(ui, &t, "󰕒", "no worlds yet", "Create one in game, or drop a world folder or .zip here.");
         ui.vertical_centered(|ui| {
             if w::button(ui, "open saves folder").clicked() {
                 super::open_path(&inst.saves_dir());

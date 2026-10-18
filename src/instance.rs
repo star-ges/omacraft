@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -184,6 +185,53 @@ impl Instance {
         out.sort_by_key(|m| m.display_name().to_lowercase());
         out
     }
+
+    /// Copy files the user dropped into this instance's `kind` folder (reflinked where it
+    /// can), returning the names added. Everything is checked before anything is copied:
+    /// each must be what the tab lists (`.jar` mods; `.zip` or folder packs), and a name
+    /// already there (enabled or not) must hold the same bytes, which is then skipped.
+    /// Copies are staged under a dot-name and moved in without replacing anything.
+    pub fn add_content(&self, kind: ContentKind, paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
+        let dir = self.game_dir().join(kind.dir());
+        let mut todo = Vec::new();
+        for p in paths {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let is_dir = std::fs::metadata(p).with_context(|| format!("can't read {}", p.display()))?.is_dir();
+            let fits = if is_dir { kind != ContentKind::Mods } else { name.ends_with(kind.ext()) };
+            if !fits || name.starts_with('.') {
+                let what = if kind == ContentKind::Mods { ".jar files" } else { ".zip files or folders" };
+                anyhow::bail!("{name} isn't a {} ({}s are {what})", kind.noun(), kind.noun());
+            }
+            let existing = [dir.join(&name), dir.join(format!("{name}.disabled"))].into_iter().find(|e| std::fs::symlink_metadata(e).is_ok());
+            match existing {
+                Some(e) if !is_dir && same_bytes(p, &e) => {}
+                Some(_) => anyhow::bail!("a different {name} is already in {}", kind.dir()),
+                None if todo.iter().any(|(_, n, _)| *n == name) => anyhow::bail!("two files are named {name}"),
+                None => todo.push((p.clone(), name, is_dir)),
+            }
+        }
+        std::fs::create_dir_all(&dir)?;
+        let mut added = Vec::new();
+        for (src, name, is_dir) in todo {
+            let staged = dir.join(format!(".{name}.adding"));
+            let _ = if is_dir { std::fs::remove_dir_all(&staged) } else { std::fs::remove_file(&staged) };
+            let copied = if is_dir { fsutil::copy_tree(&src, &staged, &|_| {}).map(|_| ()) } else { reflink_copy::reflink_or_copy(&src, &staged).map(|_| ()) };
+            let moved = copied.and_then(|_| fsutil::rename_noreplace(&staged, &dir.join(&name)));
+            if let Err(e) = moved {
+                let _ = if is_dir { std::fs::remove_dir_all(&staged) } else { std::fs::remove_file(&staged) };
+                let done = if added.is_empty() { String::new() } else { format!(" (added {} first)", added.join(", ")) };
+                return Err(anyhow::Error::from(e).context(format!("couldn't add {name}{done}")));
+            }
+            added.push(name);
+        }
+        Ok(added)
+    }
+}
+
+/// Whether two files hold the same bytes.
+fn same_bytes(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else { return false };
+    ma.is_file() && mb.is_file() && ma.len() == mb.len() && std::fs::read(a).ok().is_some_and(|x| std::fs::read(b).ok().is_some_and(|y| x == y))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -294,6 +342,50 @@ pub fn format_duration(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_content_is_checked_before_anything_is_copied() {
+        let mut inst = Instance::new("Drops", "1.21.1", Loader::Fabric("0.16.0".into()));
+        inst.assign_id().unwrap();
+        let src = paths::test_root().join("drops-src");
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(src.join("Pack Folder")).unwrap();
+        std::fs::write(src.join("Pack Folder/pack.mcmeta"), "{}").unwrap();
+        for (n, b) in [("a.jar", "a"), ("b.jar", "b"), ("notes.txt", "x"), ("p.zip", "p")] {
+            std::fs::write(src.join(n), b).unwrap();
+        }
+        let mods = inst.game_dir().join("mods");
+        let has = |n: &str| mods.join(n).exists();
+
+        // One file that doesn't fit stops the whole drop.
+        let err = inst.add_content(ContentKind::Mods, &[src.join("a.jar"), src.join("notes.txt")]).unwrap_err();
+        assert!(format!("{err:#}").contains("notes.txt"), "{err:#}");
+        assert!(!has("a.jar"));
+        assert!(inst.add_content(ContentKind::Mods, &[src.join("Pack Folder")]).is_err());
+
+        assert_eq!(inst.add_content(ContentKind::Mods, &[src.join("a.jar"), src.join("b.jar")]).unwrap(), ["a.jar", "b.jar"]);
+        assert_eq!(std::fs::read(mods.join("a.jar")).unwrap(), b"a");
+        assert!(src.join("a.jar").exists(), "the dropped file stays where it was");
+
+        // The same file again is skipped, also when it's been disabled since.
+        std::fs::rename(mods.join("b.jar"), mods.join("b.jar.disabled")).unwrap();
+        assert!(inst.add_content(ContentKind::Mods, &[src.join("a.jar"), src.join("b.jar")]).unwrap().is_empty());
+        assert!(!has("b.jar"));
+        // A different file of the same name is never replaced.
+        std::fs::write(src.join("a.jar"), "newer").unwrap();
+        assert!(inst.add_content(ContentKind::Mods, &[src.join("a.jar")]).is_err());
+        assert_eq!(std::fs::read(mods.join("a.jar")).unwrap(), b"a");
+
+        // Packs take zips and folders.
+        assert_eq!(inst.add_content(ContentKind::ResourcePacks, &[src.join("p.zip"), src.join("Pack Folder")]).unwrap(), ["p.zip", "Pack Folder"]);
+        assert!(inst.game_dir().join("resourcepacks/Pack Folder/pack.mcmeta").is_file());
+        assert!(inst.add_content(ContentKind::ShaderPacks, &[src.join("a.jar")]).is_err());
+        // No staged copies are left behind.
+        let hidden = |d: &str| std::fs::read_dir(inst.game_dir().join(d)).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with('.'));
+        assert!(!hidden("mods") && !hidden("resourcepacks"));
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+        std::fs::remove_dir_all(&src).unwrap();
+    }
 
     #[test]
     fn assign_id_reserves_distinct_dirs() {
