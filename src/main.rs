@@ -1,5 +1,6 @@
 mod auth;
 mod backups;
+mod bisect;
 mod cli;
 mod config;
 mod content_meta;
@@ -15,6 +16,7 @@ mod java;
 mod launch;
 mod loaders;
 mod modrinth;
+mod mod_sets;
 mod mojang;
 mod net;
 mod paths;

@@ -109,6 +109,15 @@ fn parse_mod(zip: &mut zip::ZipArchive<std::fs::File>, meta: &mut FileMeta) -> O
     }
 }
 
+/// The id a mod jar gives itself (its first, for jars that hold several), read from
+/// its metadata like [`read_local`] does, without hashing or icons.
+pub fn mod_id(path: &Path) -> Option<String> {
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
+    let mut meta = FileMeta::default();
+    parse_mod(&mut zip, &mut meta);
+    meta.mod_id.filter(|id| !id.is_empty())
+}
+
 /// `Implementation-Version` from the jar's manifest.
 pub(crate) fn manifest_version<R: std::io::Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>) -> Option<String> {
     let text = String::from_utf8(zip_bytes(zip, "META-INF/MANIFEST.MF")?).ok()?;
