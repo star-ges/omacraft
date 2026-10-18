@@ -1238,7 +1238,6 @@ fn editor(ui: &mut Ui, t: &Theme, o: &mut Open, st: EditorState, running: bool, 
                     if r.on_disabled_hover_text(p.why.unwrap_or_default()).clicked() {
                         out.use_pack = Some(None);
                     }
-                    ui.label(RichText::new("● in use").color(t.green).size(size));
                 } else {
                     let hover = if p.optifine { "make it OptiFine's shader pack" } else { "make it Iris's shader pack" };
                     let r = ui.add_enabled(p.why.is_none(), egui::Button::new("use this pack")).on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(hover);

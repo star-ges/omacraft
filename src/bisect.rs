@@ -600,7 +600,7 @@ pub fn answer(inst: &Instance, a: Answer) -> anyhow::Result<Bisect> {
         bail!("the search is ending; put the mods back first");
     }
     if !b.applied || !in_place(inst, &b)? {
-        bail!("the mods aren't as this step set them, so the answer wouldn't mean anything: switch them again, then play the step");
+        bail!("the mods aren't as this step set them: switch them again, then play the step");
     }
     b.answer(a)?;
     if b.done.is_some() {
