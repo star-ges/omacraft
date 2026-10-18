@@ -267,11 +267,15 @@ test (and a rule here) with any fix that sets a new one.
   (`Instance::add_content`, run as an install job under the same guards as Modrinth installs); anywhere else, or a
   `.mrpack`, opens the import dialog. Everything is checked before anything is copied: each file must be what the
   tab lists (`.jar` mods; `.zip` or folder packs), and a name already there, enabled or not, is skipped if identical
-  and refused if not, never replaced. On the worlds tab a world folder (with `level.dat`) or a `.zip` of one world
+  and refused if not, never replaced. Each drop copies into a stage folder of its own (`.adding-<pid>-<uuid>`, cleared
+  only by its own call, or once its process is gone), checks the name and its `.disabled` twin again when moving in
+  and moves in with `fsutil::rename_noreplace`, so concurrent drops of one name, also into a shared folder through two
+  instances, never publish each other's bytes: the first in wins, an identical one is skipped. On the worlds tab a world folder (with `level.dat`) or a `.zip` of one world
   is added to `saves` (`saves::add_world`): copied or extracted beside `saves`, never inside it, then moved in under
   the next free name (`<name> (2)`), without its `session.lock`. A zip with several worlds, or a folder open in a
   game, is refused. It runs as a world job (`jobs_on` its saves, not while shared folders move), so launches wait
-  for it. Tests: `instance::tests::dropped_content_is_checked_before_anything_is_copied`,
+  for it. Tests: `instance::tests::{dropped_content_is_checked_before_anything_is_copied,
+  drops_of_the_same_name_never_share_a_stage}`,
   `saves::tests::dropped_worlds_are_added_beside_the_others`.
 - **Saving:** write config/state files with `fsutil::write_atomic` (unique temp + rename; accounts at 0600).
 

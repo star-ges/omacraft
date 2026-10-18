@@ -190,7 +190,9 @@ impl Instance {
     /// can), returning the names added. Everything is checked before anything is copied:
     /// each must be what the tab lists (`.jar` mods; `.zip` or folder packs), and a name
     /// already there (enabled or not) must hold the same bytes, which is then skipped.
-    /// Copies are staged under a dot-name and moved in without replacing anything.
+    /// Each call stages its copies in a folder of its own (`.adding-<pid>-<uuid>`), so
+    /// drops of the same name, also through a shared folder, never touch each other's
+    /// stage, and moves them in without replacing anything, checking both names again.
     pub fn add_content(&self, kind: ContentKind, paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
         let dir = self.game_dir().join(kind.dir());
         let mut todo = Vec::new();
@@ -202,8 +204,7 @@ impl Instance {
                 let what = if kind == ContentKind::Mods { ".jar files" } else { ".zip files or folders" };
                 anyhow::bail!("{name} isn't a {} ({}s are {what})", kind.noun(), kind.noun());
             }
-            let existing = [dir.join(&name), dir.join(format!("{name}.disabled"))].into_iter().find(|e| std::fs::symlink_metadata(e).is_ok());
-            match existing {
+            match taken(&dir, &name) {
                 Some(e) if !is_dir && same_bytes(p, &e) => {}
                 Some(_) => anyhow::bail!("a different {name} is already in {}", kind.dir()),
                 None if todo.iter().any(|(_, n, _)| *n == name) => anyhow::bail!("two files are named {name}"),
@@ -211,20 +212,62 @@ impl Instance {
             }
         }
         std::fs::create_dir_all(&dir)?;
-        let mut added = Vec::new();
-        for (src, name, is_dir) in todo {
-            let staged = dir.join(format!(".{name}.adding"));
-            let _ = if is_dir { std::fs::remove_dir_all(&staged) } else { std::fs::remove_file(&staged) };
-            let copied = if is_dir { fsutil::copy_tree(&src, &staged, &|_| {}).map(|_| ()) } else { reflink_copy::reflink_or_copy(&src, &staged).map(|_| ()) };
-            let moved = copied.and_then(|_| fsutil::rename_noreplace(&staged, &dir.join(&name)));
-            if let Err(e) = moved {
-                let _ = if is_dir { std::fs::remove_dir_all(&staged) } else { std::fs::remove_file(&staged) };
+        clear_stale_stages(&dir);
+        let stage = dir.join(format!(".adding-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&stage)?;
+        let result = publish_all(kind, &dir, &stage, todo);
+        let _ = std::fs::remove_dir_all(&stage);
+        result
+    }
+}
+
+/// The entry already holding `name` in `dir`, enabled or disabled.
+fn taken(dir: &Path, name: &str) -> Option<PathBuf> {
+    [dir.join(name), dir.join(format!("{name}.disabled"))].into_iter().find(|e| std::fs::symlink_metadata(e).is_ok())
+}
+
+/// Copy each of `todo` into `stage` (this call's own) and move it into `dir`. A name
+/// another drop took meanwhile is skipped if it holds the same file, else an error.
+fn publish_all(kind: ContentKind, dir: &Path, stage: &Path, todo: Vec<(PathBuf, String, bool)>) -> anyhow::Result<Vec<String>> {
+    let mut added = Vec::new();
+    for (src, name, is_dir) in todo {
+        let staged = stage.join(&name);
+        let copied = if is_dir { fsutil::copy_tree(&src, &staged, &|_| {}).map(|_| ()) } else { reflink_copy::reflink_or_copy(&src, &staged).map(|_| ()) };
+        #[cfg(test)]
+        tests::BEFORE_PUBLISH.with(|h| h.borrow().as_ref().map(|h| h()));
+        let clash = || anyhow::anyhow!("a different {name} was put in {} meanwhile", kind.dir());
+        let moved = copied.map_err(anyhow::Error::from).and_then(|_| match taken(dir, &name) {
+            Some(e) if !is_dir && same_bytes(&staged, &e) => Ok(false),
+            Some(_) => Err(clash()),
+            None => match fsutil::rename_noreplace(&staged, &dir.join(&name)) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && !is_dir && same_bytes(&staged, &dir.join(&name)) => Ok(false),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(clash()),
+                Err(e) => Err(e.into()),
+            },
+        });
+        match moved {
+            Ok(true) => added.push(name),
+            Ok(false) => {}
+            Err(e) => {
                 let done = if added.is_empty() { String::new() } else { format!(" (added {} first)", added.join(", ")) };
-                return Err(anyhow::Error::from(e).context(format!("couldn't add {name}{done}")));
+                return Err(e.context(format!("couldn't add {name}{done}")));
             }
-            added.push(name);
         }
-        Ok(added)
+    }
+    Ok(added)
+}
+
+/// Remove stages left in `dir` by drops whose process is gone (a crash mid-copy). A
+/// live process's stages, this one's included, are only ever cleared by their own call.
+fn clear_stale_stages(dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name.strip_prefix(".adding-").and_then(|r| r.split('-').next()).and_then(|p| p.parse::<u32>().ok()) else { continue };
+        if pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
     }
 }
 
@@ -342,6 +385,95 @@ pub fn format_duration(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Runs in [`add_content`] after each copy, before it's moved in.
+        pub static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    type Job = Box<dyn FnOnce() -> anyhow::Result<Vec<String>> + Send>;
+
+    /// Run two drops on their own threads so that both have copied before either moves
+    /// its copy in, then let `a` finish first.
+    fn race(a: Job, b: Job) -> (anyhow::Result<Vec<String>>, anyhow::Result<Vec<String>>) {
+        let start = |f: Job| {
+            let (copied_tx, copied) = std::sync::mpsc::channel();
+            let (go, go_rx) = std::sync::mpsc::channel::<()>();
+            let t = std::thread::spawn(move || {
+                BEFORE_PUBLISH.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || {
+                        copied_tx.send(()).unwrap();
+                        go_rx.recv().unwrap();
+                    }))
+                });
+                f()
+            });
+            copied.recv().unwrap();
+            (t, go)
+        };
+        let (ta, go_a) = start(a);
+        let (tb, go_b) = start(b);
+        go_a.send(()).unwrap();
+        let ra = ta.join().unwrap();
+        go_b.send(()).unwrap();
+        (ra, tb.join().unwrap())
+    }
+
+    #[test]
+    fn drops_of_the_same_name_never_share_a_stage() {
+        let mut inst = Instance::new("Drop Race", "1.21.1", Loader::Fabric("0.16.0".into()));
+        inst.assign_id().unwrap();
+        let mut other = Instance::new("Drop Race Share", "1.21.1", Loader::Fabric("0.16.0".into()));
+        other.assign_id().unwrap();
+        let src = paths::test_root().join("drop-race-src");
+        let _ = std::fs::remove_dir_all(&src);
+        for (d, text) in [("A", "a"), ("B", "b")] {
+            std::fs::create_dir_all(src.join(d).join("Pack/assets")).unwrap();
+            std::fs::write(src.join(d).join("x.jar"), text).unwrap();
+            std::fs::write(src.join(d).join("Pack/assets/f"), text).unwrap();
+        }
+        let job = |i: &Instance, kind, p: PathBuf| -> Job {
+            let i = i.clone();
+            Box::new(move || i.add_content(kind, &[p]))
+        };
+
+        // Two jars of one name: the first to move in wins with its own bytes.
+        let (a, b) = race(job(&inst, ContentKind::Mods, src.join("A/x.jar")), job(&inst, ContentKind::Mods, src.join("B/x.jar")));
+        assert_eq!(a.unwrap(), ["x.jar"]);
+        assert_eq!(std::fs::read(inst.game_dir().join("mods/x.jar")).unwrap(), b"a");
+        assert!(format!("{:#}", b.unwrap_err()).contains("different x.jar"));
+        // The same file dropped twice at once is added once, and the other drop skips it.
+        std::fs::remove_file(inst.game_dir().join("mods/x.jar")).unwrap();
+        let (a, b) = race(job(&inst, ContentKind::Mods, src.join("A/x.jar")), job(&inst, ContentKind::Mods, src.join("A/x.jar")));
+        assert_eq!(a.unwrap(), ["x.jar"]);
+        assert!(b.unwrap().is_empty());
+        // A disabled twin that appears meanwhile is found again when moving in.
+        std::fs::remove_file(inst.game_dir().join("mods/x.jar")).unwrap();
+        let twin = inst.game_dir().join("mods/x.jar.disabled");
+        BEFORE_PUBLISH.with(|h| {
+            let (b, twin) = (src.join("B/x.jar"), twin.clone());
+            *h.borrow_mut() = Some(Box::new(move || drop(std::fs::copy(&b, &twin))))
+        });
+        let a = inst.add_content(ContentKind::Mods, &[src.join("A/x.jar")]);
+        BEFORE_PUBLISH.with(|h| h.borrow_mut().take());
+        assert!(format!("{:#}", a.unwrap_err()).contains("different x.jar"));
+        assert!(!inst.game_dir().join("mods/x.jar").exists());
+        std::fs::remove_file(&twin).unwrap();
+
+        // Folder packs into one shared folder, through two instances.
+        std::fs::create_dir_all(inst.game_dir().join("resourcepacks")).unwrap();
+        std::fs::create_dir_all(other.game_dir()).unwrap();
+        std::os::unix::fs::symlink(inst.game_dir().join("resourcepacks"), other.game_dir().join("resourcepacks")).unwrap();
+        let (a, b) = race(job(&inst, ContentKind::ResourcePacks, src.join("A/Pack")), job(&other, ContentKind::ResourcePacks, src.join("B/Pack")));
+        assert_eq!(a.unwrap(), ["Pack"]);
+        assert!(b.is_err());
+        assert_eq!(std::fs::read(inst.game_dir().join("resourcepacks/Pack/assets/f")).unwrap(), b"a");
+        let hidden = |d: &str| std::fs::read_dir(inst.game_dir().join(d)).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with('.'));
+        assert!(!hidden("mods") && !hidden("resourcepacks"), "a stage was left behind");
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+        std::fs::remove_dir_all(other.dir()).unwrap();
+        std::fs::remove_dir_all(&src).unwrap();
+    }
 
     #[test]
     fn dropped_content_is_checked_before_anything_is_copied() {
