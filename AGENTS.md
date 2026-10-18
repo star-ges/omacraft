@@ -24,7 +24,8 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim 
 - **Vendored crate:** `vendor/smithay-clipboard` is smithay-clipboard 0.7.3 patched (`[patch.crates-io]`) to take
   file drops: winit has no drag and drop on Wayland, and Hyprland sends drops only to a client's first data
   device, which is the clipboard's. The patch is `src/drop.rs` plus the `DataDeviceHandler` drop methods in
-  `src/state.rs`; when egui moves to a new smithay-clipboard, re-apply it or drop it if winit gains Wayland drops.
+  `src/state.rs` (and `set_non_blocking` made `pub(crate)`); when egui moves to a new smithay-clipboard, re-apply it
+  or drop it if winit gains Wayland drops. Its tests: `cargo test --manifest-path vendor/smithay-clipboard/Cargo.toml --lib`.
 - **Binary size:** the release profile strips symbols, and `zip` is trimmed to Deflate (flate2/zlib-rs),
   Deflate64 and `time`. Keep new dependencies' default features in check. LTO is off on purpose: full LTO
   with codegen-units=1 saved 7 MB (35 to 28) but tripled build times.
@@ -278,9 +279,12 @@ test (and a rule here) with any fix that sets a new one.
   is added to `saves` (`saves::add_world`): copied or extracted beside `saves`, never inside it, then moved in under
   the next free name (`<name> (2)`), without its `session.lock`. A zip with several worlds, or a folder open in a
   game, is refused. It runs as a world job (`jobs_on` its saves, not while shared folders move), so launches wait
-  for it. Tests: `instance::tests::{dropped_content_is_checked_before_anything_is_copied,
+  for it. The drop's uri list itself (vendored `drop::receive`) is capped at `MAX_BYTES` (1 MiB) and `MAX_PATHS`,
+  read at most `READS_PER_WAKE` chunks per wake-up so a source that never stops can't hold the clipboard thread, and
+  dropped, pipe closed, after `DEADLINE` (10 s). Tests: `instance::tests::{dropped_content_is_checked_before_anything_is_copied,
   drops_of_the_same_name_never_share_a_stage, a_folder_holding_the_destination_is_not_copied_into_itself}`,
-  `saves::tests::dropped_worlds_are_added_beside_the_others`.
+  `saves::tests::dropped_worlds_are_added_beside_the_others`, and in the vendored crate
+  `drop::tests::{transfers_are_capped_in_bytes_paths_and_reads_per_wake, abandoned_and_endless_drops_leave_other_transfers_working}`.
 - **Saving:** write config/state files with `fsutil::write_atomic` (unique temp + rename; accounts at 0600).
 
 ## Testing the GUI safely

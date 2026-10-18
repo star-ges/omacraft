@@ -430,25 +430,10 @@ impl DataDeviceHandler for State {
             offer.finish();
             return;
         }
-        let mut reader_buffer = [0; 4096];
-        let mut content = Vec::new();
-        let _ = self.loop_handle.insert_source(read_pipe, move |_, file, _| {
-            let file = unsafe { file.get_mut() };
-            loop {
-                match file.read(&mut reader_buffer) {
-                    Ok(0) => {
-                        offer.finish();
-                        crate::drop::push(crate::drop::parse_uri_list(&content));
-                        break PostAction::Remove;
-                    },
-                    Ok(n) => content.extend_from_slice(&reader_buffer[..n]),
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => break PostAction::Continue,
-                    Err(_) => {
-                        offer.finish();
-                        break PostAction::Remove;
-                    },
-                }
-            }
+        // Capped in bytes, paths, reads per wake-up and time (see drop.rs).
+        crate::drop::receive(&self.loop_handle, read_pipe, crate::drop::DEADLINE, move |paths| {
+            offer.finish();
+            crate::drop::push(paths.unwrap_or_default());
         });
     }
 
@@ -623,7 +608,7 @@ impl Drop for ClipboardSeatState {
     }
 }
 
-fn set_non_blocking(raw_fd: RawFd) -> std::io::Result<()> {
+pub(crate) fn set_non_blocking(raw_fd: RawFd) -> std::io::Result<()> {
     let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
 
     if flags < 0 {
