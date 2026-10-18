@@ -258,7 +258,7 @@ pub fn doc(text: &str) -> Doc {
             None => ("other".to_string(), key.to_string(), String::new()),
         };
         let rank = KNOWN.iter().position(|k| k.key == key).or_else(|| BINDINGS.iter().position(|(k, _, _)| *k == key)).unwrap_or(usize::MAX);
-        fields.push((ORDER.iter().position(|s| *s == section).unwrap_or(ORDER.len()), rank, Field { section: vec![section], key: key.to_string(), label: Some(label), value, span, doc, hint }));
+        fields.push((ORDER.iter().position(|s| *s == section).unwrap_or(ORDER.len()), rank, Field { section: vec![section], key: key.to_string(), label: Some(label), value, span, item_spans: Vec::new(), doc, hint }));
     }
     // Menu order: by section, then as listed above (keys in the file's order otherwise).
     fields.sort_by_key(|(s, k, _)| (*s, *k));

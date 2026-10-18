@@ -486,7 +486,7 @@ fn base(files: &BTreeMap<String, String>) -> Doc {
             };
             let doc = tr(format!("option.{name}.comment")).unwrap_or_else(|| o.comment.clone());
             let label = tr(format!("option.{name}")).unwrap_or_else(|| readable(&name));
-            Some(Field { section, key: name, label: Some(label), value, span: 0..0, doc, hint })
+            Some(Field { section, key: name, label: Some(label), value, span: 0..0, item_spans: Vec::new(), doc, hint })
         })
         .collect();
 
@@ -526,7 +526,7 @@ fn base(files: &BTreeMap<String, String>) -> Doc {
         let hint = Hint { allowed: presets.iter().map(|(n, _)| n.clone()).collect(), labels, presets, on_off: true, ..Default::default() };
         let doc = tr("profile.comment".into()).unwrap_or_else(|| "A preset from the pack: sets many options at once. \"custom\" when they've been changed by hand.".into());
         let label = tr("profile".into()).unwrap_or_else(|| "profile".into());
-        fields.insert(0, Field { section: Vec::new(), key: PROFILE.into(), label: Some(label), value: Value::Scalar(Scalar::Str(CUSTOM.into())), span: 0..0, doc, hint });
+        fields.insert(0, Field { section: Vec::new(), key: PROFILE.into(), label: Some(label), value: Value::Scalar(Scalar::Str(CUSTOM.into())), span: 0..0, item_spans: Vec::new(), doc, hint });
     }
     let mut d = Doc { fields, section_docs };
     d = doc(&d, "");

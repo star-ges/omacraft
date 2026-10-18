@@ -380,6 +380,8 @@ pub struct Field {
     pub value: Value,
     /// Where the value sits in the text.
     pub span: Range<usize>,
+    /// Where each item of a list sits, so items an edit leaves alone keep their exact text.
+    pub item_spans: Vec<Range<usize>>,
     /// Its comment, with the range/allowed/default lines taken out into `hint`.
     pub doc: String,
     pub hint: Hint,
@@ -521,7 +523,8 @@ fn toml_table(t: &toml_edit::Table, text: &str, path: &mut Vec<String>, dotted: 
                 let comment = clean_comment(&raw_text(key.leaf_decor().prefix(), text));
                 let (doc, hint) = read_hint(&comment);
                 if let Some(span) = v.span() {
-                    out.fields.push(Field { section: path.clone(), key: name, label: None, value: toml_value(v, text), span, doc, hint });
+                    let item_spans = v.as_array().map(|a| a.iter().filter_map(|i| i.span()).collect()).unwrap_or_default();
+                    out.fields.push(Field { section: path.clone(), key: name, label: None, value: toml_value(v, text), span, item_spans, doc, hint });
                 }
             }
             // `a.b = 1` inside a table: keys of this table, not a section of their own.
@@ -531,7 +534,7 @@ fn toml_table(t: &toml_edit::Table, text: &str, path: &mut Vec<String>, dotted: 
             toml_edit::Item::ArrayOfTables(a) => {
                 let comment = clean_comment(&raw_text(key.leaf_decor().prefix(), text));
                 let (doc, hint) = read_hint(&comment);
-                out.fields.push(Field { section: path.clone(), key: name, label: None, value: Value::Other(format!("{} [[tables]]", a.len())), span: 0..0, doc, hint });
+                out.fields.push(Field { section: path.clone(), key: name, label: None, value: Value::Other(format!("{} [[tables]]", a.len())), span: 0..0, item_spans: Vec::new(), doc, hint });
             }
             toml_edit::Item::None => {}
         }
@@ -650,18 +653,42 @@ pub fn scalar_text(format: Format, s: &Scalar, old: &str) -> String {
     }
 }
 
-/// A list's text, laid out like `old` (one line or one item per line).
-pub fn list_text(format: Format, items: &[Scalar], old: &str) -> String {
+/// The same value, to the bit for floats (so `-0.0` isn't `0.0` and `NaN` is itself).
+fn same(a: &Scalar, b: &Scalar) -> bool {
+    match (a, b) {
+        (Scalar::Float(x), Scalar::Float(y)) => x.to_bits() == y.to_bits(),
+        _ => a == b,
+    }
+}
+
+/// A list's text, laid out like `old` (one line or one item per line). `kept` is the old list's
+/// items with their text: an item still there is written exactly as it was (`0x10`, `1_000`,
+/// `'\x41'`), only new or changed ones are written afresh.
+pub fn list_text(format: Format, items: &[Scalar], old: &str, kept: &[(&Scalar, &str)]) -> String {
     let first_old = old.trim_start_matches('[').trim_start();
-    let quote_like = |s: &Scalar| scalar_text(format, s, first_old);
+    let mut used = vec![false; kept.len()];
+    let texts: Vec<String> = items
+        .iter()
+        .enumerate()
+        .map(|(n, it)| {
+            // The item at the same place first, else the first unused one like it.
+            let at = (n < kept.len() && !used[n] && same(kept[n].0, it)).then_some(n).or_else(|| (0..kept.len()).find(|&k| !used[k] && same(kept[k].0, it)));
+            match at {
+                Some(k) => {
+                    used[k] = true;
+                    kept[k].1.to_string()
+                }
+                None => scalar_text(format, it, first_old),
+            }
+        })
+        .collect();
     if items.is_empty() {
         return "[]".into();
     }
     if !old.contains('\n') {
         let sep = if old.contains(", ") || !old.contains(',') { ", " } else { "," };
         let pad = if old.starts_with("[ ") { " " } else { "" };
-        let body: Vec<String> = items.iter().map(quote_like).collect();
-        return format!("[{pad}{}{pad}]", body.join(sep));
+        return format!("[{pad}{}{pad}]", texts.join(sep));
     }
     // One per line: the first item's indent, the closing bracket's, and a trailing
     // comma if the old list had one.
@@ -670,9 +697,9 @@ pub fn list_text(format: Format, items: &[Scalar], old: &str) -> String {
     let close = lines.last().map(|l| l[..l.len() - l.trim_start().len()].to_string()).unwrap_or_default();
     let trailing = old.trim_end().trim_end_matches(']').trim_end().ends_with(',');
     let mut s = String::from("[\n");
-    for (n, it) in items.iter().enumerate() {
+    for (n, it) in texts.iter().enumerate() {
         s.push_str(&indent);
-        s.push_str(&quote_like(it));
+        s.push_str(it);
         if n + 1 < items.len() || trailing {
             s.push(',');
         }
@@ -692,10 +719,10 @@ pub fn set(format: Format, text: &str, field: &Field, new: &Value) -> anyhow::Re
     let lit = match new {
         Value::Scalar(s) => scalar_text(format, s, old),
         Value::List { items, .. } => {
-            if !matches!(&field.value, Value::List { editable: true, .. }) {
-                bail!("{} can only be edited as text", field.key);
-            }
-            list_text(format, items, old)
+            let Value::List { items: was, editable: true } = &field.value else { bail!("{} can only be edited as text", field.key) };
+            let lexemes: Vec<&str> = field.item_spans.iter().filter_map(|s| text.get(s.clone())).collect();
+            let kept: Vec<(&Scalar, &str)> = if lexemes.len() == was.len() { was.iter().zip(lexemes).collect() } else { Vec::new() };
+            list_text(format, items, old, &kept)
         }
         Value::Other(_) => bail!("{} can only be edited as text", field.key),
     };
@@ -703,7 +730,27 @@ pub fn set(format: Format, text: &str, field: &Field, new: &Value) -> anyhow::Re
     out.push_str(&text[..field.span.start]);
     out.push_str(&lit);
     out.push_str(&text[field.span.end..]);
+    check(format, &out, field, new)?;
     Ok(out)
+}
+
+/// That `text` still parses and reads `new` back where `field` was: a value written wrongly (a
+/// character a TOML literal string can't hold, a number rounded on the way) is refused, not saved.
+fn check(format: Format, text: &str, field: &Field, new: &Value) -> anyhow::Result<()> {
+    if !matches!(format, Format::Toml | Format::Json | Format::Json5) {
+        return Ok(());
+    }
+    let doc = parse(format, text).map_err(|e| anyhow::anyhow!("{} can't be written that way ({e}); edit it as text", field.key))?;
+    let back = doc.fields.iter().find(|f| f.span.start == field.span.start && f.key == field.key).map(|f| &f.value);
+    let ok = match (new, back) {
+        (Value::Scalar(a), Some(Value::Scalar(b))) => same(a, b),
+        (Value::List { items: a, .. }, Some(Value::List { items: b, .. })) => a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(a, b)),
+        _ => false,
+    };
+    if !ok {
+        bail!("{} can't be written that way; edit it as text", field.key);
+    }
+    Ok(())
 }
 
 // -- JSON / JSON5 ---------------------------------------------------------------
@@ -719,6 +766,17 @@ mod json {
         Array(Vec<Node>, Range<usize>),
         Scalar(Scalar, Range<usize>),
         Null(Range<usize>),
+        /// A value the fields can't hold exactly (an integer past `i64`): shown, edited only as text.
+        Raw(Range<usize>),
+    }
+
+    impl Node {
+        fn span(&self) -> Option<Range<usize>> {
+            match self {
+                Node::Object(_) => None,
+                Node::Array(_, s) | Node::Scalar(_, s) | Node::Null(s) | Node::Raw(s) => Some(s.clone()),
+            }
+        }
     }
 
     struct Member {
@@ -825,7 +883,10 @@ mod json {
                         "true" => Node::Scalar(Scalar::Bool(true), start..word_end),
                         "false" => Node::Scalar(Scalar::Bool(false), start..word_end),
                         "null" => Node::Null(start..word_end),
-                        w => Node::Scalar(num(w).ok_or_else(|| error_at(self.s, start, format!("{w:?} isn't a value")))?, start..word_end),
+                        w => match num(w).ok_or_else(|| error_at(self.s, start, format!("{w:?} isn't a value")))? {
+                            Some(n) => Node::Scalar(n, start..word_end),
+                            None => Node::Raw(start..word_end),
+                        },
                     };
                     self.i = word_end;
                     Ok(node)
@@ -943,7 +1004,9 @@ mod json {
         }
     }
 
-    fn num(w: &str) -> Option<Scalar> {
+    /// A number's value: `None` if `w` isn't a number, `Some(None)` if it is one the fields can't hold
+    /// exactly (an integer past `i64`, a finite number past `f64`), so it isn't rounded on its way back.
+    fn num(w: &str) -> Option<Option<Scalar>> {
         let (neg, body) = match w.as_bytes().first() {
             Some(b'-') => (true, &w[1..]),
             Some(b'+') => (false, &w[1..]),
@@ -951,24 +1014,28 @@ mod json {
         };
         let sign = if neg { -1.0 } else { 1.0 };
         match body {
-            "Infinity" => return Some(Scalar::Float(sign * f64::INFINITY)),
-            "NaN" => return Some(Scalar::Float(f64::NAN)),
+            "Infinity" => return Some(Some(Scalar::Float(sign * f64::INFINITY))),
+            "NaN" => return Some(Some(Scalar::Float(f64::NAN))),
             _ => {}
         }
         if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            let v = i64::from_str_radix(hex, 16).ok()?;
-            return Some(Scalar::Int(if neg { -v } else { v }));
+            if hex.is_empty() || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
+            let v = i128::from_str_radix(hex, 16).ok().map(|v| if neg { -v } else { v });
+            return Some(v.and_then(|v| i64::try_from(v).ok()).map(Scalar::Int));
         }
         if !body.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
             return None;
         }
-        if !body.contains(['.', 'e', 'E'])
-            && let Ok(i) = w.trim_start_matches('+').parse::<i64>()
-        {
-            return Some(Scalar::Int(i));
+        if !body.contains(['.', 'e', 'E']) {
+            if !body.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            return Some(w.trim_start_matches('+').parse::<i64>().ok().map(Scalar::Int));
         }
         let f: f64 = body.parse().ok().or_else(|| format!("{body}0").parse().ok())?;
-        Some(Scalar::Float(sign * f))
+        Some(f.is_finite().then_some(Scalar::Float(sign * f)))
     }
 
     pub(super) fn doc(text: &str) -> Result<Doc, ParseError> {
@@ -991,6 +1058,7 @@ mod json {
         for m in members {
             let comment = clean_comment(&m.comment);
             let (doc, hint) = read_hint(&comment);
+            let mut item_spans = Vec::new();
             let (value, span) = match m.value {
                 Node::Object(inner) => {
                     subs.push((m.key, comment, inner));
@@ -998,7 +1066,9 @@ mod json {
                 }
                 Node::Scalar(s, span) => (Value::Scalar(s), span),
                 Node::Null(span) => (Value::Other("null".into()), span),
+                Node::Raw(span) => (Value::Other(text[span.clone()].to_string()), span),
                 Node::Array(items, span) => {
+                    item_spans = items.iter().filter_map(Node::span).collect();
                     let all = items.len();
                     let scalars: Vec<Scalar> = items.into_iter().filter_map(|n| if let Node::Scalar(s, _) = n { Some(s) } else { None }).collect();
                     let editable = scalars.len() == all && !has_comment(Format::Json5, &text[span.clone()]);
@@ -1009,7 +1079,7 @@ mod json {
                     }
                 }
             };
-            out.fields.push(Field { section: path.clone(), key: m.key, label: None, value, span, doc, hint });
+            out.fields.push(Field { section: path.clone(), key: m.key, label: None, value, span, item_spans, doc, hint });
         }
         // Objects inside become sections, after this one's own keys, as in TOML.
         for (key, comment, inner) in subs {
@@ -1112,6 +1182,34 @@ mod tests {
             .replace("\"a \\\"quoted\\\" \\u00e9\"", "\"new \\\"one\\\"\\n\"");
         assert_eq!(t, want);
         assert!(parse(Format::Json5, &t).is_ok());
+    }
+
+    /// Editing one item of a list leaves the others' text alone, and a number the fields can't hold
+    /// exactly (past `i64`) is shown as text, never rounded through a float.
+    #[test]
+    fn untouched_list_items_keep_their_exact_text() {
+        let text = r#"{"values": [18446744073709551615, 1], "seed": 18446744073709551615, "mask": 0xFFFFFFFFFFFFFFFF, "odd": [0x10, 1.50, -0, '\x41', 2]}"#;
+        let d = parse(Format::Json5, text).unwrap();
+        // The big integers aren't numbers the fields could write back: text only, and so is their list.
+        assert_eq!(field(&d, "seed").value, Value::Other("18446744073709551615".into()));
+        assert_eq!(field(&d, "mask").value, Value::Other("0xFFFFFFFFFFFFFFFF".into()));
+        assert!(matches!(field(&d, "values").value, Value::Other(_)));
+        assert!(set(Format::Json5, text, field(&d, "values"), &Value::List { items: vec![Scalar::Int(1), Scalar::Int(2)], editable: true }).is_err());
+        // Changing the last item keeps every other item's own text.
+        let Value::List { items, .. } = &field(&d, "odd").value else { panic!() };
+        let mut items = items.clone();
+        *items.last_mut().unwrap() = Scalar::Int(3);
+        let t = set(Format::Json5, text, field(&d, "odd"), &Value::List { items: items.clone(), editable: true }).unwrap();
+        assert_eq!(t, text.replace(r"'\x41', 2]", r"'\x41', 3]"));
+        // Taking one out keeps the rest as written.
+        items.remove(1);
+        let t = set(Format::Json5, text, field(&d, "odd"), &Value::List { items, editable: true }).unwrap();
+        assert_eq!(t, text.replace("[0x10, 1.50, -0, ", "[0x10, -0, ").replace(", 2]", ", 3]"));
+        // In TOML too: hex, underscores and literal strings stay as they were.
+        let toml = "a = [0x10, 1_000, 'x\\y', 4]\n";
+        let d = parse(Format::Toml, toml).unwrap();
+        let t = set(Format::Toml, toml, field(&d, "a"), &Value::List { items: vec![Scalar::Int(16), Scalar::Int(1000), Scalar::Str("x\\y".into()), Scalar::Int(5)], editable: true }).unwrap();
+        assert_eq!(t, "a = [0x10, 1_000, 'x\\y', 5]\n");
     }
 
     #[test]

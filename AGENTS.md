@@ -214,7 +214,10 @@ test (and a rule here) with any fix that sets a new one.
   a_lock_file_deleted_by_its_holder_still_excludes}`,
   `ui::content::tests::a_rollback_offers_the_worlds_played_with_newer_mods`, `ui::worlds::tests`.
 - **Config editor:** an edit replaces only the value's own bytes (`mod_config::set`), so comments, layout and key
-  order survive. Never re-serialize a config file. `mod_config::save` refuses when the file on disk isn't what was
+  order survive. Never re-serialize a config file. A list edit writes only new or changed items afresh; the others keep
+  their exact text (`0x10`, `1_000`), and a number the fields can't hold exactly (an integer past `i64`) is text only,
+  never rounded through a float. Every structured edit is parsed back and must read the intended value
+  (`mod_config::check`), else it's refused. `mod_config::save` refuses when the file on disk isn't what was
   loaded (the game rewrites configs), unless the user chooses to keep their changes. Only files that resolve inside
   `config/` open (`mod_config::resolve`), up to `MAX_OPEN` (1 MiB). Leaving a file, tab, instance or the app with
   unsaved changes asks first (`config::guard`), and play refuses while the instance has unsaved config changes.
@@ -235,7 +238,7 @@ test (and a rule here) with any fix that sets a new one.
   Widgets must not change a value just by drawing it: sliders use `SliderClamping::Edits`, `DragValue` uses
   `clamp_existing_to_range(false)`, and nothing rounds. Tests: `mod_config::tests` (incl.
   `toml_edits_round_trip_byte_for_byte`, `json5_edits_round_trip_byte_for_byte`, `only_files_inside_config_open`,
-  `a_file_changed_on_disk_is_not_overwritten`), `ui::config::tests`.
+  `a_file_changed_on_disk_is_not_overwritten`, `untouched_list_items_keep_their_exact_text`), `ui::config::tests`.
 - **Mod sets:** live in `mod_sets.toml` beside `instance.toml`, never in it, and aren't exported. A set names mods by
   `mod_sets::key`: the jar's own id, else `file:` and the file name without its version, so updates keep membership.
   Switching only renames (`.disabled`), runs as a mod job, and is refused while the game starts or runs, mods install
