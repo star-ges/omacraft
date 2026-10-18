@@ -188,14 +188,32 @@ pub fn hints(app: &App) -> Vec<(String, &'static str)> {
                 (InstTab::Version, false) if app.version.picker_open() => vec![(p(Down, Up), "versions"), (l(FocusRight), "loader"), (lt, "loader type"), (l(Activate), "apply"), (l(Back), "cancel")],
                 (InstTab::Version, true) => vec![(p(Down, Up), "loader versions"), (lt, "loader type"), (l(Activate), "apply"), (l(Back), "cancel")],
                 (InstTab::Version, _) => vec![(l(Activate), "change version")],
-                (InstTab::Log, _) => vec![(p(Down, Up), "scroll"), (l(Bottom), "follow"), (l(Search), "filter"), (l(Copy), "copy")],
+                (InstTab::Log, _) => {
+                    let mut v = vec![(p(Down, Up), "scroll"), (l(Bottom), "follow"), (l(Search), "filter"), (l(Copy), "copy")];
+                    if app.selected.as_ref().is_some_and(|id| app.logs.notices.contains_key(id)) {
+                        v.insert(0, (l(Why), "why it crashed"));
+                    }
+                    v
+                }
                 (InstTab::Notes, _) => vec![(l(Activate), "write"), ("esc".into(), "stop writing")],
                 (InstTab::Worlds, false) => vec![(p(Down, Up), "worlds"), (l(Activate), "play world"), (l(Rename), "rename"), (l(Duplicate), "duplicate"), (l(Add), "back up"), (l(Delete), "delete"), (l(FocusRight), "backups")],
                 (InstTab::Worlds, true) => vec![(p(Down, Up), "backups"), (l(Activate), "restore"), (l(Add), "back up now"), (l(Delete), "delete"), (l(Folder), "folder")],
                 (InstTab::Servers, _) => vec![(p(Down, Up), "servers"), (l(Activate), "join"), (l(Add), "add"), (l(Edit), "edit"), (p(MoveDown, MoveUp), "reorder"), (l(Delete), "remove")],
                 (InstTab::Screenshots, _) => vec![(p(Down, Up), "screenshots"), (l(Activate), "open"), (l(Copy), "copy"), (l(Delete), "delete"), (l(Folder), "folder"), (l(Toggle), "all instances")],
-                (InstTab::LogHistory, false) => vec![(p(Down, Up), "files"), (l(FocusRight), "read"), (l(Activate), "open"), (l(Folder), "folder")],
-                (InstTab::LogHistory, true) => vec![(p(Down, Up), "scroll"), (l(Search), "filter"), (l(Copy), "copy")],
+                (InstTab::LogHistory, true) if app.logs.panel_focused() => {
+                    vec![(p(Down, Up), "suspects"), (l(Activate), "show in log"), (l(Toggle), "disable/enable"), (l(Copy), "copy summary"), (l(Why), "back to the log")]
+                }
+                (InstTab::LogHistory, side) => {
+                    let mut v = if side {
+                        vec![(p(Down, Up), "scroll"), (l(Search), "filter"), (l(Copy), "copy")]
+                    } else {
+                        vec![(p(Down, Up), "files"), (l(FocusRight), "read"), (l(Activate), "open"), (l(Folder), "folder")]
+                    };
+                    if app.logs.analysis().is_some() {
+                        v.insert(0, (l(Why), "why it crashed"));
+                    }
+                    v
+                }
                 (InstTab::Mods, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(Update), "updates"), (l(RollBack), "roll back"), (l(FocusRight), "modrinth"), (l(Search), "search")],
                 (_, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(FocusRight), "modrinth"), (l(Search), "search")],
                 (_, true) => vec![(p(Down, Up), "results"), (l(Activate), "install"), (l(Search), "search")],

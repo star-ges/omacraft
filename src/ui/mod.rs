@@ -333,6 +333,8 @@ impl App {
             self.tab = Tab::Accounts;
             return;
         };
+        // A new run: the last one's crash notice is old news.
+        self.logs.notices.remove(id);
         if self.selected.as_deref() == Some(id) {
             self.inst_tab = InstTab::Log;
         }
@@ -414,6 +416,7 @@ impl App {
                 Phase::Game(p) => {
                     let Some(r) = p.take() else { continue };
                     s.phase = Phase::Ended;
+                    let lines: Vec<String> = s.log.lock().unwrap().lines.iter().map(|l| l.text.clone()).collect();
                     // The launch may have finished a share set change, and recorded worlds.
                     ended = true;
                     match r {
@@ -424,14 +427,10 @@ impl App {
                                 let _ = inst.save();
                             }
                             instance::sort(&mut self.instances);
-                            if let Err(e) = &res.exit
-                                && e.as_str() != "killed by signal"
-                            {
-                                self.toast(ToastKind::Error, format!("Minecraft {e}"));
-                            } else if let Ok(c) = res.exit
-                                && c != 0
-                            {
-                                self.toast(ToastKind::Error, format!("Minecraft exited with code {c} — see the log"));
+                            // A crash report since it started, or a failed exit: find out why.
+                            if let Some(inst) = self.instances.iter().find(|i| i.id == id).cloned() {
+                                let started = std::time::SystemTime::now() - res.played - Duration::from_secs(5);
+                                self.logs.watch_exit(&self.rt, ctx, &inst, self.cfg.default_memory_mb, started, res.exit.clone(), lines);
                             }
                         }
                         Err(e) => {
@@ -444,6 +443,7 @@ impl App {
                 Phase::Ended => {}
             }
         }
+        logs::poll_crashes(self);
         if ended {
             self.refresh_shares();
             self.worlds.invalidate();
@@ -799,7 +799,7 @@ impl App {
         let mut cands = vec![Help, TabInstances, TabAccounts, TabSettings, Play, New, Import, Export, Groups];
         match self.tab {
             Tab::Instances => {
-                cands.extend([FocusLeft, FocusRight, PrevTab, NextTab, Back, ModsTab, LoaderType, Update, UpdateOne, RollBack]);
+                cands.extend([FocusLeft, FocusRight, PrevTab, NextTab, Back, ModsTab, LoaderType, Update, UpdateOne, RollBack, Why]);
                 cands.extend(nav::PANE_ACTIONS);
             }
             Tab::Accounts => cands.extend([Microsoft, Down, Up, Top, Bottom, Activate, Delete, Add, TurnLeft, TurnRight, UploadSkin, Toggle, Cycle, Back]),
@@ -849,6 +849,11 @@ impl App {
             Action::Update | Action::UpdateOne | Action::RollBack => {
                 if self.inst_tab == InstTab::Mods {
                     self.content.key = Some(a);
+                }
+            }
+            Action::Why => {
+                if matches!(self.inst_tab, InstTab::Log | InstTab::LogHistory) {
+                    self.logs.key = Some(a);
                 }
             }
             Action::FocusLeft => {

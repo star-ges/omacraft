@@ -702,7 +702,11 @@ pub async fn launch(
     .unwrap_or_default();
 
     let exit = match status {
-        Ok(s) => s.code().ok_or_else(|| "killed by signal".to_string()),
+        // Stopped by the user (or the system) vs. a JVM that crashed itself (SIGABRT, SIGSEGV).
+        Ok(s) => s.code().ok_or_else(|| match std::os::unix::process::ExitStatusExt::signal(&s) {
+            Some(n) if n != libc::SIGKILL && n != libc::SIGTERM && n != libc::SIGINT => format!("crashed (signal {n})"),
+            _ => "killed by signal".to_string(),
+        }),
         Err(e) => Err(e.to_string()),
     };
     {

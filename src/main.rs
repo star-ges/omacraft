@@ -3,6 +3,7 @@ mod backups;
 mod cli;
 mod config;
 mod content_meta;
+mod crash;
 mod export;
 mod fsutil;
 mod groups;
