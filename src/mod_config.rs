@@ -623,6 +623,13 @@ fn escape(s: &str, json: bool) -> String {
     out
 }
 
+/// Whether `c` can stand as itself inside single quotes: a TOML literal string has no escapes and
+/// takes no control character but tab; JSON5 needs no backslash or line ending there either.
+fn literal_ok(format: Format, c: char) -> bool {
+    let control = (c < ' ' && c != '\t') || c == '\u{7f}';
+    !control && c != '\'' && (format == Format::Toml || !matches!(c, '\\' | '\u{2028}' | '\u{2029}'))
+}
+
 /// A value's text, in the style of `old` (the text it replaces) where that's free:
 /// single quotes stay single, floats stay floats.
 pub fn scalar_text(format: Format, s: &Scalar, old: &str) -> String {
@@ -644,7 +651,7 @@ pub fn scalar_text(format: Format, s: &Scalar, old: &str) -> String {
         }
         Scalar::Str(v) => {
             let single = old.starts_with('\'') && !old.starts_with("'''") && format != Format::Json;
-            if single && !v.contains(['\'', '\n', '\r']) && (format == Format::Toml || !v.contains('\\')) {
+            if single && v.chars().all(|c| literal_ok(format, c)) {
                 format!("'{v}'")
             } else {
                 format!("\"{}\"", escape(v, format != Format::Toml))
@@ -1269,6 +1276,31 @@ mod tests {
         // Changing one item of a list of strings keeps the other's meaning.
         let t = set(Format::Json5, text, field(&d, "list"), &Value::List { items: vec![Scalar::Str("A".into()), Scalar::Str("c".into())], editable: true }).unwrap();
         assert_eq!(field(&parse(Format::Json5, &t).unwrap(), "list").value, Value::List { items: vec![Scalar::Str("A".into()), Scalar::Str("c".into())], editable: true });
+    }
+
+    /// Single quotes stay only when every character may stand there; anything else (DEL, a control
+    /// character) goes in an escaped double-quoted string, so the file stays valid TOML.
+    #[test]
+    fn literal_strings_take_only_what_they_can_hold() {
+        let text = "value = 'a'\n";
+        let d = parse(Format::Toml, text).unwrap();
+        for v in ["a\u{7f}b", "a\u{1}b", "a\u{1f}", "tab\there", "it's", "back\\slash", "new\nline"] {
+            let t = set(Format::Toml, text, field(&d, "value"), &Value::Scalar(Scalar::Str(v.into()))).unwrap_or_else(|e| panic!("{v:?}: {e}"));
+            let back: toml::Table = toml::from_str(&t).unwrap_or_else(|e| panic!("{v:?} wrote {t:?}: {e}"));
+            assert_eq!(back["value"].as_str(), Some(v));
+        }
+        let t = set(Format::Toml, text, field(&d, "value"), &Value::Scalar(Scalar::Str("tab\there".into()))).unwrap();
+        assert_eq!(t, "value = 'tab\there'\n");
+        let t = set(Format::Toml, text, field(&d, "value"), &Value::Scalar(Scalar::Str("a\u{7f}".into()))).unwrap();
+        assert_eq!(t, "value = \"a\\u007F\"\n");
+        // JSON5's single quotes likewise.
+        let text = "{value: 'a'}";
+        let d = parse(Format::Json5, text).unwrap();
+        for v in ["a\u{7f}b", "a\u{1}b", "back\\slash", "a\u{2028}b"] {
+            let t = set(Format::Json5, text, field(&d, "value"), &Value::Scalar(Scalar::Str(v.into()))).unwrap();
+            assert!(t.starts_with("{value: \""), "{t:?}");
+            assert_eq!(field(&parse(Format::Json5, &t).unwrap(), "value").value, Value::Scalar(Scalar::Str(v.into())));
+        }
     }
 
     #[test]

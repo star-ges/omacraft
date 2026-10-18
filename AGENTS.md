@@ -219,7 +219,9 @@ test (and a rule here) with any fix that sets a new one.
   never rounded through a float. Every structured edit is parsed back and must read the intended value
   (`mod_config::check`), else it's refused. JSON5 strings decode every escape (`\xHH`, a backslash before LF, CR,
   CRLF, U+2028 or U+2029); one a Rust string can't hold (a lone surrogate) or JSON5 forbids (`\1`) is text only.
-  `mod_config::save` refuses when the file on disk isn't what was
+  Single quotes are kept only when every character may stand there unescaped (`literal_ok`: no control character
+  but tab, no DEL); otherwise the value is written as an escaped double-quoted string. `mod_config::save` refuses
+  when the file on disk isn't what was
   loaded (the game rewrites configs), unless the user chooses to keep their changes. Only files that resolve inside
   `config/` open (`mod_config::resolve`), up to `MAX_OPEN` (1 MiB). Leaving a file, tab, instance or the app with
   unsaved changes asks first (`config::guard`), and play refuses while the instance has unsaved config changes.
@@ -241,7 +243,7 @@ test (and a rule here) with any fix that sets a new one.
   `clamp_existing_to_range(false)`, and nothing rounds. Tests: `mod_config::tests` (incl.
   `toml_edits_round_trip_byte_for_byte`, `json5_edits_round_trip_byte_for_byte`, `only_files_inside_config_open`,
   `a_file_changed_on_disk_is_not_overwritten`, `untouched_list_items_keep_their_exact_text`,
-  `json5_strings_decode_every_escape`), `ui::config::tests`.
+  `json5_strings_decode_every_escape`, `literal_strings_take_only_what_they_can_hold`), `ui::config::tests`.
 - **Mod sets:** live in `mod_sets.toml` beside `instance.toml`, never in it, and aren't exported. A set names mods by
   `mod_sets::key`: the jar's own id, else `file:` and the file name without its version, so updates keep membership.
   Switching only renames (`.disabled`), runs as a mod job, and is refused while the game starts or runs, mods install
