@@ -56,21 +56,36 @@ fn lock_file(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(path)
 }
 
-/// Take the lock at `path`, waiting for whoever holds it. Never delete a lock file
-/// someone may hold: the next one would lock a new file.
+/// Whether the locked `f` is still the file at `path`: whoever held it may have deleted
+/// it (only ever with the lock held), and a lock on the unlinked file excludes no one.
+fn still_there(f: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let held = f.metadata()?;
+    Ok(std::fs::metadata(path).is_ok_and(|m| m.ino() == held.ino() && m.dev() == held.dev()))
+}
+
+/// Take the lock at `path`, waiting for whoever holds it. Delete a lock file only while
+/// holding it: everyone else then finds it gone and locks the new one.
 pub fn lock(path: &Path) -> std::io::Result<FileLock> {
-    let f = lock_file(path)?;
-    f.lock()?;
-    Ok(FileLock(f))
+    loop {
+        let f = lock_file(path)?;
+        f.lock()?;
+        if still_there(&f, path)? {
+            return Ok(FileLock(f));
+        }
+    }
 }
 
 /// Take the lock at `path` if nobody holds it.
 pub fn try_lock(path: &Path) -> std::io::Result<Option<FileLock>> {
-    let f = lock_file(path)?;
-    match f.try_lock() {
-        Ok(()) => Ok(Some(FileLock(f))),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    loop {
+        let f = lock_file(path)?;
+        match f.try_lock() {
+            Ok(()) if still_there(&f, path)? => return Ok(Some(FileLock(f))),
+            Ok(()) => continue,
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
     }
 }
 
@@ -469,6 +484,26 @@ pub(crate) mod tests {
         let p = path.clone();
         assert!(std::thread::spawn(move || try_lock(&p).unwrap().is_none()).join().unwrap());
         drop(held);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_lock_file_deleted_by_its_holder_still_excludes() {
+        let d = scratch();
+        let path = d.join(".lock");
+        let held = lock(&path).unwrap();
+        // Someone opened the old file and waits on it while the holder deletes it.
+        let p = path.clone();
+        let waiter = std::thread::spawn(move || lock(&p).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::remove_file(&path).unwrap();
+        let newcomer = try_lock(&path).unwrap().expect("nobody holds the new file yet");
+        drop(held);
+        // The waiter got the old, unlinked file: it must notice and queue on the new one.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "two holders at once");
+        drop(newcomer);
+        drop(waiter.join().unwrap());
         std::fs::remove_dir_all(d).unwrap();
     }
 

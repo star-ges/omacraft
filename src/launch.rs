@@ -566,7 +566,7 @@ async fn start(
     log: &SharedLog,
     quick: Option<&QuickPlay>,
     features: &Features,
-) -> anyhow::Result<tokio::process::Child> {
+) -> anyhow::Result<(tokio::process::Child, crate::world_sets::Loadout)> {
     let prepared = prepare(task, inst, cfg, features).await?;
     std::fs::create_dir_all(inst.game_dir())?;
     // Catches instances created or imported since sharing was set up, and settings
@@ -581,9 +581,11 @@ async fn start(
         });
     }
     // A restore or mod rollback a crash cut short is finished first, so no world or
-    // mods folder is missing when the game starts.
+    // mods folder is missing when the game starts. It waits for backup jobs elsewhere,
+    // and anything it can't put right stops the launch.
+    task.stage("Checking backups", 0);
     let i = inst.clone();
-    let recovered = tokio::task::spawn_blocking(move || crate::backups::recover(&i)).await?;
+    tokio::task::spawn_blocking(move || crate::backups::recover(&i)).await?.context("a restore or rollback was left unfinished; the game wasn't started")?;
     // Worlds may have been played with mods this one lacks: in another instance of its
     // world set, or here before a mod rollback.
     task.stage("Checking worlds", 0);
@@ -601,7 +603,7 @@ async fn start(
             Ok(notes) => notes.iter().for_each(|n| l.push(LogLevel::Warn, n.clone())),
             Err(e) => l.push(LogLevel::Warn, format!("shared folders: {e:#}")),
         }
-        recovered.into_iter().chain(worlds).for_each(|n| l.push(LogLevel::Warn, n));
+        worlds.into_iter().for_each(|n| l.push(LogLevel::Warn, n));
         match quick {
             Some(QuickPlay::World(w)) if supports_quick_play(&prepared.version) => l.push(LogLevel::Launcher, format!("opening world {w}")),
             Some(QuickPlay::World(_)) => l.push(LogLevel::Warn, "this version can't open a world on launch; pick it from the menu"),
@@ -613,15 +615,21 @@ async fn start(
         l.push(LogLevel::Launcher, format!("args {}", shown.join(" ")));
     }
 
+    // The mods the game will load, read before it starts: the records written when it
+    // exits describe these, not whatever the mods folder holds by then.
+    let i = inst.clone();
+    let loadout = tokio::task::spawn_blocking(move || crate::world_sets::Loadout::of(&i)).await?;
+
     task.stage("Starting game", 0);
-    tokio::process::Command::new(&prepared.java)
+    let child = tokio::process::Command::new(&prepared.java)
         .args(&args)
         .current_dir(inst.game_dir())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(false)
         .spawn()
-        .with_context(|| format!("starting {}", prepared.java.display()))
+        .with_context(|| format!("starting {}", prepared.java.display()))?;
+    Ok((child, loadout))
 }
 
 /// Prepare, spawn, and wait for the game. Output streams into `log`.
@@ -640,7 +648,7 @@ pub async fn launch(
         quick_play_multiplayer: matches!(quick, Some(QuickPlay::Server(_))),
     };
     log.lock().unwrap().set_secret(&token);
-    let mut child = match start(&task, &inst, &cfg, &account, &token, &log, quick.as_ref(), &features).await {
+    let (mut child, loadout) = match start(&task, &inst, &cfg, &account, &token, &log, quick.as_ref(), &features).await {
         Ok(c) => c,
         Err(e) => {
             // Leave nothing waiting on a game that never started.
@@ -653,12 +661,6 @@ pub async fn launch(
     log.lock().unwrap().pid = child.id();
     task.finish(&Ok(()));
     let started = Instant::now();
-    // The mods the game loads, read as it starts: the records written when it exits
-    // describe these, not whatever the mods folder holds by then.
-    let loadout = {
-        let i = inst.clone();
-        tokio::task::spawn_blocking(move || crate::world_sets::Loadout::of(&i))
-    };
 
     let pump = |r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, stderr: bool, log: SharedLog| {
         tokio::spawn(async move {
@@ -687,10 +689,9 @@ pub async fn launch(
     };
     let _ = tokio::join!(a, b);
     let (i, keep) = (inst.clone(), cfg.backups_keep);
-    let loadout = loadout.await.ok();
     let (played, failed) = tokio::task::spawn_blocking(move || {
         let plays = watch.played();
-        let mut failed = crate::world_sets::record_plays(&loadout.unwrap_or_else(|| crate::world_sets::Loadout::of(&i)), &plays);
+        let mut failed = crate::world_sets::record_plays(&loadout, &plays);
         let played: Vec<std::path::PathBuf> = plays.into_iter().map(|(w, _)| w).collect();
         for w in &played {
             failed.extend(crate::backups::after_play(w, crate::backups::Owner::of(&i), &i.name, keep));

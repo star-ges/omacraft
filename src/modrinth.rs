@@ -436,13 +436,16 @@ pub(crate) fn back_up_for_update(inst: &Instance, reason: &str, keep: u32) -> an
     Ok(())
 }
 
-/// Where `u`'s file is now and whether it's enabled: it may have been enabled or
-/// disabled since the check. Fails if it's gone or isn't the file that was checked.
+/// Where `u`'s file is now and whether it's enabled: the very file that was checked if
+/// it's still there, else the same file enabled or disabled since. Fails if it's gone
+/// or isn't the file that was checked.
 fn locate(u: &Update) -> anyhow::Result<(PathBuf, bool)> {
     let name = u.path.file_name().context("no file name")?.to_string_lossy();
     let base = name.trim_end_matches(".disabled");
     let dir = u.path.parent().context("no folder")?;
-    [(dir.join(base), true), (dir.join(format!("{base}.disabled")), false)]
+    let (on, off) = ((dir.join(base), true), (dir.join(format!("{base}.disabled")), false));
+    let order = if u.path == off.0 { [off, on] } else { [on, off] };
+    order
         .into_iter()
         .find(|(p, _)| net::sha1_file(p).is_some_and(|h| h.eq_ignore_ascii_case(&u.sha1)))
         .with_context(|| format!("{} changed since the update check; check again", u.title))
@@ -468,6 +471,14 @@ pub async fn update(inst: &Instance, updates: Vec<Update>, keep: u32, task: &Tas
             bail!("{}: odd file name {:?}", u.title, file.filename);
         }
         files.push(file.clone());
+    }
+    // Each update replaces its own file with its own new one: two entries for one file
+    // (copies of a jar, enabled and not), or two landing on one name, would undo each other.
+    let dests: Vec<PathBuf> = files.iter().zip(&at).map(|(f, (_, on))| dir.join(if *on { f.filename.clone() } else { format!("{}.disabled", f.filename) })).collect();
+    for (i, u) in updates.iter().enumerate() {
+        if let Some(j) = (0..i).find(|&j| at[j].0 == at[i].0 || dests[j] == dests[i]) {
+            bail!("{} and {} are the same file, or would be once updated; remove one copy and check again", updates[j].title, u.title);
+        }
     }
 
     // The new versions may need mods the old ones didn't, pinned ones at their version.
@@ -495,9 +506,8 @@ pub async fn update(inst: &Instance, updates: Vec<Update>, keep: u32, task: &Tas
     tokio::task::spawn_blocking(move || back_up_for_update(&i, &reason, keep)).await?.context("backing up first; nothing was updated")?;
 
     let mut out = Updated { missing, ..Default::default() };
-    for ((u, file), (path, enabled)) in updates.iter().zip(&files).zip(&at) {
+    for (((u, file), (path, _)), dest) in updates.iter().zip(&files).zip(&at).zip(dests) {
         task.stage(format!("Updating {}", u.title), 0);
-        let dest = dir.join(if *enabled { file.filename.clone() } else { format!("{}.disabled", file.filename) });
         store::fetch(&Download { url: file.url.clone(), path: dest.clone(), sha1: Some(file.hashes.sha1.clone()), size: Some(file.size) })
             .await
             .with_context(|| format!("updating {} (roll back to undo the updates so far)", u.title))?;
@@ -689,7 +699,7 @@ mod tests {
         assert!(crate::backups::instance_snapshots(&inst.id).is_empty(), "the mods snapshot comes after the worlds'");
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::remove_dir_all(inst.dir()).unwrap();
-        crate::backups::forget_instance(&inst.id);
+        crate::backups::forget_instance(&inst.id).unwrap();
     }
 
     /// G18: an update's dependencies keep their pins: an installed other version is
@@ -759,10 +769,27 @@ mod tests {
         // Disabled since the check: updated, and still disabled.
         std::fs::write(mods.join("a-1.jar"), "a1").unwrap();
         std::fs::rename(mods.join("a-1.jar"), mods.join("a-1.jar.disabled")).unwrap();
-        update(&inst, vec![up], 5, &Task::new("t")).await.unwrap();
+        update(&inst, vec![up.clone()], 5, &Task::new("t")).await.unwrap();
         assert_eq!(mod_names(&mods), ["a-2.jar.disabled"]);
+
+        // Identical enabled and disabled copies: updating the disabled one replaces that
+        // one, not its enabled twin.
+        std::fs::remove_file(mods.join("a-2.jar.disabled")).unwrap();
+        std::fs::write(mods.join("a-1.jar"), "a1").unwrap();
+        std::fs::write(mods.join("a-1.jar.disabled"), "a1").unwrap();
+        let off = Update { path: mods.join("a-1.jar.disabled"), ..up.clone() };
+        in_store("a2");
+        update(&inst, vec![off.clone()], 5, &Task::new("t")).await.unwrap();
+        assert_eq!(mod_names(&mods), ["a-1.jar", "a-2.jar.disabled"]);
+        // Two entries that end up at one file stop before anything changes.
+        std::fs::remove_file(mods.join("a-2.jar.disabled")).unwrap();
+        std::fs::write(mods.join("a-1.jar.disabled"), "a1").unwrap();
+        std::fs::remove_file(mods.join("a-1.jar")).unwrap();
+        let err = update(&inst, vec![up.clone(), off], 5, &Task::new("t")).await.unwrap_err();
+        assert!(format!("{err:#}").contains("same file"), "{err:#}");
+        assert_eq!(mod_names(&mods), ["a-1.jar.disabled"]);
         std::fs::remove_dir_all(inst.dir()).unwrap();
-        crate::backups::forget_instance(&inst.id);
+        crate::backups::forget_instance(&inst.id).unwrap();
     }
 
     /// Hits the network; run with `cargo test -- --ignored`.
@@ -794,7 +821,7 @@ mod tests {
         crate::backups::roll_back(&inst, &snap, 5).unwrap();
         assert!(path.exists());
         std::fs::remove_dir_all(inst.dir()).unwrap();
-        crate::backups::forget_instance(&inst.id);
+        crate::backups::forget_instance(&inst.id).unwrap();
     }
 
     /// Hits the network; run with `cargo test -- --ignored`.

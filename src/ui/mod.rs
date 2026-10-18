@@ -104,6 +104,12 @@ impl Session {
     pub fn running(&self) -> bool {
         !matches!(self.phase, Phase::Ended)
     }
+
+    /// Signing in or preparing, before Java starts: the mods are read for the play
+    /// records just before it does, so they mustn't change meanwhile.
+    pub fn starting(&self) -> bool {
+        self.running() && self.log.lock().unwrap().pid.is_none()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -982,12 +988,22 @@ impl App {
                     self.toast(ToastKind::Error, format!("Can't delete {name} while {why}"));
                     return;
                 }
+                // Its backups are locked first: a job in another Omacraft may be using them.
+                let backups = match crate::backups::lock_instance(id) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.toast(ToastKind::Error, format!("Can't delete {name} while a backup job is using {e:#}"));
+                        return;
+                    }
+                };
                 if let Err(e) = std::fs::remove_dir_all(inst.dir()) {
                     self.toast(ToastKind::Error, format!("Delete failed: {e}"));
                     return;
                 }
-                crate::backups::forget_instance(id);
-                self.toast(ToastKind::Info, format!("Deleted {name}"));
+                match backups.forget() {
+                    Ok(()) => self.toast(ToastKind::Info, format!("Deleted {name}")),
+                    Err(e) => self.toast(ToastKind::Error, format!("Deleted {name}, but not all its backups: {e:#}")),
+                }
                 self.instances.retain(|i| &i.id != id);
                 self.sessions.remove(id);
                 self.selected = self.visible_instances().first().map(|&n| self.instances[n].id.clone());

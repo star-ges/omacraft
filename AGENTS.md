@@ -97,13 +97,15 @@ test (and a rule here) with any fix that sets a new one.
   version or fail; `.mrpack` files are checked before the instance exists (HTTPS downloads, a valid SHA-1 per file).
 - **Mod updates:** `modrinth::check_updates` offers a file only if Modrinth's newest compatible build is newer *by date*
   than the installed one (a hand-installed beta isn't "updated" to an older release). Nothing is written until each
-  checked file is found again by SHA-1 (enabled or disabled, as it is now; a removed or replaced file stops the whole
-  update), the game still matches the one the list was checked for (`modrinth::game_key`), and the new versions'
+  checked file is found again by SHA-1 (the very path checked if it still matches, else the same file enabled or
+  disabled since; a removed or replaced file stops the whole update), no two entries share a file or a new name,
+  the game still matches the one the list was checked for (`modrinth::game_key`), and the new versions'
   required dependencies are resolved by `resolve`, the pinned resolver installs use. Then `back_up_for_update` backs
-  up every world no snapshot covers (`backups::cover_worlds`; any failure but a world open in a game stops the
-  update), and after that `mods` + `config`, so a rollback's cutoff comes after the update's world copies. An update
+  up every world no snapshot covers (`backups::cover_worlds`, which lists `saves` strictly: an unreadable folder
+  fails rather than looking empty; any failure but a world open in a game stops the update), and after that `mods` + `config`, so a rollback's cutoff comes after the update's world copies. An update
   keeps a disabled mod disabled. The mods tab offers only entries still valid for the files and game
   (`current_updates`) and doesn't switch or remove mods while a mod job runs. Tests:
+  `backups::tests::an_unreadable_saves_folder_fails_the_update_backups`,
   `modrinth::tests::{updates_only_go_forward, an_update_stops_if_a_world_cant_be_backed_up,
   an_update_follows_the_file_as_it_is_now, update_dependencies_keep_their_pins, finds_and_applies_updates}` (the last
   needs network), `ui::content::tests::found_updates_go_stale_with_the_game_or_the_file`.
@@ -112,7 +114,8 @@ test (and a rule here) with any fix that sets a new one.
   in (`worlds::saves_key`, followed through links), so instances sharing worlds, by setting or by a leftover link, wait
   for each other's backups, restores, duplicates and update backups (`worlds::jobs_on`). A launch waits while the
   instance's mods are being swapped, its worlds are copied or restored through any instance, or shared folders are
-  moving (`worlds::launch_blocked`). Tests: `ui::worlds::tests::jobs_on_shared_worlds_block_every_member`,
+  moving (`worlds::launch_blocked`). Mods aren't switched, removed or installed while a game starts
+  (`Session::starting`, until Java has a pid), since its play records are read then. Tests: `ui::worlds::tests::jobs_on_shared_worlds_block_every_member`,
   `ui::content::tests::every_mod_job_stays_tracked_until_it_ends`.
 - **Content installs:** `modrinth::plan` works out the whole set before downloading. Pins beat the
   newest build, installed files count by Modrinth project (hash lookup) as well as filename, and required
@@ -164,7 +167,7 @@ test (and a rule here) with any fix that sets a new one.
   new version only once the instance's saves no longer link into the set (`version::after_sharing`); a failed leave
   keeps it in the set on its old version, and a launch refuses while saves link into a world set the instance isn't in
   (`shares::check_world_link`). When a game exits, each world it played gets an `omacraft.toml` of what the game
-  started with (`world_sets::Loadout`, read as it starts: instance, version, loader, and every mod the enabled jars
+  started with (`world_sets::Loadout`, read just before Java is spawned: instance, version, loader, and every mod the enabled jars
   declare, from `world_sets::mod_inventory`: all of Forge's `[[mods]]` and `mcmod.info`'s entries, and nested jars
   (Fabric/Quilt `jars`, Forge jarjar, 4 deep, capped), unlike `content_meta`'s one-name-per-file display metadata).
   A world counts as played if this game's pid held its `session.lock` (polled with `F_GETLK` every 3 s; Java's
@@ -187,14 +190,20 @@ test (and a rule here) with any fix that sets a new one.
   refused (checked again just before the swap). Each shelf (a world's or an instance's snapshots) has an `flock`
   beside it (`.<shelf>.lock`), held through every snapshot, restore, delete and prune by any process, so jobs from
   different world set members queue instead of clearing each other's stages; `.partial` stages are cleared only under
-  it, and deleting from the UI gives up after 200 ms. `swap_in` journals the move (`<stage>.swap`, the copy known by
-  inode) and, without `RENAME_EXCHANGE`, renames the old folder aside instead of deleting it; `backups::recover`
-  finishes any swap cut short before launch and before the worlds tab lists. Worlds that are gone but have
+  it, and deleting from the UI gives up after 200 ms. A lock file is only ever deleted by its holder, and
+  `fsutil::lock` checks after locking that the file is still the one at its path, so nobody holds a lock on a deleted
+  one. `swap_in` journals the move (`<stage>.swap`, the copy known by
+  inode) and, without `RENAME_EXCHANGE`, renames the old folder aside instead of deleting it. `backups::recover`
+  finishes any swap cut short before launch: it waits for jobs holding a shelf, and if any shelf can't be put right
+  the game isn't started. The worlds tab runs a best-effort pass (`recover_worlds`) before listing. Worlds that are gone but have
   snapshots stay listed. After a mod rollback, each world last played with a mod it took away or made older is
   offered for restore, newest snapshot from before the rolled-back update preselected; if none predates it, none is.
-  Deleting an instance deletes its backups (a world set's stay with the set). Tests: `backups::tests` (incl.
-  `jobs_on_one_shelf_wait_for_each_other`, `an_interrupted_restore_is_finished_before_launch`),
-  `fsutil::tests::{swap_in_finishes_after_a_crash_at_any_step, locks_exclude_other_processes}`,
+  Deleting an instance deletes its backups (a world set's stay with the set): `backups::lock_instance` takes every
+  shelf's lock first, and the delete is refused while a job anywhere holds one. Tests: `backups::tests` (incl.
+  `jobs_on_one_shelf_wait_for_each_other`, `an_interrupted_restore_is_finished_before_launch`,
+  `launch_recovery_waits_for_a_busy_shelf_and_fails_loudly`, `deleting_an_instance_waits_for_its_backup_jobs`),
+  `fsutil::tests::{swap_in_finishes_after_a_crash_at_any_step, locks_exclude_other_processes,
+  a_lock_file_deleted_by_its_holder_still_excludes}`,
   `ui::content::tests::a_rollback_offers_the_worlds_played_with_newer_mods`, `ui::worlds::tests`.
 - **Screenshots stay per instance:** never pool them on disk (a shared pool needed guessed ownership, which lost or
   misattributed files). The screenshots tab's "all instances" toggle (config `all_screenshots`) lists every

@@ -415,10 +415,13 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
     let mut out = Out::default();
     // Installing into a folder that's being moved into or out of a share set could land
     // the file in the old place or get it renamed on a clash.
+    let starting = app.sessions.get(&inst.id).is_some_and(|s| s.starting());
     let blocked = if app.sharing.is_some() && crate::shares::SET_FOLDERS.contains(&kind.dir()) {
         Some("Shared folders are moving; install again in a moment")
     } else if kind == ContentKind::Mods && app.content.updating(&inst.id) {
         Some("Mods are updating; install again in a moment")
+    } else if kind == ContentKind::Mods && starting {
+        Some("The game is starting; install again once it has")
     } else {
         None
     };
@@ -429,7 +432,7 @@ pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
                 _ => Vec::new(),
             },
             checking: app.content.updates.as_ref().is_some_and(|(id, c)| *id == inst.id && matches!(c, Check::Running(_))),
-            running: app.content.updating(&inst.id),
+            running: app.content.updating(&inst.id) || starting,
             key: app.content.key.take(),
         }),
         _ => None,
@@ -485,7 +488,7 @@ struct Out {
 struct Updates {
     list: Vec<Update>,
     checking: bool,
-    /// An update or rollback is running in this instance.
+    /// An update or rollback is running in this instance, or the game is starting.
     running: bool,
     key: Option<Action>,
 }
@@ -723,7 +726,7 @@ fn installed(
 ) {
     let files = s.files(inst, kind);
     let update_for = |m: &ModFile| ups.and_then(|u| u.list.iter().find(|x| update_base(x) == base_path(m)));
-    // Mods aren't switched or removed under an update or rollback.
+    // Mods aren't switched or removed under an update or rollback, or as the game starts.
     let busy = ups.is_some_and(|u| u.running);
     // Selection is by file stem, so it survives enable/disable renames.
     let stem = |m: &ModFile| m.name.trim_end_matches(".disabled").to_string();
@@ -1029,7 +1032,7 @@ mod tests {
         let early = p.snaps[1].info.taken - chrono::Duration::seconds(1);
         assert_eq!(world_prompts(&inst, early)[0].selected, None);
         std::fs::remove_dir_all(inst.dir()).unwrap();
-        backups::forget_instance(&inst.id);
+        backups::forget_instance(&inst.id).unwrap();
     }
 
     /// G17: a found update stays on offer only for the game it was checked for and a file

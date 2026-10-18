@@ -606,6 +606,6 @@ mod tests {
         assert!(s.sync(rt.handle(), &ctx, &two).is_none());
         assert!(s.selected.is_none());
         std::fs::remove_dir_all(one.dir()).unwrap();
-        backups::forget_instance(&one.id);
+        backups::forget_instance(&one.id).unwrap();
     }
 }

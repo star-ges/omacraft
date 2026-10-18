@@ -18,7 +18,7 @@
 //! process. So jobs from two members of a world set queue up instead of clearing
 //! away each other's half-made copies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -230,20 +230,41 @@ pub fn after_play(world: &Path, owner: Owner, inst_name: &str, keep: u32) -> Vec
 pub fn cover_worlds(inst: &Instance, reason: &str) -> anyhow::Result<()> {
     let owner = Owner::of(inst);
     let mut failed = Vec::new();
-    for w in crate::saves::list_worlds(&inst.saves_dir()) {
-        let modified = std::fs::metadata(w.dir.join("level.dat")).and_then(|m| m.modified()).ok().map(DateTime::<Utc>::from);
-        let covered = snapshots(owner, &w.folder).iter().any(|s| modified.is_some_and(|m| s.info.taken >= m));
-        if covered || crate::world_sets::lock_holder(&w.dir).is_some() {
+    for (folder, dir) in every_world(&inst.saves_dir())? {
+        let modified = std::fs::metadata(dir.join("level.dat")).and_then(|m| m.modified()).ok().map(DateTime::<Utc>::from);
+        let covered = snapshots(owner, &folder).iter().any(|s| modified.is_some_and(|m| s.info.taken >= m));
+        if covered || crate::world_sets::lock_holder(&dir).is_some() {
             continue;
         }
-        if let Err(e) = snapshot_world(&w.dir, owner, reason, false) {
-            failed.push(format!("{}: {e:#}", w.name));
+        if let Err(e) = snapshot_world(&dir, owner, reason, false) {
+            failed.push(format!("{folder}: {e:#}"));
         }
     }
     if !failed.is_empty() {
         bail!("couldn't back up {}", failed.join("; "));
     }
     Ok(())
+}
+
+/// Every world folder in `saves` (folder name, path), for backups that must not miss
+/// one: unlike the worlds tab's listing, a folder that can't be read fails instead of
+/// looking empty. No `saves` at all is no worlds.
+fn every_world(saves: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
+    let entries = match std::fs::read_dir(saves) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        r => r.with_context(|| format!("reading {}", saves.display()))?,
+    };
+    let mut out = Vec::new();
+    for e in entries {
+        let dir = e.with_context(|| format!("reading {}", saves.display()))?.path();
+        match std::fs::metadata(dir.join("level.dat")) {
+            Ok(m) if m.is_file() => out.push((dir.file_name().unwrap_or_default().to_string_lossy().into_owned(), dir)),
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => {}
+            Err(e) => return Err(e).with_context(|| format!("looking into {}", dir.display())),
+        }
+    }
+    Ok(out)
 }
 
 /// The finished snapshots of world folder `world`, newest first.
@@ -303,35 +324,52 @@ fn stage(from: &Path, staged: &Path) -> anyhow::Result<()> {
 
 /// Finish what a crash cut short in `inst`'s shelves (its mods and config, and its
 /// worlds'): restores and rollbacks halfway through being swapped in are completed,
-/// half-made copies cleared. Shelves a running job holds are left to it. Run before
-/// launch, so a game never starts with a world or the mods folder swapped out.
-pub fn recover(inst: &Instance) -> Vec<String> {
-    let mut notes = recover_worlds(Owner::of(inst));
-    if let Err(e) = recover_shelf(&instance_dir(&inst.id)) {
-        notes.push(format!("couldn't finish rolling back {}'s mods: {e:#}", inst.name));
+/// half-made copies cleared. Run before launch, so a game never starts with a world or
+/// the mods folder swapped out: it waits for jobs holding a shelf (another process's),
+/// and fails if any shelf couldn't be put right.
+pub fn recover(inst: &Instance) -> anyhow::Result<()> {
+    let mut shelves = world_shelves(Owner::of(inst))?;
+    shelves.push(instance_dir(&inst.id));
+    for shelf in shelves.iter().filter(|s| s.is_dir()) {
+        let _l = lock(shelf)?;
+        recover_locked(shelf).with_context(|| format!("finishing an interrupted restore in {}", shelf.display()))?;
     }
-    notes
+    Ok(())
 }
 
-/// [`recover`] for the world shelves of `owner` only.
+/// Best-effort [`recover`] for the world shelves of `owner`, for the worlds tab: shelves
+/// a job holds are left to it. Returns what went wrong, for the log.
 pub fn recover_worlds(owner: Owner) -> Vec<String> {
-    std::fs::read_dir(owner_dir(owner))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter_map(|e| recover_shelf(&e.path()).err().map(|err| format!("couldn't finish restoring {}: {err:#}", e.file_name().to_string_lossy())))
-        .collect()
-}
-
-fn recover_shelf(shelf: &Path) -> anyhow::Result<()> {
-    if !shelf.is_dir() {
-        return Ok(());
-    }
-    match lock_soon(shelf)? {
+    let shelves = match world_shelves(owner) {
+        Ok(s) => s,
+        Err(e) => return vec![format!("{e:#}")],
+    };
+    let recover = |shelf: &Path| match lock_soon(shelf)? {
         Some(_l) => recover_locked(shelf),
         None => Ok(()),
+    };
+    shelves.iter().filter(|s| s.is_dir()).filter_map(|s| recover(s).err().map(|e| format!("couldn't finish restoring {}: {e:#}", s.display()))).collect()
+}
+
+/// Every world shelf of `owner`: each folder, and each lock file whose folder a job may
+/// be about to make.
+fn world_shelves(owner: Owner) -> anyhow::Result<Vec<PathBuf>> {
+    let dir = owner_dir(owner);
+    let entries = match std::fs::read_dir(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        r => r.with_context(|| format!("reading {}", dir.display()))?,
+    };
+    let mut out = BTreeSet::new();
+    for e in entries {
+        let e = e.with_context(|| format!("reading {}", dir.display()))?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        if let Some(shelf) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".lock")) {
+            out.insert(dir.join(shelf));
+        } else if e.file_type().is_ok_and(|t| t.is_dir()) {
+            out.insert(e.path());
+        }
     }
+    Ok(out.into_iter().collect())
 }
 
 /// [`recover_shelf`] with the lock held: every journalled swap is finished; restore
@@ -414,11 +452,52 @@ pub fn roll_back(inst: &Instance, s: &Snapshot, keep: u32) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Delete an instance's snapshots: its mods and config, and its own worlds'.
-pub fn forget_instance(id: &str) {
-    let _ = std::fs::remove_dir_all(instance_dir(id));
-    let _ = std::fs::remove_file(lock_path(&instance_dir(id)));
-    let _ = std::fs::remove_dir_all(owner_dir(Owner::Instance(id)));
+/// Every backup shelf of an instance being deleted, locked: no job (in any process) can
+/// be using them. [`Self::forget`] deletes them.
+pub struct Forgetting {
+    shelves: Vec<(PathBuf, fsutil::FileLock)>,
+    owner: PathBuf,
+}
+
+/// Lock an instance's snapshots (its mods and config, and its own worlds') for deleting,
+/// or fail if a job is using them. Take this before deleting the instance itself.
+pub fn lock_instance(id: &str) -> anyhow::Result<Forgetting> {
+    let mut shelves = world_shelves(Owner::Instance(id))?;
+    shelves.push(instance_dir(id));
+    let mut held = Vec::new();
+    for shelf in shelves {
+        let l = try_lock(&shelf).with_context(|| format!("its backups in {}", shelf.display()))?;
+        held.push((shelf, l));
+    }
+    Ok(Forgetting { shelves: held, owner: owner_dir(Owner::Instance(id)) })
+}
+
+impl Forgetting {
+    /// Delete the snapshots, then each lock file while still holding it (anyone waiting
+    /// on it finds it gone and locks afresh).
+    pub fn forget(self) -> anyhow::Result<()> {
+        let mut failed = Vec::new();
+        for (shelf, l) in self.shelves {
+            match std::fs::remove_dir_all(&shelf) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => failed.push(format!("{}: {e}", shelf.display())),
+                _ => {
+                    let _ = std::fs::remove_file(lock_path(&shelf));
+                }
+            }
+            drop(l);
+        }
+        let _ = std::fs::remove_dir(&self.owner);
+        if !failed.is_empty() {
+            bail!("couldn't delete {}", failed.join("; "));
+        }
+        Ok(())
+    }
+}
+
+/// Delete an instance's snapshots, if no job is using them.
+#[cfg(test)]
+pub fn forget_instance(id: &str) -> anyhow::Result<()> {
+    lock_instance(id)?.forget()
 }
 
 #[cfg(test)]
@@ -474,7 +553,7 @@ mod tests {
         assert!(after_play(&world, owner, "A", 0).is_empty());
         assert_eq!(snapshots(owner, "W").len(), 3);
         std::fs::remove_dir_all(root).unwrap();
-        forget_instance(&id);
+        forget_instance(&id).unwrap();
         assert!(!owner_dir(owner).exists());
     }
 
@@ -517,7 +596,7 @@ mod tests {
         }
         assert!(all_worlds(owner).is_empty());
         std::fs::remove_dir_all(root).unwrap();
-        forget_instance(&id);
+        forget_instance(&id).unwrap();
     }
 
     #[test]
@@ -602,7 +681,7 @@ mod tests {
         // And a copy cut short before its journal: never finished, so cleared away.
         std::fs::create_dir_all(ishelf.join(".config.restoring")).unwrap();
 
-        assert!(recover(&inst).is_empty());
+        recover(&inst).unwrap();
         assert_eq!(std::fs::read_to_string(world.join("level.dat")).unwrap(), "then");
         assert_eq!(std::fs::read_to_string(mods.join("a.jar")).unwrap(), "old");
         for dir in [&shelf, &ishelf] {
@@ -611,7 +690,7 @@ mod tests {
         }
         NO_EXCHANGE.with(|n| n.set(false));
         std::fs::remove_dir_all(inst.dir()).unwrap();
-        forget_instance(&inst.id);
+        forget_instance(&inst.id).unwrap();
     }
 
     #[test]
@@ -629,7 +708,7 @@ mod tests {
         cover_worlds(&inst, "before updating").unwrap();
         assert_eq!(snapshots(Owner::of(&inst), "W").len(), 2);
         std::fs::remove_dir_all(inst.dir()).unwrap();
-        forget_instance(&inst.id);
+        forget_instance(&inst.id).unwrap();
     }
 
     #[test]
@@ -665,6 +744,106 @@ mod tests {
         snapshot_instance(&inst, "again", 1).unwrap();
         assert_eq!(instance_snapshots(&inst.id).len(), 1);
         std::fs::remove_dir_all(inst.dir()).unwrap();
-        forget_instance(&inst.id);
+        forget_instance(&inst.id).unwrap();
+    }
+
+    #[test]
+    fn launch_recovery_waits_for_a_busy_shelf_and_fails_loudly() {
+        use crate::fsutil::tests::{NO_EXCHANGE, write_journal};
+        NO_EXCHANGE.with(|n| n.set(true));
+        let mut inst = Instance::new("recover busy", "1.21.1", Loader::Vanilla);
+        inst.assign_id().unwrap();
+        let world = inst.saves_dir().join("W");
+        std::fs::create_dir_all(&world).unwrap();
+        std::fs::write(world.join("level.dat"), "then").unwrap();
+        let owner = Owner::of(&inst);
+        snapshot_world(&world, owner, "then", false).unwrap();
+        let then = snapshots(owner, "W").remove(0);
+        // A restore cut short with W moved aside, its shelf held by a job elsewhere.
+        let shelf = world_dir(owner, "W");
+        let staged = shelf.join(".restoring");
+        stage(&then.dir, &staged).unwrap();
+        write_journal(&staged, &inst.saves_dir().canonicalize().unwrap().join("W"));
+        std::fs::rename(&world, shelf.join(".restoring.old")).unwrap();
+        let held = lock(&shelf).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            drop(held);
+        });
+        // Waits past the UI's 200 ms rather than calling it done.
+        recover(&inst).unwrap();
+        assert_eq!(std::fs::read_to_string(world.join("level.dat")).unwrap(), "then");
+        releaser.join().unwrap();
+        NO_EXCHANGE.with(|n| n.set(false));
+
+        // A shelf that can't be put right stops the launch.
+        if unsafe { libc::geteuid() } != 0 {
+            let bad = shelf.join(".restoring");
+            std::fs::create_dir_all(bad.join("inner")).unwrap();
+            std::fs::set_permissions(&bad, std::os::unix::fs::PermissionsExt::from_mode(0o500)).unwrap();
+            assert!(recover(&inst).is_err());
+            std::fs::set_permissions(&bad, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        }
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+        forget_instance(&inst.id).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_saves_folder_fails_the_update_backups() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let mut inst = Instance::new("cover unreadable", "1.21.1", Loader::Vanilla);
+        inst.assign_id().unwrap();
+        // No saves at all is fine: nothing to cover.
+        cover_worlds(&inst, "x").unwrap();
+        let w = inst.saves_dir().join("W");
+        std::fs::create_dir_all(&w).unwrap();
+        std::fs::write(w.join("level.dat"), "L").unwrap();
+        for (dir, why) in [(inst.saves_dir(), "saves"), (w.clone(), "a world")] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let r = cover_worlds(&inst, "x");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(r.is_err(), "an unreadable {why} looked like no worlds");
+        }
+        assert!(snapshots(Owner::of(&inst), "W").is_empty());
+        cover_worlds(&inst, "x").unwrap();
+        assert_eq!(snapshots(Owner::of(&inst), "W").len(), 1);
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+        forget_instance(&inst.id).unwrap();
+    }
+
+    #[test]
+    fn deleting_an_instance_waits_for_its_backup_jobs() {
+        let mut inst = Instance::new("forget busy", "1.21.1", Loader::Vanilla);
+        inst.assign_id().unwrap();
+        let world = inst.saves_dir().join("W");
+        std::fs::create_dir_all(&world).unwrap();
+        std::fs::write(world.join("level.dat"), "L").unwrap();
+        snapshot_world(&world, Owner::of(&inst), "x", false).unwrap();
+        let shelf = world_dir(Owner::of(&inst), "W");
+
+        // A job (anywhere) holds the shelf: deleting refuses and leaves it all alone.
+        let held = lock(&shelf).unwrap();
+        assert!(lock_instance(&inst.id).is_err());
+        assert_eq!(snapshots(Owner::of(&inst), "W").len(), 1);
+        drop(held);
+
+        // Once free, everything goes, lock files too, and a job waiting on a lock file
+        // being deleted can't share the shelf with one that came after.
+        let forgetting = lock_instance(&inst.id).unwrap();
+        let s = shelf.clone();
+        let waiter = std::thread::spawn(move || lock(&s).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        forgetting.forget().unwrap();
+        assert!(!shelf.exists());
+        let waited = waiter.join().unwrap();
+        assert!(try_lock(&shelf).is_err(), "two holders of one shelf");
+        drop(waited);
+        let _ = std::fs::remove_file(lock_path(&shelf));
+        let _ = std::fs::remove_dir(owner_dir(Owner::of(&inst)));
+        assert!(!instance_dir(&inst.id).exists());
+        std::fs::remove_dir_all(inst.dir()).unwrap();
     }
 }
