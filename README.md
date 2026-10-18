@@ -5,12 +5,46 @@
 A Minecraft launcher in Rust, modeled on [Prism Launcher](https://github.com/PrismLauncher/PrismLauncher)
 and drawn in [Omarchy](https://omarchy.org)'s design language.
 
-It follows your Omarchy theme and changes with it, and on other systems it uses Tokyo Night.
-You can drive the whole thing with vim-style keys, or just use the mouse.
+It does what most players use Prism for (instances, every major loader, Modrinth, Prism and MultiMC
+imports) and adds the things Prism leaves to you: finding the mod that broke your game, editing mod and
+shader configs, backing up worlds before anything can harm them, and sharing files between instances
+without copying them. It follows your Omarchy theme and changes with it, and you can drive the whole
+thing with vim-style keys or just use the mouse.
 
 ## Install
 
-You need Rust 1.95 or newer ([rustup](https://rustup.rs)). Then:
+On Linux (x86_64) with [Rust](https://rustup.rs) 1.95 or newer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/star-ges/omacraft/master/install.sh | bash
+```
+
+It builds Omacraft and installs it for your user (`~/.local`), with a desktop entry and icon. From a
+clone, `./install.sh` does the same with that checkout. Omacraft runs under
+Wayland or X11 and uses the XDG desktop portal for file pickers. Java isn't needed: Omacraft downloads
+the runtime each Minecraft version expects.
+
+To update, run the same command again: it always fetches the latest version. From a clone, pull first:
+
+```sh
+git pull
+./install.sh
+```
+
+Only what changed is rebuilt. A running Omacraft keeps working and picks up the new version when you
+restart it.
+
+To uninstall, run `./uninstall.sh` from a clone, or:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/star-ges/omacraft/master/uninstall.sh | bash
+```
+
+That keeps your instances, worlds and accounts. To delete those as well, add `--purge` (`./uninstall.sh --purge`,
+or `| bash -s -- --purge`); it asks before deleting anything.
+
+<details>
+<summary>By hand</summary>
 
 ```sh
 git clone https://github.com/star-ges/omacraft
@@ -21,106 +55,79 @@ install -Dm644 packaging/omacraft.desktop ~/.local/share/applications/omacraft.d
 install -Dm644 packaging/omacraft.svg ~/.local/share/icons/hicolor/scalable/apps/omacraft.svg
 ```
 
-It runs on Linux (x86_64) under Wayland or X11. File pickers use the XDG desktop portal, and fonts
-are found with fontconfig. Java isn't needed: Omacraft downloads the runtime each Minecraft version
-expects.
+To remove it, delete those three files; your data is in `~/.local/share/omacraft` and `~/.config/omacraft`.
 
-## Uninstall
+</details>
 
-Remove the three installed files:
+## What Omacraft adds
 
-```sh
-rm ~/.local/bin/omacraft ~/.local/share/applications/omacraft.desktop ~/.local/share/icons/hicolor/scalable/apps/omacraft.svg
-```
+### When something breaks
 
-That keeps your instances and settings. To delete those as well, including every world and your
-signed-in accounts:
-
-```sh
-rm -rf ~/.local/share/omacraft ~/.config/omacraft
-```
-
-## Features
-
-- **Instances**: each one is a self-contained `.minecraft` with its own version, loader, memory,
-  JVM args, Java, window size, icon, group and notes. Libraries, assets and runtimes are shared
-  between instances.
-
-  ![Instances](docs/screenshots/instances.png)
-
-- **Loaders**: vanilla (every release and snapshot), Fabric, Quilt, Forge and NeoForge. Forge 1.13+
-  and NeoForge patch the game on the first launch of each build, so that launch takes a minute longer.
-
-  ![Loaders](docs/screenshots/loaders.png)
-
-- **Modrinth**: search and install mods, resource packs and shader packs, with dependencies resolved.
-  Installed items show their name, icon and version. `u` in the mods tab updates them (see
-  [mod updates](#how-omacraft-handles-game-files)).
-
-  ![Modrinth](docs/screenshots/modrinth.png)
-
-- **Import**: browse Modrinth modpacks right in the import dialog and pick any version, or import Prism,
-  PolyMC and MultiMC instances (found automatically, or from a `.zip` or folder), a `.mrpack` or a
-  modrinth.com modpack link. On btrfs, even huge instances import instantly.
-
-  ![Import](docs/screenshots/import.png)
-
-- **Drag and drop**: drop mods, resource packs or shader packs on their tab to add them, a world folder
-  or world `.zip` on the worlds tab, and a pack or instance anywhere else to import it. Nothing already
-  there is ever replaced.
-- **Disk dedup**: each mod and pack is downloaded once. On btrfs or xfs, every instance gets its own
-  copy, but the bytes are stored only once. **settings → reclaim disk space** merges identical files that
-  came in another way (imports, jars added by hand) and clears cached downloads no instance uses.
-- **Share sets**: instances in the same share set share their resource packs, shader packs and schematics,
-  so a pack added to one shows up in all of them. Pick a set when editing an instance; **settings → shared
-  folders** lists every set and its members.
-- **World sets**: instances on the same Minecraft version and loader can share their worlds, say a
-  lightweight one and a shaders one. Each world remembers the mods it was last played with, and Omacraft
-  backs a world up before another instance with fewer or older mods opens it.
-- **Backups**: each world a game played is backed up when it exits, and the worlds tab can back up, restore or
-  delete by hand. Mod updates back up `mods` and `config` first, and `z` rolls them back.
-- **Export**: a Modrinth pack (`.mrpack`) or an instance zip that Prism, PolyMC and MultiMC open.
-  You choose which folders go in.
-- **Per-instance tabs**: version and loader, live game log, mods, resource packs, shader packs, configs (game, mods, shaders),
-  notes, worlds (open one directly on 1.20+, rename, duplicate, delete, backups), servers (edit the list, join directly),
-  screenshots (just this instance's, or every instance's at once) and past logs and crash reports.
-- **Copy settings**: a new instance can start with another one's keybinds, FOV and sound (`options.txt`).
-- **Config editor**: the configs tab has three parts. **minecraft** is the game's own `options.txt`, named and
-  grouped like its menus (video, sound, controls, chat…), key bindings set by pressing the key. **mods** lists each mod's config files (`c` or the cog on
-  a mod in the mods tab goes straight there) and edits TOML, JSON and JSON5 settings as switches, sliders and
-  choices, with the mod's own descriptions, ranges and defaults; other files edit as text. **shaders** shows each
-  shader pack's options and profiles with the pack's own names, menus and sliders, saved where Iris and OptiFine
-  read them (the cog on a pack in the shader packs tab goes there), and "use this pack" switches to it. Every file has "restore defaults". Mods and
-  headers fold, and stay as you left them.
-  Saving changes only the values you touched, never overwrites a file the game rewrote meanwhile without asking,
-  and nothing unsaved is lost on the way out.
-
-  ![Config editor](docs/screenshots/config%20editor.png)
-
-- **Mod sets**: save the mods as they are as a named set ("performance", "full pack") and switch between sets in
-  one step from the mods tab (`s`). Edit a set as a checklist without touching the mods folder; ticking a mod
-  ticks what it needs. Nothing is removed or duplicated, updates keep a mod in its sets, and newly added mods
-  join the set in use.
-
-  ![Mod sets](docs/screenshots/mod%20sets.png)
-
-- **Why it crashed**: when a game crashes, the log tab says which mod is most likely at fault and why, quoting the
-  lines in the crash report or log that say so. Unmet dependencies, failed mixins, mods for the wrong loader or
-  Java, and out-of-memory or graphics-driver crashes are explained in plain words. Disable the suspect right there,
-  or copy a summary for a bug report.
-- **Find the breaking mod**: `b` in the mods tab (or the crash analysis) turns about half the mods off at a time.
-  You play and say whether the problem occurred, and a few games later Omacraft names the mod, then puts
-  everything back exactly as it was.
+- **Why it crashed**: when a game crashes, the log tab says which mod is most likely at fault and how
+  sure it is, quoting the lines in the crash report or log that say so. Unmet dependencies, failed mixins,
+  mods for the wrong loader or Java, and out-of-memory or graphics-driver crashes are explained in plain
+  words. Disable the suspect right there, or copy a summary for a bug report.
+- **Find the breaking mod**: `b` in the mods tab (or the crash analysis) turns about half the mods off at
+  a time, always keeping each mod's dependencies on. You play and say whether the problem occurred, and a
+  few games later Omacraft names the mod, then puts everything back exactly as it was, even after a crash
+  halfway through.
 
   ![Find the breaking mod](docs/screenshots/find%20the%20breaking%20mod.png)
 
-- **Groups**: collapsible groups in the instance list, each with an optional colour from the theme.
-  Drag instances between them, or press `g` to manage them.
-- **Accounts and skins**: Microsoft and offline accounts. A 3D preview of each skin and cape; upload a
-  skin (or drop a `.png` on the accounts tab), switch between classic and slim arms, reset it, or pick a cape you own.
+- **Updates you can undo**: `u` in the mods tab updates every mod from Modrinth, `shift+u` just one. Before
+  anything changes, Omacraft backs up `mods`, `config` and any world without a recent backup. `z` rolls the
+  mods back and offers to restore each world that was played with the newer ones.
 
-  ![Accounts and skins](docs/screenshots/accounts%20and%20skins.png)
+### Configs without leaving the launcher
 
+- **Config editor**: the configs tab has three parts.
+  - **minecraft** is the game's own `options.txt`, named and grouped like its menus (video, sound,
+    controls, chat…), with key bindings set by pressing the key.
+  - **mods** edits each mod's TOML, JSON and JSON5 settings as switches, sliders and choices, with the
+    mod's own descriptions, ranges and defaults; other files edit as text. `c` or the cog on a mod in the
+    mods tab goes straight to its files.
+  - **shaders** shows each shader pack's options and profiles with the pack's own names, menus and
+    sliders, saved where Iris and OptiFine read them, and "use this pack" switches to it.
+
+  Saving changes only the values you touched, so comments and layout survive. A file the game rewrote
+  meanwhile is never overwritten without asking, nothing unsaved is lost on the way out, and every file
+  has "restore defaults".
+
+  ![Config editor](docs/screenshots/config%20editor.png)
+
+- **Mod sets**: save the mods as they are as a named set ("performance", "full pack") and switch between
+  sets in one step from the mods tab (`s`). Edit a set as a checklist without touching the mods folder;
+  ticking a mod ticks what it needs. Updates keep a mod in its sets, and newly added mods join the set in use.
+
+  ![Mod sets](docs/screenshots/mod%20sets.png)
+
+### Worlds that stay safe
+
+- **Backups**: each world a game played is backed up when it exits (the last 5 by default). The worlds tab
+  backs up, restores or deletes by hand, and worlds you deleted stay listed by their backups. Restoring
+  backs up what's there first.
+- **Play records**: each world remembers which instance last played it, on which Minecraft version and with
+  which mods. Before any instance starts, a world last played with a mod it lacks, a newer version of one
+  or a newer Minecraft is backed up first.
+
+### Share without copying
+
+- **Disk dedup**: each mod and pack is downloaded once. On btrfs or xfs every instance still gets its own
+  copy, but the bytes are stored only once, and backups and imports cost only what changed.
+  **settings → reclaim disk space** merges identical files that came in another way.
+- **Share sets**: instances in a share set share their resource packs, shader packs and schematics, so a
+  pack added to one shows up in all of them. Sets are named, since packs are often tied to a version.
+- **World sets**: instances on the same Minecraft version and loader share their worlds, say a lightweight
+  one and a shaders one. Changing one member's version asks whether to move the whole set or leave it.
+- **Copy settings**: a new instance can start with another one's keybinds, FOV and sound (`options.txt`),
+  copied once rather than shared, since older versions drop settings they don't know.
+
+[How Omacraft handles game files](#how-omacraft-handles-game-files) has the details.
+
+### Made for Omarchy and the keyboard
+
+- **Live theming**: colours, fonts and borders come from your Omarchy theme and change with it. Elsewhere
+  it uses Omarchy's Tokyo Night.
 - **Keyboard first**: `h`/`l` move between panes and `j`/`k` within them, `enter` does the obvious
   thing (play, join, install, open) and `p` plays from anywhere. The bottom bar shows the keys for the
   focused pane, `?` lists them all, and every key can be rebound in **settings → keys** or in `config.toml`:
@@ -129,6 +136,9 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
   down = ["j", "down"]
   play = ["p", "ctrl+enter"]
   ```
+- **Drag and drop**, on Wayland too: drop mods, resource packs or shader packs on their tab, a world folder or
+  `.zip` on the worlds tab, a skin on the accounts tab, and a pack or instance anywhere else to import it.
+  Nothing already there is ever replaced.
 - **CLI**, for Hyprland binds or the Omarchy menu:
   ```
   omacraft list                 # grouped like the sidebar; tab-separated when piped
@@ -141,7 +151,47 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
   omacraft theme
   ```
 
-Not supported: CurseForge packs and downloads, LiteLoader, and Forge before 1.6.
+## Everything you'd expect
+
+- **Instances**: each one is a self-contained `.minecraft` with its own version, loader, memory,
+  JVM args, Java, window size, icon, group and notes. Libraries, assets and runtimes are shared
+  between instances. Collapsible, coloured groups; drag instances between them, or press `g`.
+
+  ![Instances](docs/screenshots/instances.png)
+
+- **Loaders**: vanilla (every release and snapshot), Fabric, Quilt, Forge and NeoForge. Forge 1.13+
+  and NeoForge patch the game on the first launch of each build, so that launch takes a minute longer.
+
+  ![Loaders](docs/screenshots/loaders.png)
+
+- **Modrinth**: search and install mods, resource packs and shader packs, with dependencies resolved.
+  Installed items show their name, icon and version.
+
+  ![Modrinth](docs/screenshots/modrinth.png)
+
+- **Import**: browse Modrinth modpacks right in the import dialog and pick any version, or import Prism,
+  PolyMC and MultiMC instances (found automatically, or from a `.zip` or folder), a `.mrpack` or a
+  modrinth.com modpack link. On btrfs, even huge instances import instantly.
+
+  ![Import](docs/screenshots/import.png)
+
+- **Export**: a Modrinth pack (`.mrpack`) or an instance zip that Prism, PolyMC and MultiMC open.
+  You choose which folders go in.
+- **Per-instance tabs**: version and loader, live game log, mods, resource packs, shader packs, configs,
+  notes, worlds (open one directly on 1.20+, rename, duplicate, delete, backups), servers (edit the list,
+  join directly), screenshots (just this instance's, or every instance's at once) and past logs and crash reports.
+- **Accounts and skins**: Microsoft and offline accounts. A 3D preview of each skin and cape; upload a
+  skin, switch between classic and slim arms, reset it, or pick a cape you own.
+
+  ![Accounts and skins](docs/screenshots/accounts%20and%20skins.png)
+
+## Where Prism is still the better pick
+
+- **CurseForge**: no CurseForge packs or downloads (they need an API key, and many files forbid
+  third-party downloads). Modrinth only.
+- **Other platforms**: Prism also runs on Windows and macOS, and on ARM. Omacraft launches games on
+  x86_64 Linux only.
+- **Legacy loaders**: no LiteLoader, and no Forge before 1.6.
 
 ## How Omacraft handles game files
 

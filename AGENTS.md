@@ -18,6 +18,9 @@ cargo test -- --ignored                                         # + network test
 omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim | theme   # CLI, handy for checks
 ```
 
+- **Install scripts:** `install.sh` (builds from its own clone, else clones to a temp dir; also the `curl | bash`
+  install) and `uninstall.sh` (`--purge` deletes data after typing `delete`) are what the README tells users to run.
+  Keep their paths in step with `packaging/` and `paths.rs`.
 - **Style:** don't run `cargo fmt`; the code uses longer lines than rustfmt's defaults. Match the
   surrounding style.
 - **Warnings:** keep the build warning-free.
