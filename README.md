@@ -57,9 +57,22 @@ rm -rf ~/.local/share/omacraft ~/.config/omacraft
   came in another way (imports, jars added by hand) and clears cached downloads no instance uses.
 - **Export**: a Modrinth pack (`.mrpack`) or an instance zip that Prism, PolyMC and MultiMC open.
   You choose which folders go in.
-- **Per-instance tabs**: version and loader, live game log, mods, resource packs, shader packs, notes,
-  worlds (open one directly on 1.20+, rename, duplicate, delete), servers (edit the list, join directly),
+- **Per-instance tabs**: version and loader, live game log, mods, mod configs, resource packs, shader packs,
+  notes, worlds (open one directly on 1.20+, rename, duplicate, delete), servers (edit the list, join directly),
   screenshots (just this instance's, or every instance's at once) and past logs and crash reports.
+- **Config editor**: the config tab lists each mod's config files and edits TOML, JSON and JSON5 settings as
+  switches, sliders and choices, with the mod's own descriptions, ranges and defaults; other files edit as text.
+  Saving changes only the values you touched, never overwrites a file the game rewrote meanwhile without asking,
+  and nothing unsaved is lost on the way out.
+- **Mod sets**: save the mods as they are as a named set ("performance", "full pack") and switch between sets in
+  one step from the mods tab (`s`). Nothing is removed or duplicated, and updates keep a mod in its sets.
+- **Why it crashed**: when a game crashes, the log tab says which mod is most likely at fault and why, quoting the
+  lines in the crash report or log that say so. Unmet dependencies, failed mixins, mods for the wrong loader or
+  Java, and out-of-memory or graphics-driver crashes are explained in plain words. Disable the suspect right there,
+  or copy a summary for a bug report.
+- **Find the breaking mod**: `b` in the mods tab (or the crash analysis) turns about half the mods off at a time.
+  You play and say whether the problem happened, and a few games later Omacraft names the mod, then puts
+  everything back exactly as it was.
 - **Groups**: collapsible groups in the instance list, each with an optional colour from the theme.
   Drag instances between them, or press `g` to manage them.
 - **Accounts and skins**: Microsoft and offline accounts. A 3D preview of each skin and cape; upload a

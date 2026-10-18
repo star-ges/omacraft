@@ -48,7 +48,10 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim 
 | `ui/mod.rs` | `App`, top/status bars, modals, key routing, launching, imports |
 | `ui/nav.rs` | Focus zones, `Nav`, hints bar and `?` help, both built from the keymap |
 | `ui/instances.rs` | Sidebar (groups, drag-and-drop, context menu) + instance header + tab dispatch |
-| `ui/{version,content,worlds,servers,screenshots,logs}.rs` | Per-instance tabs (content also has mod updates and the rollback dialogs; worlds has the backups pane) |
+| `mod_config.rs`, `ui/config.rs` | Config tab: `config/` files grouped by mod; TOML (`toml_edit` spans) and JSON/JSON5 (own parser) as fields with comment hints (range, allowed values, default); edits splice only the value's bytes; conflict-checked saves |
+| `mod_sets.rs`, `bisect.rs`, `ui/mod_sets.rs` | Mod sets (`mod_sets.toml`: named on/off arrangements keyed by jar mod id, else versionless file name); the search for the breaking mod (`bisect.toml`: dependency-closed halving, a confirming step, exact restore); the mods tab's set line, sets dialog, search dialogs and banner |
+| `crash.rs` | Crash analysis: suspects from crash reports and logs (loader errors, unmet dependencies, mixins, entrypoints, Suspected Mods, stack frames matched to jars by package), non-mod causes; jar facts cached by path/size/mtime |
+| `ui/{version,content,worlds,servers,screenshots,logs}.rs` | Per-instance tabs (content also has mod updates and the rollback dialogs; worlds has the backups pane; log history has the crash analysis panel) |
 | `ui/{new_instance,export,version_picker,icon_picker,group_manager,settings,accounts}.rs` | Dialogs and pages |
 | `ui/skin_view.rs` | 3D player model: one coloured quad per texel, rotated, projected and painted back to front as an `egui::Mesh` |
 | `ui/widgets.rs` | The widget kit, listed under Patterns below |
@@ -205,6 +208,34 @@ test (and a rule here) with any fix that sets a new one.
   `fsutil::tests::{swap_in_finishes_after_a_crash_at_any_step, locks_exclude_other_processes,
   a_lock_file_deleted_by_its_holder_still_excludes}`,
   `ui::content::tests::a_rollback_offers_the_worlds_played_with_newer_mods`, `ui::worlds::tests`.
+- **Config editor:** an edit replaces only the value's own bytes (`mod_config::set`), so comments, layout and key
+  order survive. Never re-serialize a config file. `mod_config::save` refuses when the file on disk isn't what was
+  loaded (the game rewrites configs), unless the user chooses to keep their changes. Only files that resolve inside
+  `config/` open (`mod_config::resolve`), up to `MAX_OPEN` (1 MiB). Leaving a file, tab, instance or the app with
+  unsaved changes asks first (`config::guard`), and play refuses while the instance has unsaved config changes.
+  Widgets must not change a value just by drawing it: sliders use `SliderClamping::Edits`, `DragValue` uses
+  `clamp_existing_to_range(false)`, and nothing rounds. Tests: `mod_config::tests` (incl.
+  `toml_edits_round_trip_byte_for_byte`, `json5_edits_round_trip_byte_for_byte`, `only_files_inside_config_open`,
+  `a_file_changed_on_disk_is_not_overwritten`), `ui::config::tests`.
+- **Mod sets:** live in `mod_sets.toml` beside `instance.toml`, never in it, and aren't exported. A set names mods by
+  `mod_sets::key`: the jar's own id, else `file:` and the file name without its version, so updates keep membership.
+  Switching only renames (`.disabled`), runs as a mod job, and is refused while the game starts or runs, mods install
+  or update, or a search has them. A mod switched on that the active set hasn't seen joins it (`ModSets::absorb`);
+  mods a set has never seen are off after a switch, and the mods tab offers to add them. Tests: `mod_sets::tests`
+  (incl. `switching_sets_is_exact`, `membership_survives_an_update_rename`,
+  `new_mods_join_the_active_set_and_stay_off_elsewhere`).
+- **Finding the breaking mod:** `bisect.toml` keeps the exact original on/off state, and every end (stop, keep, turn it
+  off) restores it before anything else. Each step's mods are closed over required dependencies (`Bisect::closure`),
+  so no mod runs without what it needs; "turn it off" also disables whatever needs the culprit. A single suspect is
+  only "found" after a step with everything but it on. While a search exists, the mods tab doesn't toggle, remove,
+  install, update, roll back or switch sets, and says so once (the banner). A crash analysis starts a search with its
+  suspects first (`mod_sets::open_bisect`). Tests: `bisect::tests`.
+- **Crash analysis:** `crash::analyze_with` only says "certain" for what a loader or Minecraft states outright; stack
+  frames and Suspected Mods are "likely" at best, frames below the top 8 "possible", and with nothing likely the
+  headline says no single mod stands out. Frames from Minecraft, loaders, Java and common libraries (`LIBRARIES`,
+  `NOT_MODS`) never point at a mod. Analysis runs on a Promise; a log only gets a jar index if `looks_crashed`. A
+  game that exits with a new crash report or a failed exit gets a notice in its log tab, cleared on the next launch;
+  a JVM killed by SIGKILL/SIGTERM/SIGINT counts as stopped, any other signal as a crash. Tests: `crash::tests`.
 - **Screenshots stay per instance:** never pool them on disk (a shared pool needed guessed ownership, which lost or
   misattributed files). The screenshots tab's "all instances" toggle (config `all_screenshots`) lists every
   instance's folder in the background, each tile captioned with its instance. Test:
