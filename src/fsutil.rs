@@ -242,14 +242,29 @@ pub fn read_capped(r: impl Read) -> std::io::Result<Vec<u8>> {
 /// `mods` folders), so later edits never reach the original. Broken links and
 /// links back up the tree are skipped. Returns a note for each skipped link.
 pub fn copy_tree(src: &Path, dst: &Path, progress: &dyn Fn(u64)) -> std::io::Result<Vec<String>> {
+    copy_tree_outside(src, dst, None, progress)
+}
+
+/// [`copy_tree`], failing if any folder it copies, reached through links or not, holds
+/// `keep_out` or lies inside it (canonical paths). With `keep_out` the folder the copy
+/// is made in, a source that holds it would copy its own copy over and over.
+pub fn copy_tree_outside(src: &Path, dst: &Path, keep_out: Option<&Path>, progress: &dyn Fn(u64)) -> std::io::Result<Vec<String>> {
     let root = src.canonicalize()?;
     let mut skipped = Vec::new();
-    copy_dir(&root, src, dst, &mut vec![root.clone()], progress, &mut skipped)?;
+    copy_dir(&root, src, dst, keep_out, &mut vec![root.clone()], progress, &mut skipped)?;
     Ok(skipped)
 }
 
+/// Whether copying the canonical folder `dir` would reach `keep_out`.
+fn reaches(dir: &Path, keep_out: Option<&Path>) -> bool {
+    keep_out.is_some_and(|k| k.starts_with(dir) || dir.starts_with(k))
+}
+
 /// `stack` holds the canonical dirs being copied, to catch links back up the tree.
-fn copy_dir(root: &Path, src: &Path, dst: &Path, stack: &mut Vec<PathBuf>, progress: &dyn Fn(u64), skipped: &mut Vec<String>) -> std::io::Result<()> {
+fn copy_dir(root: &Path, src: &Path, dst: &Path, keep_out: Option<&Path>, stack: &mut Vec<PathBuf>, progress: &dyn Fn(u64), skipped: &mut Vec<String>) -> std::io::Result<()> {
+    if let Some(dir) = stack.last().filter(|d| reaches(d, keep_out)) {
+        return Err(std::io::Error::other(format!("{} holds the folder it would be copied into", dir.display())));
+    }
     std::fs::create_dir_all(dst)?;
     for e in std::fs::read_dir(src)? {
         let e = e?;
@@ -280,7 +295,7 @@ fn copy_dir(root: &Path, src: &Path, dst: &Path, stack: &mut Vec<PathBuf>, progr
                 continue;
             }
             stack.push(canon);
-            copy_dir(root, &real, &to, stack, progress, skipped)?;
+            copy_dir(root, &real, &to, keep_out, stack, progress, skipped)?;
             stack.pop();
         } else if ft.is_file() {
             reflink_copy::reflink_or_copy(&real, &to)?;

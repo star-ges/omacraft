@@ -24,7 +24,8 @@ omacraft list | import <zip|mrpack|folder|url> | export <inst> <file> | reclaim 
 - **Vendored crate:** `vendor/smithay-clipboard` is smithay-clipboard 0.7.3 patched (`[patch.crates-io]`) to take
   file drops: winit has no drag and drop on Wayland, and Hyprland sends drops only to a client's first data
   device, which is the clipboard's. The patch is `src/drop.rs` plus the `DataDeviceHandler` drop methods in
-  `src/state.rs`; when egui moves to a new smithay-clipboard, re-apply it or drop it if winit gains Wayland drops.
+  `src/state.rs` (and `set_non_blocking` made `pub(crate)`); when egui moves to a new smithay-clipboard, re-apply it
+  or drop it if winit gains Wayland drops. Its tests: `cargo test --manifest-path vendor/smithay-clipboard/Cargo.toml --lib`.
 - **Binary size:** the release profile strips symbols, and `zip` is trimmed to Deflate (flate2/zlib-rs),
   Deflate64 and `time`. Keep new dependencies' default features in check. LTO is off on purpose: full LTO
   with codegen-units=1 saved 7 MB (35 to 28) but tripled build times.
@@ -121,10 +122,11 @@ test (and a rule here) with any fix that sets a new one.
   (`ContentState::mod_jobs`) until their result is taken. World jobs are keyed by the folder their worlds really live
   in (`worlds::saves_key`, followed through links), so instances sharing worlds, by setting or by a leftover link, wait
   for each other's backups, restores, duplicates and update backups (`worlds::jobs_on`). A launch waits while the
-  instance's mods are being swapped, its worlds are copied or restored through any instance, or shared folders are
-  moving (`worlds::launch_blocked`). Mods aren't switched, removed or installed while a game starts
+  instance's mods are being swapped or installed (Modrinth or dropped, `ContentState::installing_mods`, until the
+  job's result is taken; pack installs don't count), its worlds are copied or restored through any instance, or shared
+  folders are moving (`worlds::launch_blocked`). Mods aren't switched, removed or installed while a game starts
   (`Session::starting`, until Java has a pid), since its play records are read then. Tests: `ui::worlds::tests::jobs_on_shared_worlds_block_every_member`,
-  `ui::content::tests::every_mod_job_stays_tracked_until_it_ends`.
+  `ui::content::tests::{every_mod_job_stays_tracked_until_it_ends, mod_drops_and_launches_wait_for_each_other}`.
 - **Content installs:** `modrinth::plan` works out the whole set before downloading. Pins beat the
   newest build, installed files count by Modrinth project (hash lookup) as well as filename, and required
   dependencies that can't be met come back in `Installed::missing` (error toast, non-zero CLI exit).
@@ -306,12 +308,22 @@ test (and a rule here) with any fix that sets a new one.
   (`Instance::add_content`, run as an install job under the same guards as Modrinth installs); anywhere else, or a
   `.mrpack`, opens the import dialog. Everything is checked before anything is copied: each file must be what the
   tab lists (`.jar` mods; `.zip` or folder packs), and a name already there, enabled or not, is skipped if identical
-  and refused if not, never replaced. On the worlds tab a world folder (with `level.dat`) or a `.zip` of one world
+  and refused if not, never replaced. Each drop copies into a stage folder of its own (`.adding-<pid>-<uuid>`, cleared
+  only by its own call, or once its process is gone), checks the name and its `.disabled` twin again when moving in
+  and moves in with `fsutil::rename_noreplace`, so concurrent drops of one name, also into a shared folder through two
+  instances, never publish each other's bytes: the first in wins, an identical one is skipped. A folder that holds the
+  destination (canonical paths, so also through a link) is refused up front, and the copy
+  (`fsutil::copy_tree_outside`) stops at any folder, reached through links or not, that holds the stage or lies in it,
+  so a pack never copies itself into itself. On the worlds tab a world folder (with `level.dat`) or a `.zip` of one world
   is added to `saves` (`saves::add_world`): copied or extracted beside `saves`, never inside it, then moved in under
   the next free name (`<name> (2)`), without its `session.lock`. A zip with several worlds, or a folder open in a
   game, is refused. It runs as a world job (`jobs_on` its saves, not while shared folders move), so launches wait
-  for it. Tests: `instance::tests::dropped_content_is_checked_before_anything_is_copied`,
-  `saves::tests::dropped_worlds_are_added_beside_the_others`.
+  for it. The drop's uri list itself (vendored `drop::receive`) is capped at `MAX_BYTES` (1 MiB) and `MAX_PATHS`,
+  read at most `READS_PER_WAKE` chunks per wake-up so a source that never stops can't hold the clipboard thread, and
+  dropped, pipe closed, after `DEADLINE` (10 s). Tests: `instance::tests::{dropped_content_is_checked_before_anything_is_copied,
+  drops_of_the_same_name_never_share_a_stage, a_folder_holding_the_destination_is_not_copied_into_itself}`,
+  `saves::tests::dropped_worlds_are_added_beside_the_others`, and in the vendored crate
+  `drop::tests::{transfers_are_capped_in_bytes_paths_and_reads_per_wake, abandoned_and_endless_drops_leave_other_transfers_working}`.
 - **Saving:** write config/state files with `fsutil::write_atomic` (unique temp + rename; accounts at 0600).
 
 ## Testing the GUI safely
