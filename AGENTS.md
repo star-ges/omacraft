@@ -121,10 +121,11 @@ test (and a rule here) with any fix that sets a new one.
   (`ContentState::mod_jobs`) until their result is taken. World jobs are keyed by the folder their worlds really live
   in (`worlds::saves_key`, followed through links), so instances sharing worlds, by setting or by a leftover link, wait
   for each other's backups, restores, duplicates and update backups (`worlds::jobs_on`). A launch waits while the
-  instance's mods are being swapped, its worlds are copied or restored through any instance, or shared folders are
-  moving (`worlds::launch_blocked`). Mods aren't switched, removed or installed while a game starts
+  instance's mods are being swapped or installed (Modrinth or dropped, `ContentState::installing_mods`, until the
+  job's result is taken; pack installs don't count), its worlds are copied or restored through any instance, or shared
+  folders are moving (`worlds::launch_blocked`). Mods aren't switched, removed or installed while a game starts
   (`Session::starting`, until Java has a pid), since its play records are read then. Tests: `ui::worlds::tests::jobs_on_shared_worlds_block_every_member`,
-  `ui::content::tests::every_mod_job_stays_tracked_until_it_ends`.
+  `ui::content::tests::{every_mod_job_stays_tracked_until_it_ends, mod_drops_and_launches_wait_for_each_other}`.
 - **Content installs:** `modrinth::plan` works out the whole set before downloading. Pins beat the
   newest build, installed files count by Modrinth project (hash lookup) as well as filename, and required
   dependencies that can't be met come back in `Installed::missing` (error toast, non-zero CLI exit).

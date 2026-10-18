@@ -161,11 +161,15 @@ pub fn jobs_on(content: &super::content::ContentState, worlds: &WorldsState, sav
     }
 }
 
-/// Why `inst` can't start right now, if it can't: its mods are being swapped, or its
-/// worlds copied or swapped, through it or any instance sharing its saves.
+/// Why `inst` can't start right now, if it can't: its mods are being swapped or added
+/// (a mod moved in after the launch reads them would be missing from its play records),
+/// or its worlds copied or swapped, through it or any instance sharing its saves.
 pub fn launch_blocked(content: &super::content::ContentState, worlds: &WorldsState, inst: &Instance) -> Option<&'static str> {
     if content.updating(&inst.id) {
         return Some("its mods are being updated or rolled back");
+    }
+    if content.installing_mods(&inst.id) {
+        return Some("mods are being added to it");
     }
     let saves = saves_key(inst);
     if worlds.busy_with(&inst.id) || worlds.busy_on(&saves) {

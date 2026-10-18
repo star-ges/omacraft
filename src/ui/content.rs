@@ -251,6 +251,12 @@ impl ContentState {
         self.kinds.values().any(|k| k.installing.keys().any(|(id, _)| id == inst_id)) || self.updating(inst_id)
     }
 
+    /// Whether mods are being installed into this instance, from Modrinth or dropped,
+    /// until the job's result is taken. Pack installs don't count.
+    pub fn installing_mods(&self, inst_id: &str) -> bool {
+        self.kinds.get(&ContentKind::Mods).is_some_and(|k| k.installing.keys().any(|(id, _)| id == inst_id))
+    }
+
     /// Whether this instance's mods are being updated or rolled back.
     pub fn updating(&self, inst_id: &str) -> bool {
         self.mod_jobs.iter().any(|j| j.inst_id == inst_id)
@@ -439,21 +445,29 @@ pub fn add_dropped(app: &mut App, ctx: &egui::Context, inst: &Instance, kind: Co
         [one] => one.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
         many => format!("{} files", many.len()),
     };
-    let job = (inst.id.clone(), format!("drop:{}", paths[0].display()));
-    let s = app.content.kinds.entry(kind).or_default();
-    if s.installing.contains_key(&job) {
-        return;
+    let rt = app.rt.clone();
+    app.content.start_drop(&rt, ctx, inst, kind, paths, title);
+}
+
+impl ContentState {
+    /// Copy dropped `paths` into `inst`'s `kind` folder as an install job (admitted already).
+    fn start_drop(&mut self, rt: &tokio::runtime::Handle, ctx: &egui::Context, inst: &Instance, kind: ContentKind, paths: Vec<PathBuf>, title: String) {
+        let job = (inst.id.clone(), format!("drop:{}", paths[0].display()));
+        let s = self.kinds.entry(kind).or_default();
+        if s.installing.contains_key(&job) {
+            return;
+        }
+        let task = Task::new(format!("adding {title}"));
+        task.stage(format!("Adding {title}"), 0);
+        let (i, tk) = (inst.clone(), task.clone());
+        let promise = Promise::spawn(rt, ctx, async move {
+            let r = tokio::task::spawn_blocking(move || i.add_content(kind, &paths)).await.map_err(anyhow::Error::from).and_then(|r| r);
+            tk.finish(&r.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
+            r.map(|files| modrinth::Installed { files, projects: Vec::new(), missing: Vec::new() })
+        });
+        let dir = inst.game_dir().join(kind.dir());
+        s.installing.insert(job, Job { task, promise, title, dir });
     }
-    let task = Task::new(format!("adding {title}"));
-    task.stage(format!("Adding {title}"), 0);
-    let (i, tk) = (inst.clone(), task.clone());
-    let promise = Promise::spawn(&app.rt, ctx, async move {
-        let r = tokio::task::spawn_blocking(move || i.add_content(kind, &paths)).await.map_err(anyhow::Error::from).and_then(|r| r);
-        tk.finish(&r.as_ref().map(|_| ()).map_err(|e| anyhow::anyhow!("{e:#}")));
-        r.map(|files| modrinth::Installed { files, projects: Vec::new(), missing: Vec::new() })
-    });
-    let dir = inst.game_dir().join(kind.dir());
-    s.installing.insert(job, Job { task, promise, title, dir });
 }
 
 pub fn show(app: &mut App, ui: &mut Ui, inst: &Instance, kind: ContentKind) {
@@ -1269,5 +1283,45 @@ mod tests {
         meta.installed(a, &done);
         assert!(meta.project_ids(&[file(a, "lithium.jar", 5, 1)]).contains("gvQqBUqZ"));
         assert!(meta.project_ids(&[file(b, "lithium.jar", 5, 1)]).is_empty());
+    }
+
+    /// F4 (G28): a mod added while the game starts would be loaded but missing from the
+    /// mods read for its play records, so drops and launches hold each other off.
+    #[test]
+    fn mod_drops_and_launches_wait_for_each_other() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ctx = egui::Context::default();
+        let mut inst = Instance::new("drop launch", "1.21.1", crate::loaders::Loader::Fabric("0.16.5".into()));
+        inst.assign_id().unwrap();
+        let src = crate::paths::test_root().join(format!("drop-launch-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(src.join("Pack")).unwrap();
+        std::fs::write(src.join("late.jar"), "j").unwrap();
+        let worlds = super::super::worlds::WorldsState::default();
+        let blocked = |c: &ContentState| super::super::worlds::launch_blocked(c, &worlds, &inst);
+
+        // Drop, then launch: the launch waits while the drop's job is tracked, done or not.
+        let mut content = ContentState::default();
+        content.start_drop(rt.handle(), &ctx, &inst, ContentKind::ResourcePacks, vec![src.join("Pack")], "Pack".into());
+        assert!(blocked(&content).is_none(), "a pack install doesn't hold off a launch");
+        content.start_drop(rt.handle(), &ctx, &inst, ContentKind::Mods, vec![src.join("late.jar")], "late.jar".into());
+        assert_eq!(blocked(&content), Some("mods are being added to it"));
+        let start = Instant::now();
+        while !content.kinds[&ContentKind::Mods].installing.values().all(|j| j.promise.ready()) {
+            assert!(start.elapsed() < Duration::from_secs(5), "the drop never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(blocked(&content).is_some(), "a finished drop counts until its result is taken");
+        content.kinds.get_mut(&ContentKind::Mods).unwrap().installing.clear();
+        assert!(blocked(&content).is_none());
+
+        // Launch, then drop: the game counts as starting, which install_blocked refuses mod
+        // drops for, until Java has a pid (after the mods were read and it was spawned).
+        let log: crate::launch::SharedLog = Default::default();
+        let s = super::super::Session { log: log.clone(), task: Task::new("launch"), phase: super::super::Phase::Game(Promise::spawn(rt.handle(), &ctx, std::future::pending())) };
+        assert!(s.starting());
+        log.lock().unwrap().pid = Some(1);
+        assert!(!s.starting() && s.running());
+        std::fs::remove_dir_all(inst.dir()).unwrap();
+        std::fs::remove_dir_all(&src).unwrap();
     }
 }
