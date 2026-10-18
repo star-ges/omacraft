@@ -47,12 +47,17 @@ else
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
     say "Downloading Omacraft ($ref)…"
-    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$ref" "$REPO" "$tmp/omacraft"
+    # Fetch rather than clone --branch: a shallow clone of an annotated tag warns "is not a commit".
+    git init --quiet "$tmp/omacraft"
+    if [ "$ref" = master ]; then spec=refs/heads/master; else spec=refs/tags/$ref; fi
+    git -C "$tmp/omacraft" fetch --quiet --depth 1 "$REPO" "$spec"
+    git -C "$tmp/omacraft" -c advice.detachedHead=false checkout --quiet FETCH_HEAD
     src="$tmp/omacraft"
 fi
 
 say "Building (this takes a few minutes the first time)…"
-cargo build --release --manifest-path "$src/Cargo.toml"
+# An explicit target dir, so a CARGO_TARGET_DIR in the environment doesn't put the binary elsewhere.
+cargo build --release --manifest-path "$src/Cargo.toml" --target-dir "$src/target"
 
 say "Installing…"
 # Copy beside the old binary and rename over it, so a running Omacraft keeps working.
