@@ -87,7 +87,7 @@ impl Nav {
 
 /// Which zones the current instance tab has.
 pub fn has_side(app: &App) -> bool {
-    app.inst_tab.content_kind().is_some() || matches!(app.inst_tab, InstTab::LogHistory | InstTab::Worlds) || (app.inst_tab == InstTab::Version && app.version.picker_open())
+    app.inst_tab.content_kind().is_some() || matches!(app.inst_tab, InstTab::LogHistory | InstTab::Worlds | InstTab::Config) || (app.inst_tab == InstTab::Version && app.version.picker_open())
 }
 
 /// Actions that drive panes and dialogs.
@@ -200,6 +200,16 @@ pub fn hints(app: &App) -> Vec<(String, &'static str)> {
                 (InstTab::Worlds, true) => vec![(p(Down, Up), "backups"), (l(Activate), "restore"), (l(Add), "back up now"), (l(Delete), "delete"), (l(Folder), "folder")],
                 (InstTab::Servers, _) => vec![(p(Down, Up), "servers"), (l(Activate), "join"), (l(Add), "add"), (l(Edit), "edit"), (p(MoveDown, MoveUp), "reorder"), (l(Delete), "remove")],
                 (InstTab::Screenshots, _) => vec![(p(Down, Up), "screenshots"), (l(Activate), "open"), (l(Copy), "copy"), (l(Delete), "delete"), (l(Folder), "folder"), (l(Toggle), "all instances")],
+                (InstTab::Config, false) => vec![(p(Down, Up), "files"), (l(FocusRight), "edit"), (l(Search), "filter"), (l(SaveConfig), "save"), (l(Folder), "folder")],
+                (InstTab::Config, true) if app.config.open.as_ref().is_some_and(|o| o.raw_mode()) => {
+                    let mut v = vec![(l(Activate), "type"), ("esc".into(), "stop typing"), (l(SaveConfig), "save")];
+                    if app.config.open.as_ref().is_some_and(|o| o.has_fields()) {
+                        v.push((l(RawConfig), "fields"));
+                    }
+                    v.push((l(Delete), "revert"));
+                    v
+                }
+                (InstTab::Config, true) => vec![(p(Down, Up), "settings"), (l(Toggle), "switch"), (l(Activate), "edit"), (l(Delete), "default"), (l(SaveConfig), "save"), (l(RawConfig), "text"), (l(Search), "filter")],
                 (InstTab::LogHistory, true) if app.logs.panel_focused() => {
                     vec![(p(Down, Up), "suspects"), (l(Activate), "show in log"), (l(Toggle), "disable/enable"), (l(Copy), "copy summary"), (l(Why), "back to the log")]
                 }

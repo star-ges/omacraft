@@ -1,4 +1,5 @@
 mod accounts;
+mod config;
 mod content;
 mod export;
 mod group_manager;
@@ -68,6 +69,8 @@ pub enum Modal {
     ModSets(Box<mod_sets::SetsDialog>),
     /// Starting a search for the breaking mod, or answering one of its steps.
     Bisect(Box<mod_sets::BisectDialog>),
+    /// Leaving a config file with unsaved changes.
+    ConfigLeave(Box<config::Leave>),
 }
 
 /// A yes/no question before something destructive.
@@ -93,6 +96,8 @@ pub enum ConfirmAction {
     RollBack(String, crate::backups::Snapshot),
     /// A mod set: (instance id, set name). Only the set goes; the mods stay.
     DeleteModSet(String, String),
+    /// Throw away the unsaved changes to the open config file.
+    RevertConfig,
 }
 
 enum Phase {
@@ -178,6 +183,7 @@ pub struct App {
     pub servers: servers::ServersState,
     pub shots: screenshots::ShotsState,
     pub logs: logs::LogsState,
+    pub config: config::ConfigState,
     pub acct: accounts::AccountsState,
     imports: Vec<(Task, Promise<crate::import::Imported>)>,
     /// (task, result, instance id)
@@ -244,6 +250,7 @@ impl App {
             servers: Default::default(),
             shots: Default::default(),
             logs: Default::default(),
+            config: Default::default(),
             acct: Default::default(),
             imports: Vec::new(),
             exports: Vec::new(),
@@ -336,6 +343,12 @@ impl App {
         let why = if self.sharing.is_some() { Some("shared folders are moving") } else { worlds::launch_blocked(&self.content, &self.worlds, &inst) };
         if let Some(why) = why {
             self.toast(ToastKind::Error, format!("Can't start {} while {why}", inst.name));
+            return;
+        }
+        // The game would read the config as it is on disk, not as edited here.
+        if let Some(o) = self.config.open.as_ref().filter(|o| o.inst_id == inst.id && o.dirty()) {
+            let name = o.rel.display().to_string();
+            self.toast(ToastKind::Error, format!("Save or revert your changes to {name} before playing"));
             return;
         }
         let Some(account) = self.accounts.active().cloned() else {
@@ -799,6 +812,10 @@ impl App {
         if km.take(ctx, &[Quit]).is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        // Saving a config works while typing in it.
+        if self.tab == Tab::Instances && self.inst_tab == InstTab::Config && self.modal.is_none() && km.take(ctx, &[SaveConfig]).is_some() {
+            self.config.key = Some(SaveConfig);
+        }
         if ctx.egui_wants_keyboard_input() {
             return;
         }
@@ -811,7 +828,7 @@ impl App {
         let mut cands = vec![Help, TabInstances, TabAccounts, TabSettings, Play, New, Import, Export, Groups];
         match self.tab {
             Tab::Instances => {
-                cands.extend([FocusLeft, FocusRight, PrevTab, NextTab, Back, ModsTab, LoaderType, Update, UpdateOne, RollBack, Why, ModSets, FindBreaking]);
+                cands.extend([FocusLeft, FocusRight, PrevTab, NextTab, Back, ModsTab, LoaderType, Update, UpdateOne, RollBack, Why, ModSets, FindBreaking, SaveConfig, RawConfig]);
                 cands.extend(nav::PANE_ACTIONS);
             }
             Tab::Accounts => cands.extend([Microsoft, Down, Up, Top, Bottom, Activate, Delete, Add, TurnLeft, TurnRight, UploadSkin, Toggle, Cycle, Back]),
@@ -871,6 +888,11 @@ impl App {
             Action::FindBreaking => {
                 if let Some(id) = self.selected.clone() {
                     mod_sets::key(self, &id);
+                }
+            }
+            Action::SaveConfig | Action::RawConfig => {
+                if self.inst_tab == InstTab::Config {
+                    self.config.key = Some(a);
                 }
             }
             Action::FocusLeft => {
@@ -1051,6 +1073,7 @@ impl App {
             }
             ConfirmAction::RollBack(id, snap) => content::start_roll_back(self, ctx, id, snap.clone()),
             ConfirmAction::DeleteModSet(id, name) => mod_sets::delete_set(self, id, name),
+            ConfirmAction::RevertConfig => config::revert(self),
             ConfirmAction::ResetSkin(uuid) => accounts::skin_change(self, ctx, uuid, crate::skins::Change::Reset),
             ConfirmAction::DeleteSet(kind, name) => {
                 // Checked again: an instance may have joined since the dialog opened.
@@ -1145,6 +1168,7 @@ impl eframe::App for App {
         {
             self.modal = Some(Modal::WorldRollBack(Box::new(p)));
         }
+        config::guard(self, &ctx);
         self.show_modal(&ctx);
         self.toasts(&ctx);
         self.nav = None;
@@ -1261,6 +1285,13 @@ impl App {
                     .backdrop_color(widgets::scrim(&t))
                     .show(ctx, |ui| mod_sets::bisect_dialog(self, &mut s, ui));
                 if r.inner || r.should_close() { None } else { Some(Modal::Bisect(s)) }
+            }
+            Modal::ConfigLeave(s) => {
+                let r = egui::Modal::new(egui::Id::new("config-leave"))
+                    .frame(widgets::modal_frame(&t))
+                    .backdrop_color(widgets::scrim(&t))
+                    .show(ctx, |ui| config::leave_dialog(self, &s, ui));
+                if r.inner || r.should_close() { None } else { Some(Modal::ConfigLeave(s)) }
             }
             Modal::Confirm(c) => {
                 let mut yes = false;

@@ -1,7 +1,7 @@
 use egui::{Align, Layout, RichText, Sense, Ui, vec2};
 
 use super::widgets::{self as w, Lead};
-use super::{App, Confirm, ConfirmAction, Modal, ToastKind, content, logs, new_instance, screenshots, servers, version, worlds};
+use super::{App, Confirm, ConfirmAction, Modal, ToastKind, config, content, logs, new_instance, screenshots, servers, version, worlds};
 use super::nav::{Nav, Zone};
 use crate::icons;
 use crate::instance::{self, ContentKind, Instance};
@@ -12,6 +12,7 @@ pub enum InstTab {
     Log,
     Version,
     Mods,
+    Config,
     ResourcePacks,
     ShaderPacks,
     Notes,
@@ -22,10 +23,11 @@ pub enum InstTab {
 }
 
 impl InstTab {
-    pub const ALL: [(InstTab, &'static str); 10] = [
+    pub const ALL: [(InstTab, &'static str); 11] = [
         (InstTab::Version, "version"),
         (InstTab::Log, "log"),
         (InstTab::Mods, "mods"),
+        (InstTab::Config, "config"),
         (InstTab::ResourcePacks, "resource packs"),
         (InstTab::ShaderPacks, "shader packs"),
         (InstTab::Notes, "notes"),
@@ -421,6 +423,7 @@ fn detail(app: &mut App, ui: &mut Ui, inst: &Instance) {
         match app.inst_tab {
             InstTab::Log => logs::live(app, ui, inst),
             InstTab::Version => version::show(app, ui, inst),
+            InstTab::Config => config::show(app, ui, inst),
             InstTab::Notes => notes(app, ui, inst),
             InstTab::Worlds => worlds::show(app, ui, inst),
             InstTab::Servers => servers::show(app, ui, inst),
