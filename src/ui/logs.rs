@@ -524,9 +524,11 @@ fn act(app: &mut App, ctx: &egui::Context, inst: &Instance, a: &Analysis, out: P
 }
 
 /// Hook for the bisect: start finding the breaking mod among `a`'s suspects first.
-// TODO(merge): wire to the bisect module, then set BISECT to true.
-fn start_bisect(_app: &mut App, _inst: &Instance, _a: &Analysis) {}
-const BISECT: bool = false;
+/// Search for the breaking mod, trying the analysis's suspects first, strongest first.
+fn start_bisect(app: &mut App, inst: &Instance, a: &Analysis) {
+    let first = a.suspects.iter().filter_map(|s| s.file.as_ref()?.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+    super::mod_sets::open_bisect(app, &inst.id, first);
+}
 
 /// The mod file the analysis named, as it is now (it may have been enabled or disabled since).
 fn current_file(inst: &Instance, file: &Path) -> Option<crate::instance::ModFile> {
@@ -596,7 +598,7 @@ fn panel(ui: &mut Ui, t: &Theme, a: &Analysis, st: &mut Panel, kb: Option<Nav>, 
                     st.hidden = true;
                 }
                 out.copy |= w::button(ui, "copy summary").clicked();
-                if BISECT && w::button(ui, "find it by bisecting").clicked() {
+                if a.crashed && w::button(ui, "find the breaking mod").clicked() {
                     out.bisect = true;
                 }
                 ui.add_space(8.0);
