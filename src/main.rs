@@ -15,6 +15,7 @@ mod keymap;
 mod java;
 mod launch;
 mod loaders;
+mod mod_config;
 mod modrinth;
 mod mod_sets;
 mod mojang;

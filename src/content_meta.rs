@@ -165,6 +165,20 @@ pub fn read_local(path: &Path, is_dir: bool, kind: ContentKind) -> FileMeta {
     meta
 }
 
+/// A mod jar's name, id and icon, without hashing it (for naming its config files).
+pub fn read_quick(path: &Path) -> FileMeta {
+    let key = {
+        let m = std::fs::metadata(path).ok();
+        let stamp = m.as_ref().and_then(|m| m.modified().ok()).map(|t| format!("{t:?}")).unwrap_or_default();
+        format!("{}|{}|{stamp}", path.display(), m.map(|m| m.len()).unwrap_or(0))
+    };
+    let mut meta = FileMeta::default();
+    if let Ok(mut zip) = std::fs::File::open(path).map_err(anyhow::Error::from).and_then(|f| Ok(zip::ZipArchive::new(f)?)) {
+        read_mod(&mut zip, &key, &mut meta);
+    }
+    meta
+}
+
 #[derive(Debug, Clone)]
 pub struct Project {
     pub id: String,

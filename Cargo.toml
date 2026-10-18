@@ -29,6 +29,9 @@ serde_json = "1.0.154"
 sha1 = "0.11.0"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "fs", "process", "io-util", "sync", "time"] }
 toml = "1.1.8"
+# Already built for proc-macro-crate; reads TOML configs with the position of every
+# value and comment, so edits can leave the rest of a file untouched.
+toml_edit = { version = "0.25.17", default-features = false, features = ["parse", "display"] }
 uuid = { version = "1.28.0", features = ["v4", "serde"] }
 # Deflate covers jars, Prism/MultiMC zips and .mrpacks; Deflate64 is what Windows
 # Explorer writes for big archives. The rest of zip's codecs (zopfli, bzip2, zstd,
