@@ -214,6 +214,10 @@ pub fn hints(app: &App) -> Vec<(String, &'static str)> {
                     }
                     v
                 }
+                // A search for the breaking mod has the mods: only answering it and browsing work.
+                (InstTab::Mods, false) if app.selected.as_ref().is_some_and(|id| app.mod_sets.seen_searching(id)) => {
+                    vec![(p(Down, Up), "installed"), (l(FindBreaking), "answer the step"), (l(FocusRight), "modrinth"), (l(Search), "search")]
+                }
                 (InstTab::Mods, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(Update), "updates"), (l(RollBack), "roll back"), (l(ModSets), "sets"), (l(FindBreaking), "find breaking mod"), (l(FocusRight), "modrinth"), (l(Search), "search")],
                 (_, false) => vec![(p(Down, Up), "installed"), (l(Toggle), "enable/disable"), (l(Delete), "remove"), (l(FocusRight), "modrinth"), (l(Search), "search")],
                 (_, true) => vec![(p(Down, Up), "results"), (l(Activate), "install"), (l(Search), "search")],

@@ -80,6 +80,11 @@ impl State {
         self.get(inst).bisect.as_ref().is_ok_and(|b| b.is_some())
     }
 
+    /// [`Self::searching`] as last read, for the hints bar (which can't read files).
+    pub fn seen_searching(&self, id: &str) -> bool {
+        self.cache.get(id).is_some_and(|c| c.bisect.as_ref().is_ok_and(|b| b.is_some()))
+    }
+
     /// Read `inst`'s files again next time (after writing them).
     pub fn forget(&mut self, id: &str) {
         self.cache.remove(id);
@@ -156,8 +161,8 @@ pub fn bar(app: &mut App, ui: &mut Ui, inst: &Instance, found: Option<(&[Entry],
     let ctx = ui.ctx().clone();
     let empty = HashMap::new();
     let names = found.map_or(&empty, |(_, n)| n);
-    if let Some(b) = app.mod_sets.bisect(inst) {
-        search_line(ui, &t, &b);
+    // While a search runs its banner says so, and the mods are the search's until it ends.
+    if app.mod_sets.bisect(inst).is_some() {
         return;
     }
     let sets = app.mod_sets.sets(inst);
@@ -284,16 +289,6 @@ pub fn bar(app: &mut App, ui: &mut Ui, inst: &Instance, found: Option<(&[Entry],
         app.content.key = None;
         open_bisect(app, &inst.id, Vec::new());
     }
-}
-
-/// The bar's line while a search runs: the mods are the search's until it ends.
-fn search_line(ui: &mut Ui, t: &Theme, b: &Bisect) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        ui.label(RichText::new(SEARCH).color(t.accent));
-        let text = if b.done.is_some() { "the search is done · choose above what to do with the mods" } else { "finding the breaking mod · the mods stay as each step sets them until it ends" };
-        ui.add(egui::Label::new(RichText::new(text).color(t.muted)).truncate());
-    });
 }
 
 /// Switch `inst`'s mods to set `name` in the background.
