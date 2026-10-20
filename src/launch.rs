@@ -548,6 +548,15 @@ fn build_command(
     Ok(cmd)
 }
 
+/// The command the game runs through, split into words: the instance's, else the
+/// global one. Empty runs Java directly.
+pub fn wrapper(inst: &Instance, cfg: &Config) -> anyhow::Result<Vec<String>> {
+    match inst.wrapper_command.trim() {
+        "" => split_args(&cfg.wrapper_command).context("global wrapper command"),
+        own => split_args(own).context("instance wrapper command"),
+    }
+}
+
 fn supports_quick_play(v: &VersionJson) -> bool {
     v.arguments.as_ref().is_some_and(|a| a.game.iter().any(|g| g.mentions("${quickPlayMultiplayer}")))
 }
@@ -606,12 +615,16 @@ async fn start(
     let i = inst.clone();
     let worlds = tokio::task::spawn_blocking(move || crate::world_sets::check(&i)).await?;
     let args = build_command(&prepared, inst, cfg, account, token, features, quick)?;
+    let wrapper = wrapper(inst, cfg)?;
 
     {
         let mut l = log.lock().unwrap();
         l.push(LogLevel::Launcher, format!("Omacraft {} launching {}", env!("CARGO_PKG_VERSION"), inst.name));
         l.push(LogLevel::Launcher, format!("minecraft {}  ·  {}", inst.mc_version, inst.loader.display()));
         l.push(LogLevel::Launcher, format!("java {}", prepared.java.display()));
+        if !wrapper.is_empty() {
+            l.push(LogLevel::Launcher, format!("wrapper {}", wrapper.join(" ")));
+        }
         l.push(LogLevel::Launcher, format!("game dir {}", inst.game_dir().display()));
         match &shared {
             Ok(notes) => notes.iter().for_each(|n| l.push(LogLevel::Warn, n.clone())),
@@ -635,14 +648,24 @@ async fn start(
     let loadout = tokio::task::spawn_blocking(move || crate::world_sets::Loadout::of(&i)).await?;
 
     task.stage("Starting game", 0);
-    let child = tokio::process::Command::new(&prepared.java)
+    // A wrapper gets Java and its arguments as its own: `prime-run java …`.
+    let mut cmd = match wrapper.split_first() {
+        Some((program, rest)) => {
+            let mut c = tokio::process::Command::new(program);
+            c.args(rest).arg(&prepared.java);
+            c
+        }
+        None => tokio::process::Command::new(&prepared.java),
+    };
+    let program = wrapper.first().map(PathBuf::from).unwrap_or_else(|| prepared.java.clone());
+    let child = cmd
         .args(&args)
         .current_dir(inst.game_dir())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(false)
         .spawn()
-        .with_context(|| format!("starting {}", prepared.java.display()))?;
+        .with_context(|| format!("starting {}", program.display()))?;
     Ok((child, loadout))
 }
 
@@ -853,6 +876,19 @@ mod tests {
         assert_eq!(args.iter().position(|a| a == "M"), Some(args.len() - 1));
         inst.jvm_args = r#"-Dp="/tmp"#.into();
         assert!(build_command(&p, &inst, &Config::default(), &Account::offline("Steve"), "0", &features, None).is_err());
+    }
+
+    #[test]
+    fn wrapper_instance_over_global() {
+        let mut inst = Instance::new("t", "1.21.1", Loader::Vanilla);
+        let mut cfg = Config::default();
+        assert!(wrapper(&inst, &cfg).unwrap().is_empty());
+        cfg.wrapper_command = "prime-run".into();
+        assert_eq!(wrapper(&inst, &cfg).unwrap(), ["prime-run"]);
+        inst.wrapper_command = r#" gamemoderun "/opt/my tools/mangohud" "#.into();
+        assert_eq!(wrapper(&inst, &cfg).unwrap(), ["gamemoderun", "/opt/my tools/mangohud"]);
+        inst.wrapper_command = "'unclosed".into();
+        assert!(wrapper(&inst, &cfg).is_err());
     }
 
     #[test]
