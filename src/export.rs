@@ -340,7 +340,7 @@ fn instance_cfg(inst: &Instance, icon_key: &str) -> String {
     if let Some((w, h)) = inst.window {
         kv.extend([("OverrideWindow", "true".into()), ("MinecraftWinWidth", w.to_string()), ("MinecraftWinHeight", h.to_string())]);
     }
-    // The Java path is left out: it belongs to this machine.
+    // The Java path and wrapper command are left out: they belong to this machine.
     let mut out = String::from("[General]\n");
     for (k, v) in kv {
         out.push_str(&format!("{k}={}\n", cfg_value(&v)));
@@ -498,6 +498,7 @@ mod tests {
         let mut i = inst();
         i.jvm_args = r#"-Xss2m -Dgreeting="hi there""#.into();
         i.java_path = "/opt/java/bin/java".into();
+        i.wrapper_command = "prime-run".into();
         i.last_played = chrono::DateTime::from_timestamp_millis(1_700_000_000_123);
         std::fs::write(scratch.join("pic.png"), b"\x89PNG fake icon").unwrap();
         i.icon = icons::add_custom(&scratch.join("pic.png")).unwrap();
@@ -547,6 +548,7 @@ mod tests {
         assert_eq!((back.memory_mb, &back.jvm_args, back.window), (src.memory_mb, &src.jvm_args, src.window));
         assert_eq!((back.played_secs, back.last_played), (src.played_secs, src.last_played));
         assert_eq!(back.java_path, "", "the Java path belongs to the exporting machine");
+        assert_eq!(back.wrapper_command, "", "so does the wrapper command");
         let icon = |i: &Instance| std::fs::read(icons::dir().join(i.icon.strip_prefix("custom:").unwrap())).unwrap();
         assert_eq!(icon(&back), icon(&src));
 
