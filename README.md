@@ -161,7 +161,7 @@ For more details, see [How Omacraft handles game files](#how-omacraft-handles-ga
 ## Everything you'd expect
 
 - **Instances**: each one is a self-contained `.minecraft` with its own version, loader, memory,
-  JVM args, Java, window size, icon, group and notes. Libraries, assets and runtimes are shared
+  JVM args, Java, wrapper command (`prime-run`, `gamemoderun`…), window size, icon, group and notes. Libraries, assets and runtimes are shared
   between instances. Collapsible, coloured groups; drag instances between them, or press `g`.
 
   ![Instances](docs/screenshots/instances.png)

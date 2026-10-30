@@ -470,6 +470,7 @@ pub struct EditState {
     custom_memory: bool,
     jvm_args: String,
     java_path: String,
+    wrapper_command: String,
     custom_window: bool,
     window: (u32, u32),
 }
@@ -501,6 +502,7 @@ impl EditState {
             custom_memory: i.memory_mb.is_some(),
             jvm_args: i.jvm_args.clone(),
             java_path: i.java_path.clone(),
+            wrapper_command: i.wrapper_command.clone(),
             custom_window: i.window.is_some(),
             window: i.window.unwrap_or((1280, 720)),
         }
@@ -573,6 +575,14 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
         ui.label(RichText::new("java").color(t.muted));
         w::text_input(ui, &mut s.java_path, "auto (mojang runtime)", field_w, false);
         ui.end_row();
+
+        ui.label(RichText::new("wrapper").color(t.muted)).on_hover_text("a command the game runs through, like prime-run or gamemoderun");
+        let global = match app.cfg.wrapper_command.trim() {
+            "" => "none".to_string(),
+            g => format!("default ({g})"),
+        };
+        w::text_input(ui, &mut s.wrapper_command, &global, field_w, false);
+        ui.end_row();
     });
 
     for f in &mut s.sets {
@@ -595,6 +605,8 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
         let changed: Vec<Kind> = Kind::ALL.into_iter().zip(&new).filter(|(k, v)| app.instances.iter().any(|i| i.id == s.id && k.set_of(i) != v.as_str())).map(|(k, _)| k).collect();
         if save && let Err(e) = crate::launch::split_args(&s.jvm_args) {
             app.toast(ToastKind::Error, format!("JVM arguments: {e}"));
+        } else if save && let Err(e) = crate::launch::split_args(&s.wrapper_command) {
+            app.toast(ToastKind::Error, format!("wrapper command: {e}"));
         } else if save && let Some(e) = set_change_error(app, s, &new, &changed) {
             app.toast(ToastKind::Error, e);
         } else if save {
@@ -607,6 +619,7 @@ pub fn edit(app: &mut App, s: &mut EditState, ui: &mut Ui) -> EditOutcome {
                 i.window = s.custom_window.then_some(s.window);
                 i.jvm_args = s.jvm_args.trim().to_string();
                 i.java_path = s.java_path.trim().to_string();
+                i.wrapper_command = s.wrapper_command.trim().to_string();
                 [i.share_set, i.world_set] = new;
                 if let Err(e) = i.save() {
                     app.toast(ToastKind::Error, format!("Save failed: {e}"));

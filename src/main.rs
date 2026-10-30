@@ -43,7 +43,15 @@ fn main() -> eframe::Result {
         std::process::exit(rt.block_on(cli::run(args)));
     }
 
+    // wgpu prefers the discrete GPU, which on a hybrid laptop stays awake as long as
+    // the launcher is open. The game picks its own GPU (see the wrapper command), and
+    // WGPU_POWER_PREF still overrides this.
+    let mut wgpu_options = eframe::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
+        setup.power_preference = eframe::wgpu::PowerPreference::from_env().unwrap_or(eframe::wgpu::PowerPreference::LowPower);
+    }
     let options = eframe::NativeOptions {
+        wgpu_options,
         viewport: egui::ViewportBuilder::default()
             .with_app_id(paths::APP_ID)
             .with_title("Omacraft")

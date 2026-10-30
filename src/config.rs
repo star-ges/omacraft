@@ -19,6 +19,9 @@ pub struct Config {
     pub java_override: String,
     /// Extra JVM flags applied to every instance.
     pub global_jvm_args: String,
+    /// Command the game runs through (`prime-run`, `gamemoderun`, `mangohud`…), for
+    /// instances without their own.
+    pub wrapper_command: String,
     pub show_snapshots: bool,
     /// The screenshots tab shows every instance's screenshots, not just the current one's.
     pub all_screenshots: bool,
@@ -38,6 +41,7 @@ impl Default for Config {
             default_memory_mb: 4096,
             java_override: String::new(),
             global_jvm_args: String::new(),
+            wrapper_command: String::new(),
             show_snapshots: false,
             all_screenshots: false,
             backups_keep: 5,

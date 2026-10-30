@@ -57,6 +57,10 @@ pub fn show(app: &mut App, ui: &mut Ui) {
                 w::field_label(ui, &t, "jvm args");
                 changed |= w::text_input(ui, &mut app.cfg.global_jvm_args, "applied to every instance", 420.0, false).changed();
             });
+            ui.horizontal(|ui| {
+                w::field_label(ui, &t, "wrapper");
+                changed |= w::text_input(ui, &mut app.cfg.wrapper_command, "none (e.g. prime-run, gamemoderun)", 420.0, false).changed();
+            });
 
             ui.add_space(10.0);
             w::section(ui, &t, "versions");

@@ -35,6 +35,9 @@ pub struct Instance {
     pub jvm_args: String,
     #[serde(default)]
     pub java_path: String,
+    /// Command the game runs through; falls back to the global one.
+    #[serde(default)]
+    pub wrapper_command: String,
     #[serde(default)]
     pub window: Option<(u32, u32)>,
     pub created: DateTime<Utc>,
@@ -59,6 +62,7 @@ impl Instance {
             memory_mb: None,
             jvm_args: String::new(),
             java_path: String::new(),
+            wrapper_command: String::new(),
             window: None,
             created: Utc::now(),
             last_played: None,
